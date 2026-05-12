@@ -1,0 +1,164 @@
+Context as of 2026-05-27
+
+## Project
+agentskills-internal — tooling to run Claude Code in a hardened sandbox on
+CSCS supercomputers (shared HPC login nodes, x86_64 and aarch64, no root).
+
+## Repository structure
+
+claude-safe/
+  src/
+    seccomp_wrapper.c     Syscall deny-list wrapper source
+  test/
+    smoke.c                     Integration test runner (fork/exec, checks exit/signal)
+    test_ptrace.c               Calls ptrace; expected SIGSYS
+    test_personality_query.c    Calls personality(0xffffffff); expected exit 0
+    test_personality_switch.c   Calls personality(PER_LINUX32); expected SIGSYS
+  Makefile                Builds seccomp-wrapper + test binaries; `make check` runs smoke tests
+  README.md               Full reference: KEEP/CLOSE/CHECK syscall tables,
+                          build instructions, design notes
+scripts/
+  merge-claude-settings.py  Merges user-config/settings.json into ~/.claude/settings.json;
+                            called by install-claude-safe.sh
+user-config/
+  settings.json           Source of truth for the machine-wide blocks written to
+                          ~/.claude/settings.json by the install script
+project-config/
+  settings.json           Per-project template; copy to .claude/settings.json in your project
+  README.md               Rationale and guidance for each entry
+install-claude-safe.sh    One-shot install script (see below)
+doc/
+  constraints.txt         Rationale for every constraint and setting
+  context.txt             This file
+
+Note: pre-built seccomp-wrapper binaries are NOT committed to the repo.
+They are compiled natively on each machine (Balfrin for x86_64, Santis for
+aarch64) and shipped together in a single release tarball.
+
+## Sandbox dependency stack
+
+bubblewrap (bwrap): provided system-wide, statically linked, no deps
+socat: built from source into ~/.local/bin; bwrap removes the network namespace
+  entirely, so socat is the only network path — bridges TCP listeners inside the
+  sandbox (port 3128 HTTP, port 1080 SOCKS5) to host-side Unix sockets; not
+  optional
+apply-seccomp: extracted from @anthropic-ai/sandbox-runtime npm tarball
+  - static binary, no runtime deps (BPF filter baked in as C array)
+  - blocks socket(AF_UNIX,...) and io_uring_*
+  - wraps agent subprocess in nested user+PID+mount namespace
+  - uses SCMP_ACT_ERRNO (soft: returns EPERM, agent can observe and report)
+  - placed at ~/.local/lib/claude-sandbox/apply-seccomp
+seccomp-wrapper: compiled natively on Balfrin (x86_64) and Santis (aarch64);
+  aarch64 binary is scp'd to Balfrin before running make-release.sh
+  - static binary (gcc -static), no runtime deps
+  - broad syscall deny-list: ptrace, kexec_load, bpf, pivot_root, io_uring, etc.
+  - personality(2) blocked via argument filtering: 0xffffffff (query) allowed,
+    all other values (ABI-switch) killed
+  - SCMP_ARCH_X86 added on x86_64, SCMP_ARCH_ARM added on aarch64 (covers
+    32-bit compat syscall numbers)
+  - uses SCMP_ACT_KILL_PROCESS — kills offending subprocess, Claude survives
+  - placed at ~/.local/bin/seccomp-wrapper
+claude-safe: launcher script at ~/.local/bin/claude-safe
+  - runs: exec seccomp-wrapper claude "$@"
+  - users invoke claude-safe instead of claude
+
+## What install-claude-safe.sh does
+1. Builds socat from source into ~/.local if not already present
+2. Extracts apply-seccomp from @anthropic-ai/sandbox-runtime npm tarball
+   (no npm needed — direct wget | tar)
+3. Copies claude-safe/seccomp-wrapper binary to ~/.local/bin/
+   Exits with error if the binary is not found — does not degrade silently
+4. Writes (overwrites) claude-safe launcher at ~/.local/bin/claude-safe
+5. Calls scripts/merge-claude-settings.py to write ~/.claude/settings.json:
+   - reads user-config/settings.json for the managed blocks
+   - injects seccomp.applyPath if apply-seccomp was installed
+   - preserves existing keys outside the managed blocks
+   - backs up corrupt files before overwriting
+
+## ~/.claude/settings.json (written by install script, sourced from user-config/settings.json)
+{
+  "enableAllProjectMcpServers": false,
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,   ← no bash prompts inside sandbox
+    "allowUnsandboxedCommands": false,  ← hard-block; no unsandboxed commands
+    "seccomp": {
+      "applyPath": "~/.local/lib/claude-sandbox/apply-seccomp"
+    },
+    "filesystem": {
+      "denyRead": ["~"],                ← block entire home dir
+      "allowRead": ["./"]              ← re-allow current project dir
+    }
+  },
+  "permissions": {
+    "allow": [
+      "Bash(sinfo *)", "Bash(squeue *)", "Bash(sacct *)",
+      "Bash(scontrol show *)", "Bash(sprio *)", "Bash(sreport *)"
+    ],
+    "deny": [
+      "Edit(**/.claude/settings.json)", "Write(**/.claude/settings.json)",
+      "Read/**/.env*)", ...,            ← credential files
+      "Bash(nc *)", "Bash(socat *)"    ← hard-deny exfiltration tools
+    ]
+  }
+}
+
+## project-config/settings.json (per-project template, copied to .claude/settings.json)
+- permissions.deny:
+    ssh/scp/rsync (Bash)   ← network access to other nodes; DECISION NEEDED
+    curl/wget (Bash)        ← outbound HTTP; DECISION NEEDED
+    mcp__*                  ← all MCP tool calls; disable per trusted server
+- SLURM write commands (sbatch/srun/salloc/scancel/scontrol modify) are NOT
+  in allow → Claude Code prompts for confirmation
+- git, pip and other dev tools deliberately NOT in deny — too disruptive
+- user-level MCP servers (~/.claude/) are NOT covered by
+  enableAllProjectMcpServers: false — review independently
+
+## Key design decisions made
+- SCMP_ACT_KILL_PROCESS chosen over SCMP_ACT_ERRNO for seccomp-wrapper:
+  kills the sandboxed subprocess (not Claude), Claude sees exit code and
+  continues — gives hard enforcement without losing the session
+- allowUnsandboxedCommands: false: primary use case is unattended autonomous
+  runs where no human is present to approve prompts; a sandbox users work
+  around is no sandbox at all
+- autoAllowBashIfSandboxed: true: sandbox is the guard, prompting inside it
+  is friction with no additional safety value
+- Machine-wide rules in user-config/settings.json, project workflow rules in
+  project-config/settings.json: sandbox and invariant security rules apply
+  everywhere; network access and MCP decisions vary per project
+- Edit/Write(**/.claude/settings.json) deny rules in global config: hard-block
+  so agent cannot ask user to approve — no prompt to social-engineer
+- seccomp-wrapper compiled as static binary: portable across HPC centers
+  even without libseccomp installed at destination
+- personality(2) uses argument filtering rather than unconditional kill:
+  allows the harmless 0xffffffff query form, blocks ABI-switch attempts
+- io_uring blocked unconditionally (CLOSE, not CHECK): CVE history justifies
+  the risk; apply-seccomp also blocks it as a second layer
+- allowRead paths are passed to bwrap as --ro-bind arguments (confirmed via
+  sandbox-runtime source): paths outside denyRead regions are already
+  accessible via root bind mount; allowRead only needed to punch back through
+  a denyRead region
+
+## Development tools
+SECCOMP_WRAPPER_DEBUG=1: swaps KILL_PROCESS for ERRNO(ENOSYS) for one session.
+Documented in claude-safe/README.md. Development use only — do not set in
+production. Human users may set it; the AI agent cannot (it is the threat model).
+
+## Open decisions
+- Domain policy: bwrap already runs --unshare-net and socat is already the
+  only network path; network.allowedDomains/deniedDomains are enforced at the
+  proxy level (stronger than tool-level deny). No domain list configured yet —
+  curl/wget tool-level deny is the active compensating control. Allowlists suit
+  projects with fixed endpoints; general coding workflows need unpredictable
+  doc domains so an allowlist is impractical there.
+- ssh deny vs. confirmation for compute node access — currently hard denied;
+  relax to confirmation if users regularly need Claude on compute nodes
+- Two-tier seccomp (KILL vs ERRNO for "unclear" syscalls) — deliberately
+  deferred; empirical profiling needed; management decision on
+  productivity/security tradeoff
+
+## Resolved decisions
+- bwrap/mount: bwrap calls mount/pivot_root/umount2 (confirmed via strace on
+  CSCS). These were removed from BLOCKED_SYSCALLS so bwrap can set up
+  filesystem namespaces. Risk is bounded: inside bwrap's user namespace only
+  bind-mounts of owned paths and pseudo-filesystems are possible.

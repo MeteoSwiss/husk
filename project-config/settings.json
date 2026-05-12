@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "deny": [
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(rsync *)",
+      "Bash(curl *)",
+      "Bash(wget *)",
+      "mcp__*"
+    ]
+  }
+}
