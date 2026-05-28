@@ -33,6 +33,31 @@
 
 set -euo pipefail
 
+# ── Confirm before modifying ~/.claude/settings.json ─────────────────────────
+
+SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+echo ""
+echo "This script will merge settings into ~/.claude/settings.json."
+echo "Existing settings outside these blocks are preserved."
+echo ""
+echo "What will be added:"
+echo "  1. Sandbox isolation — restricts Claude to the current project directory;"
+echo "     blocks all home directories (/users/); enables seccomp syscall filters."
+echo "  2. Permission rules — pre-approves SLURM read-only commands (sinfo, squeue,"
+echo "     sacct, ...); blocks credential files, nc, socat, and Claude's own"
+echo "     settings files from being read or modified by the agent."
+echo ""
+echo "Full settings (user-config/settings.json):"
+echo "────────────────────────────────────────────────────────"
+cat "$SCRIPT_DIR_EARLY/user-config/settings.json"
+echo "────────────────────────────────────────────────────────"
+echo ""
+echo "Press Enter to continue or Ctrl+C to cancel."
+read -r
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 for _cmd in wget python3 tar sha256sum sha512sum; do
   command -v "$_cmd" >/dev/null 2>&1 \
     || { echo "error: '$_cmd' is required but not found on PATH"; exit 1; }

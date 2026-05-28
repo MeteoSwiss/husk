@@ -16,6 +16,9 @@ Run the install script once from this repository:
 ./install-claude-safe.sh
 ```
 
+> The script will show you exactly what it will add to `~/.claude/settings.json`
+> and ask for confirmation before making any changes.
+
 If `~/.local/bin` is not yet on your PATH, add this to `~/.bashrc` or
 `~/.bash_profile`:
 
@@ -45,8 +48,8 @@ See [Per-project setup](#per-project-setup) for details.
 ## What it restricts
 
 **Filesystem:** Claude can only read and write files inside the current project
-directory. Your home directory — SSH keys, API tokens, configuration files — is
-not visible to the agent. Data on shared filesystems outside your home directory
+directory. All home directories — yours and other users' — are not visible to
+the agent. Data on shared filesystems outside the home directories
 (e.g. `/scratch/`) is readable but not writable.
 
 **SLURM:** Read-only commands (`sinfo`, `squeue`, `sacct`, etc.) run freely.

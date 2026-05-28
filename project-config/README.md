@@ -46,8 +46,8 @@ Some entries may be too aggressive for your workflow:
 
 The global sandbox blocks the entire home directory from Claude's view, with
 only the current project directory visible. If your conda environment or Python
-installation lives inside `~` (e.g. `~/miniconda3/`), Claude's Bash commands
-won't find it.
+installation lives inside your home directory (e.g. `~/miniconda3/`), Claude's
+Bash commands won't find it — home directories are blocked by the sandbox.
 
 Check where your Python lives:
 
@@ -56,19 +56,19 @@ which python3
 echo $CONDA_PREFIX
 ```
 
-If the path starts with `~` or `/home/`, add it to `allowRead` in your project's
-`.claude/settings.json`:
+If the path starts with `/users/` (or your site's home directory prefix), add
+it to `allowRead` in your project's `.claude/settings.json`:
 
 ```json
 {
   "sandbox": {
     "filesystem": {
-      "allowRead": ["./", "~/miniconda3/"]
+      "allowRead": ["./", "/users/yourusername/miniconda3/"]
     }
   }
 }
 ```
 
-Adjust the path to match your actual installation (`~/miniforge3/`,
-`~/.conda/`, etc.). If your Python is on `/scratch/` or loaded via a module,
-no change is needed — paths outside `~` are already visible inside the sandbox.
+Adjust the path to match your actual installation. If your Python is on
+`/scratch/` or loaded via a module, no change is needed — paths outside the
+home directories are already visible inside the sandbox.

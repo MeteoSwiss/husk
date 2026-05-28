@@ -5,7 +5,7 @@
     "autoAllowBashIfSandboxed": true,
     "allowUnsandboxedCommands": false,
     "filesystem": {
-      "denyRead": ["~"],
+      "denyRead": ["/users"],
       "allowRead": ["./"]
     }
   },

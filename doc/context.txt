@@ -63,6 +63,8 @@ claude-safe: launcher script at ~/.local/bin/claude-safe
   - users invoke claude-safe instead of claude
 
 ## What install-claude-safe.sh does
+0. Prints a plain-English summary of what will be added to ~/.claude/settings.json,
+   then shows the raw user-config/settings.json, then prompts to continue or cancel
 1. Builds socat from source into ~/.local if not already present
 2. Extracts apply-seccomp from @anthropic-ai/sandbox-runtime npm tarball
    (no npm needed — direct wget | tar)
@@ -86,7 +88,7 @@ claude-safe: launcher script at ~/.local/bin/claude-safe
       "applyPath": "~/.local/lib/claude-sandbox/apply-seccomp"
     },
     "filesystem": {
-      "denyRead": ["~"],                ← block entire home dir
+      "denyRead": ["/users"],           ← block all home dirs (CSCS: /users/)
       "allowRead": ["./"]              ← re-allow current project dir
     }
   },

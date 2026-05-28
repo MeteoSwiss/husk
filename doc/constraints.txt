@@ -47,10 +47,12 @@ sandbox.seccomp.applyPath
   architecture) rather than writing a broken path.
 
 sandbox.filesystem.denyRead / allowRead
-  denyRead: ["~"] blocks the entire home directory.
+  denyRead: ["/users"] blocks all home directories on CSCS (where home
+  directories live under /users/). This prevents the agent from reading the
+  current user's ~/.ssh, API tokens, and other users' world-readable files on
+  the shared filesystem. Adjust to /home (or the relevant parent) on other
+  HPC systems.
   allowRead: ["./"] re-allows the current project directory.
-  This prevents the agent from reading ~/.ssh, API tokens, or other users'
-  world-readable files on shared filesystems.
 
   allowRead paths are passed to bwrap as --ro-bind arguments (confirmed via
   sandbox-runtime source). Paths outside any denyRead region are already
@@ -74,7 +76,7 @@ sandbox.filesystem.denyRead / allowRead
 
   Native file tools — Read, Edit, Write (run in the Claude Code process):
     These run OUTSIDE bwrap entirely and bypass its filesystem restrictions.
-    denyRead: ["~"] and allowRead: ["./"] cause Claude Code to PROMPT the
+    denyRead: ["/users"] and allowRead: ["./"] cause Claude Code to PROMPT the
     user before proceeding, but do not hard-block access.
     autoAllowBashIfSandboxed does NOT apply — native tools always prompt,
     even inside the project directory.
