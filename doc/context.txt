@@ -1,4 +1,4 @@
-Context as of 2026-05-27
+Context as of 2026-06-02
 
 ## Project
 agentskills-internal — tooling to run Claude Code in a hardened sandbox on
@@ -51,7 +51,10 @@ apply-seccomp: extracted from @anthropic-ai/sandbox-runtime npm tarball
 seccomp-wrapper: compiled natively on Balfrin (x86_64) and Santis (aarch64);
   aarch64 binary is scp'd to Balfrin before running make-release.sh
   - static binary (gcc -static), no runtime deps
-  - broad syscall deny-list: ptrace, kexec_load, bpf, pivot_root, io_uring, etc.
+  - broad syscall deny-list: ptrace, kexec_load, bpf, io_uring, etc.
+    (mount/umount2/pivot_root/capset are intentionally NOT blocked — bwrap
+    needs them for user-namespace setup; blocking capset killed bwrap on
+    aarch64, fixed 2026-06-03)
   - personality(2) blocked via argument filtering: 0xffffffff (query) allowed,
     all other values (ABI-switch) killed
   - SCMP_ARCH_X86 added on x86_64, SCMP_ARCH_ARM added on aarch64 (covers
@@ -98,10 +101,15 @@ claude-safe: launcher script at ~/.local/bin/claude-safe
       "Bash(scontrol show *)", "Bash(sprio *)", "Bash(sreport *)"
     ],
     "deny": [
-      "Edit(**/.claude/settings.json)", "Write(**/.claude/settings.json)",
-      "Read/**/.env*)", ...,            ← credential files
+      "Edit(~/.claude/settings.json)", "Edit(.claude/settings.json)",
+      "Edit(.claude/settings.local.json)", ...   ← sandbox-config integrity
+      "Read(//**/.env*)", "Read(//**/credentials)", ...  ← credential files
       "Bash(nc *)", "Bash(socat *)"    ← hard-deny exfiltration tools
     ]
+    (//**/ = filesystem-wide. The /sandbox Config tab warns these globs are
+     "not fully supported on Linux" — that is the bwrap boundary only; the
+     permission layer still enforces them on the native tools (confirmed
+     2026-06-04). Cosmetic. See constraints.txt "credential files".)
   }
 }
 
@@ -146,21 +154,218 @@ SECCOMP_WRAPPER_DEBUG=1: swaps KILL_PROCESS for ERRNO(ENOSYS) for one session.
 Documented in claude-safe/README.md. Development use only — do not set in
 production. Human users may set it; the AI agent cannot (it is the threat model).
 
+## Documented gaps and their disposition
+
+The sandbox does not defend against every harm. The list below records
+each known gap, what the sandbox does or does not do about it, and the
+recommended path for users and agents.
+
+SLURM-path escape (affects H2 / H4 / H6 / H7 / H8)
+  Sandbox: bwrap mount and network namespaces, the seccomp filter, and the
+  proxy path do NOT propagate to SLURM-submitted jobs. A submitted job runs on
+  a compute node via slurmstepd — outside every sandbox layer the login-node
+  agent sits inside. Env vars propagate (SLURM's --export=ALL default) so
+  conda/PYTHONPATH work, which can look like inheritance, but no kernel-level
+  isolation reaches the compute node.
+
+  Empirical findings (Santis, 2026-06):
+    - SLURM does NOT work from inside the sandbox today. Every client
+      (sbatch/srun/salloc AND the read-only sinfo/squeue/sacct) authenticates
+      to slurmctld/slurmdbd via MUNGE over a local AF_UNIX socket and reaches
+      the controller over the network — apply-seccomp blocks AF_UNIX, bwrap
+      --unshare-net removes the route. Two independent walls -> the bash-path
+      escape is ALREADY closed (and the allow-listed read commands also fail
+      in-sandbox; see constraints.txt).
+    - bwrap + --unshare-net WORKS on compute nodes (confirmed: `srun bwrap
+      --ro-bind / / --dev /dev --proc /proc --unshare-net true` -> exit 0); the
+      login/compute software stack is identical, so re-sandboxing a job on the
+      compute node is viable.
+
+  Disposition — the SLURM GATEWAY, built within v0.2.x (decided 2026-06-04;
+  NOT gated on v0.3). Two-layer defense, same shape as H1's layering.
+
+    User-side layer (the GATEWAY, built within v0.2.x): the agent never runs
+      the real sbatch. A thin stub SHADOWS sbatch inside the sandbox
+      (bind-mount over /usr/bin/sbatch, inherited by claude's inner bwrap —
+      claude is an unpatchable single binary, native installer AND npm both
+      resolving to the same ~240MB platform binary, so we contain from
+      OUTSIDE). The stub only SERIALIZES a structured request to a
+      bind-mounted drop dir / fifo (plain file I/O — works even though
+      apply-seccomp blocks AF_UNIX). A small BROKER process running OUTSIDE
+      the sandbox — where MUNGE + network already work — validates the
+      request, forces safe options (allowed partition/QoS, time cap,
+      --export=NONE, fixed --output), and submits a job whose payload runs
+      RE-SANDBOXED (seccomp-wrapper + bwrap) on the compute side. Example:
+      agent `sbatch evil.sh` -> broker submits `sbatch <forced opts>
+      --wrap='seccomp-wrapper bwrap --unshare-net --tmpfs $HOME … bash
+      evil.sh'`, so the agent's code runs but jailed (no net, no home/creds).
+
+        Why a gateway, not a shim that submits from inside: a submitting shim
+        is POROUS — to let it submit you must open MUNGE+network in the
+        agent's sandbox, which also lets the agent submit DIRECTLY
+        (pyslurm/raw RPC), bypassing the shim. Keeping the real binary OUTSIDE
+        (the broker) is the only non-porous option without admin
+        (non-porous + no-broker + no-admin = pick two).
+        VERIFY-FIRST (gates the build): confirm claude's inner bwrap inherits
+        an outer bind-mount over sbatch —
+          unshare -rm bash -c 'mount --bind fake /usr/bin/sbatch; exec claude-safe'
+        then have the agent run `which sbatch`. Sees fake => build it.
+
+      v0.3-stable by design: the broker, the request schema, and the
+      compute-side seccomp-wrapper+bwrap wrapper layer ON the
+      Anthropic/claude-safe sandbox and do NOT need reworking for v0.3 — only
+      the thin delivery (stub shadowing + channel mount) re-wires there, and
+      gets easier with an open agent. Make it a contract (see
+      sandbox-interface.txt): the sandbox shadows sbatch and exposes the
+      broker channel via a SANDBOX_* env var.
+
+      Compute-side network policy: --unshare-net for non-fabric jobs. For
+      MPI / Slingshot-fabric jobs --unshare-net would break RDMA, so network
+      containment for those moves to the ADMIN layer (restricted partition,
+      no external IP egress, + Slingshot per-job VNI; the fabric is
+      VNI-isolated and the job needs it for MPI+Lustre). Worth testing whether
+      CXI survives --unshare-net (fabric-native addressing may be
+      netns-independent) — if so the hole closes unprivileged.
+
+    Admin-side layer (site-specific, recommended for high-assurance
+      deployments): SLURM job_submit Lua plugin that mandates the
+      wrapper for the agent's account, OR a restricted partition with
+      no external network and limited mounts, OR equivalent. Stronger
+      boundary because slurmd and plugins are admin-controlled — the
+      agent cannot tamper. Per-site engineering required; not
+      universally available.
+
+    Both deployed together: defense in depth. Admin-side catches what
+    the user-side shim misses (the unenumerated SLURM path); user-side
+    catches what admin-side misses (the plugin's corner cases). Same
+    layering pattern as H1: our seccomp narrowing, admin-side syscall
+    policy, and kernel UID checks each contribute without any one
+    being sufficient on its own.
+
+    Sites with no admin engagement get only the user-side layer.
+    Acceptable for interactive use; weak for unsupervised multi-day
+    runs at such sites. For unsupervised use at unconfigured sites,
+    the "block sbatch entirely" fallback (denyRead on the SLURM
+    binaries) is the safer alternative.
+
+  (The escape itself — submitted jobs running unsandboxed on compute nodes —
+  follows from the architecture; the gateway above is what re-sandboxes them.
+  See the slurm-job-shim design notes for the full broker design + the
+  MPI/Slingshot network analysis.)
+
+H3 (compute resource abuse)
+  Sandbox: does not enforce SLURM job rate limits — cannot reason about
+  whether a given sbatch is legitimate or abusive.
+  v0.2 disposition: sbatch / srun / salloc / scancel are NOT in
+  permissions.allow, so Claude Code prompts per submission. User
+  attention is the only control. No budget or rate-limit mechanism.
+
+  v0.3 sandbox-layer option (planned): route SLURM submissions into a
+  site-provided constrained execution environment via SBATCH_PARTITION /
+  SBATCH_QOS env var plus a wrapper script that strips overrides.
+  Mechanisms the site might offer:
+    - Preemptive queue (CSCS has "preemptive"): jobs evicted when higher-
+      priority jobs need the resources. Bounds queue-impact damage.
+    - Restricted QoS (admin-configured): GrpTRESRunMins, MaxJobsPerUser,
+      etc. Bounds resource consumption.
+    - Time-bounded reservation: heavier, rare.
+  Sites without any of these fall back to prompt-per-submission. Custom
+  rate limiter inside the sandbox itself is possible but probably not
+  worth the maintenance (edge cases dominate).
+
+  Note: the SLURM-path escape (see entry above) means submitted jobs
+  run outside bwrap entirely. Preemptive-queue routing caps H3
+  specifically (resource cost); it does not bound the other harms
+  reachable from a compute-node job. The escape is a separate gap with
+  its own disposition above.
+
+  Beyond v0.3: agent-layer policy. The agent contract is expected to
+  include per-tool approval (command-pattern allowlist, analogous to the
+  network allowlist) for finer policy than queue routing alone provides.
+
+H4 (project-directory data destruction)
+  Sandbox: does not protect files in the project directory — the project
+  dir IS the agent's writable working surface by design.
+  Disposition: operational. See "Operational mitigations" in
+  constraints.txt for the recommended pattern (separate precious data,
+  mount inputs read-only via allowRead, take backups). No sandbox-layer
+  fix is possible without giving up the project dir as a working surface.
+
+Sandbox performance on Lustre / large trees (v0.2 known bug, not security)
+  Symptom: repeated ~60s freezes running claude-safe in a large project
+  tree (e.g. ICON, many build dirs) on Lustre, and when opening
+  /sandbox -> Config. Leading cause (diagnosed Balfrin 2026-06-01): bwrap
+  bind-MOUNTING the dangerous-file deny set on Lustre — FINDING the files
+  is fast (a depth-3 find in ICON is quick), MOUNTING over each in a
+  Lustre-backed namespace is the cost.
+  v0.2 disposition: genuine upstream bug, no user remediation — the logic
+  is compiled into the closed claude binary, and the standalone runtime's
+  mandatoryDenySearchDepth knob is NOT honored by the shipped binary.
+  Workaround: launch from a leaner cwd (not the build-heavy root); keep big
+  build/output dirs out of the working dir (also shrinks H4 blast radius);
+  avoid the Config tab in giant trees; report upstream.
+  v0.3: with our own runtime/fork we control the deny set and the walk —
+  tune depth, prune build dirs, memoize, move it off the UI path.
+
+Bash vs. native-tool asymmetry (affects H2, H7, H8)
+  Sandbox: defends the bash path comprehensively (bwrap). The native-tool
+  path (Read / Edit / Write in Claude Code) bypasses bwrap by running
+  in-process and is defended by enumerated deny patterns plus user-
+  reviewed prompts.
+  Linux note (resolved 2026-06-04): the /sandbox Config tab warns these glob
+  deny patterns are "not fully supported on Linux" and "will be ignored."
+  That is the bwrap BOUNDARY only — bwrap cannot express a glob — NOT the
+  permission-layer enforcement. The native-tool protection works: confirmed on
+  Santis that a native Read of a .env is DENIED by Claude Code's permission
+  layer (and `cat .env` in the cwd is blocked at the OS layer by the
+  mandatory-deny scan). Using the "//**/" form for filesystem-wide coverage;
+  the warning is cosmetic and unavoidable for any glob rule (see constraints.txt).
+  Disposition: structural. v0.3 addresses this by requiring agents to run
+  system-affecting tools as subprocesses (see doc/sandbox-interface.txt
+  under "What the agent must accept"). Once file tools are sandboxable
+  subprocesses the OS filesystem boundary covers them uniformly and the
+  enumerated permission rules become redundant — the credential-name and
+  config-protection intent migrates into bwrap denyRead and the contract's
+  "no API to modify policy" property. Existing Claude Code stays a
+  best-effort integration with documented asymmetries.
+
+H6 (internet exfiltration) had been listed here as a gap; resolved by the
+two-posture allowlist model. See Resolved decisions below. Audit side:
+socat HTTP request logging is available as an opt-in for high-exposure
+projects; not enabled by default.
+
 ## Open decisions
-- Domain policy: bwrap already runs --unshare-net and socat is already the
-  only network path; network.allowedDomains/deniedDomains are enforced at the
-  proxy level (stronger than tool-level deny). No domain list configured yet —
-  curl/wget tool-level deny is the active compensating control. Allowlists suit
-  projects with fixed endpoints; general coding workflows need unpredictable
-  doc domains so an allowlist is impractical there.
 - ssh deny vs. confirmation for compute node access — currently hard denied;
   relax to confirmation if users regularly need Claude on compute nodes
 - Two-tier seccomp (KILL vs ERRNO for "unclear" syscalls) — deliberately
   deferred; empirical profiling needed; management decision on
   productivity/security tradeoff
+- Sandbox-config integrity via managed settings — put "sandbox":{"enabled":
+  true} in /etc/claude-code/managed-settings.json (admin-controlled,
+  non-overridable) so the sandbox cannot be disabled by editing any
+  user-writable settings file. Needs CSCS admin; pair with the admin-side
+  SLURM layer. The v0.2.1 .claude/settings.local.json deny is the user-side
+  stopgap (closes the project-local override that outranks user settings).
+- SLURM shim seccomp/MUNGE: relax apply-seccomp (AF_UNIX) vs out-of-sandbox
+  broker for controlled real sbatch — see "SLURM-path escape" above.
 
 ## Resolved decisions
-- bwrap/mount: bwrap calls mount/pivot_root/umount2 (confirmed via strace on
-  CSCS). These were removed from BLOCKED_SYSCALLS so bwrap can set up
-  filesystem namespaces. Risk is bounded: inside bwrap's user namespace only
-  bind-mounts of owned paths and pseudo-filesystems are possible.
+- Domain policy (H6): two-posture model. Strict (default deny outside
+  allowlist) for projects with known fixed endpoints. Permissive (default
+  allow except blocklist) for general coding and research where domains
+  are unpredictable. Allowlist is user-maintained in settings.json under
+  sandbox.network.allowedDomains; agent cannot modify (settings.json is
+  deny-blocked). Proxy picks up changes without restart. The agent can
+  surface denials to the user but cannot expand the allowlist itself —
+  the user must edit the settings file directly. Deliberate: an agent
+  that could expand its own permissions would bypass H6 entirely. See
+  doc/constraints.txt under "Network isolation" for the configuration
+  details.
+- bwrap syscalls: bwrap calls mount/pivot_root/umount2 (confirmed via strace on
+  CSCS) and capset (drops caps during user-namespace setup). These were removed
+  from / kept out of BLOCKED_SYSCALLS so bwrap can set up filesystem namespaces;
+  capset was the last one still blocked, which killed bwrap on aarch64 (Santis,
+  fixed 2026-06-03 + a bwrap gate in build_and_test.sh). Risk is bounded: inside
+  bwrap's user namespace only bind-mounts of owned paths and pseudo-filesystems
+  are possible, and an unprivileged NO_NEW_PRIVS process has an empty permitted
+  cap set so capset cannot escalate.

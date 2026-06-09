@@ -16,6 +16,12 @@
 
 set -euo pipefail
 
+# --help prints this script's header comment block (single source of truth).
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '1d; /^#/!q; s/^#//; s/^ //; p' "$0"
+  exit 0
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/.build"
 PREFIX="${BUILD_DIR}/prefix"
@@ -135,6 +141,35 @@ if "${SCRIPT_DIR}/test/smoke" \
 else
     echo "  [error] smoke test failed — binary not installed"
     exit 1
+fi
+
+# ── bwrap compatibility gate ──────────────────────────────────────────────────
+#
+# The smoke test checks our deny-list behaves, but NOT that bwrap can still set
+# up its sandbox UNDER the wrapper. bwrap needs a few syscalls during
+# user-namespace setup (notably capset); if the deny-list ever blocks one,
+# every sandboxed command dies with SIGSYS — which is exactly how the aarch64
+# (Santis) breakage slipped through. This gate catches it per-arch at build
+# time, so a wrapper that breaks bwrap is never installed.
+
+log "Verifying bwrap runs under the wrapper"
+if command -v bwrap >/dev/null 2>&1; then
+    if "${BUILD_DIR}/seccomp-wrapper" bwrap --dev-bind / / true; then
+        ok "bwrap sets up its namespace under the wrapper"
+    else
+        rc=$?
+        echo "  [error] bwrap FAILED under the wrapper (exit ${rc})"
+        [[ ${rc} -eq 159 ]] && echo "          159 = SIGSYS: the deny-list is blocking a syscall bwrap needs."
+        echo "          Find it (run bwrap WITHOUT the wrapper) and exclude it in"
+        echo "          src/seccomp_wrapper.c, e.g.:"
+        echo "            strace -f -e trace=capset,setuid,setgid,setresuid,setresgid,setreuid,setregid,setfsuid,setfsgid \\"
+        echo "              bwrap --dev-bind / / true"
+        echo "          Binary NOT installed."
+        exit 1
+    fi
+else
+    echo "  [warn] bwrap not found on PATH — cannot verify sandbox setup here."
+    echo "         Verify on the target system before relying on this build."
 fi
 
 # ── install binary ────────────────────────────────────────────────────────────

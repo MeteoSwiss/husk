@@ -18,6 +18,12 @@
 
 set -euo pipefail
 
+# --help prints this script's header comment block (single source of truth).
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '1d; /^#/!q; s/^#//; s/^ //; p' "$0"
+  exit 0
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINARY_X86_64="${REPO_ROOT}/claude-safe/seccomp-wrapper-x86_64"
 BINARY_AARCH64="${REPO_ROOT}/claude-safe/seccomp-wrapper-aarch64"

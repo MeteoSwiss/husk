@@ -60,8 +60,22 @@ static const char *const BLOCKED_SYSCALLS[] = {
     "setfsuid",
     "setfsgid",
 
-    /* --- capability manipulation --- */
-    "capset",
+    /* --- capability manipulation ---
+     *
+     * capset is intentionally NOT blocked. bwrap calls it while setting up its
+     * user namespace (to drop the capabilities it does not need); blocking it
+     * kills bwrap before it can sandbox anything — observed on Santis (aarch64,
+     * bwrap 0.11.0): every sandboxed command died with SIGSYS on capset (#91).
+     * On x86_64 the same block exists but Balfrin's bwrap build does not hit
+     * that path, which is why it surfaced only on aarch64. Same reasoning as
+     * the mount/umount2/pivot_root exclusion below.
+     *
+     * The security cost is ~nil here: this process runs unprivileged with
+     * NO_NEW_PRIVS, so its permitted capability set is empty and capset cannot
+     * grant a capability it does not already hold. Inside bwrap's user
+     * namespace any capabilities are confined to that namespace and cannot
+     * affect the host.
+     */
 
     /* --- side-channel / CPU pinning --- */
     "sched_setaffinity",
@@ -214,8 +228,9 @@ static int install_filter(bool debug_mode)
      * is belt-and-braces. On other aarch64 cores (Cortex-A series) it is
      * the primary protection against the 32-bit ABI bypass.
      *
-     * The personality(PER_LINUX32) block above already prevents ABI switches
-     * via personality(2); this is a second layer in case that is bypassed.
+     * The personality(PER_LINUX32) block below (in install_filter) already
+     * prevents ABI switches via personality(2); this is a second layer in
+     * case that is bypassed.
      */
     rc = seccomp_arch_add(ctx, SCMP_ARCH_ARM);
     if (rc != 0 && rc != -EEXIST) {

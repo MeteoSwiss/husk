@@ -250,6 +250,7 @@ The `CHECK` list needs empirical profiling — see [Empirical profiling workflow
 | `mount` | Required by bwrap to bind-mount the project directory and pseudo-filesystems (tmpfs, proc) when setting up the tool sandbox. Blocked by earlier versions; removed from CLOSE after confirming that apply-seccomp does not cover it and that bwrap failing silently defeats the filesystem namespace layer entirely. Risk is bounded: inside bwrap's user namespace only bind-mounts of owned paths and pseudo-filesystems are possible — real device mounts require CAP_SYS_ADMIN outside a user namespace. |
 | `umount2` | Same rationale as `mount` — bwrap tears down mounts at exit. |
 | `pivot_root` | Same rationale — bwrap uses pivot_root to switch the root filesystem inside the new mount namespace. `chroot` remains blocked because bwrap does not use it. |
+| `capset` | Required by bwrap to drop the capabilities it does not need while setting up its user namespace. Blocked by earlier versions — which silently killed bwrap on aarch64 (Santis, bwrap 0.11.0): every sandboxed command died with SIGSYS on `capset`. Removed from CLOSE 2026-06-03. Risk is bounded: with `NO_NEW_PRIVS` set and an unprivileged UID the permitted capability set is empty, so `capset` cannot grant a capability the process does not already hold; capabilities inside bwrap's user namespace are confined to that namespace. `build_and_test.sh` now gates on `seccomp-wrapper bwrap … true` succeeding, so a wrapper that breaks bwrap is never installed. |
 
 ### CLOSE — block unconditionally
 
@@ -268,7 +269,6 @@ These are implemented as `SCMP_ACT_KILL_PROCESS` in `src/seccomp_wrapper.c`.
 | `setregid` | Set real/effective GID — same |
 | `setfsuid` | Set filesystem UID — same |
 | `setfsgid` | Set filesystem GID — same |
-| `capset` | Set capabilities — could escalate privileges |
 | `sched_setaffinity` | Pin process to CPU — primary use case is cache-timing side-channel attacks |
 | `perf_event_open` | Performance monitoring — known side-channel attack surface |
 | `kexec_load` | Load a new kernel — obviously not needed |

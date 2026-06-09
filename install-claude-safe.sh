@@ -22,8 +22,15 @@
 #                             restricts filesystem reads to the current project,
 #                             and hard-blocks the agent from editing settings files
 #
+# Prerequisites:
+#   - The `claude` CLI installed and signed in. claude-safe wraps an existing
+#     Claude Code install; this script does NOT install or update Claude.
+#   - bubblewrap (bwrap) available system-wide (present on CSCS).
+#
 # Usage:
-#   ./install-claude-safe.sh
+#   ./install-claude-safe.sh              install / update
+#   ./install-claude-safe.sh --uninstall  remove everything this installed and
+#                                         revert ~/.claude/settings.json
 #
 # After running, add to ~/.bashrc or ~/.bash_profile if not already present:
 #   export PATH="$HOME/.local/bin:$PATH"
@@ -37,6 +44,60 @@ set -euo pipefail
 
 SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── --help ────────────────────────────────────────────────────────────────────
+# Prints this script's header comment block (the single source of truth for what
+# it does), so help text never duplicates or drifts from the header.
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  sed -n '1d; /^#/!q; s/^#//; s/^ //; p' "$0"
+  exit 0
+fi
+
+# ── Uninstall mode (./install-claude-safe.sh --uninstall) ────────────────────
+if [[ "${1:-}" == "--uninstall" ]]; then
+  PREFIX="${HOME}/.local"
+  CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
+  MANIFEST="$PREFIX/lib/claude-sandbox/uninstall-manifest.json"
+
+  echo ""
+  echo "This will remove claude-safe from your home directory:"
+  echo "  - delete  $PREFIX/bin/{claude-safe,seccomp-wrapper,seccomp-wrapper.sha256}"
+  echo "            $PREFIX/lib/claude-sandbox/apply-seccomp"
+  echo "  - revert the enableAllProjectMcpServers / sandbox / permissions blocks in"
+  echo "    $CLAUDE_SETTINGS to their pre-install state (all other settings kept)"
+  echo "  - socat at $PREFIX/bin/socat is LEFT in place (a shared dependency);"
+  echo "    remove it yourself if nothing else uses it"
+  echo ""
+  echo "Press Enter to continue or Ctrl+C to cancel."
+  read -r
+
+  if [[ -f "$CLAUDE_SETTINGS" ]]; then
+    bak="$CLAUDE_SETTINGS.bak.$(date +%s)"
+    cp "$CLAUDE_SETTINGS" "$bak"
+    printf '  [ok]   backed up current settings to %s\n' "$bak"
+    python3 "$SCRIPT_DIR_EARLY/scripts/merge-claude-settings.py" --uninstall \
+      "$CLAUDE_SETTINGS" "$MANIFEST"
+  else
+    printf '  [skip] %s does not exist\n' "$CLAUDE_SETTINGS"
+  fi
+
+  # Read the manifest (above) before deleting it here.
+  for f in "$PREFIX/bin/claude-safe" \
+           "$PREFIX/bin/seccomp-wrapper" \
+           "$PREFIX/bin/seccomp-wrapper.sha256" \
+           "$PREFIX/lib/claude-sandbox/apply-seccomp" \
+           "$MANIFEST"; do
+    if [[ -e "$f" ]]; then rm -f "$f"; printf '  [ok]   removed %s\n' "$f"; fi
+  done
+  rmdir "$PREFIX/lib/claude-sandbox" 2>/dev/null \
+    && printf '  [ok]   removed %s\n' "$PREFIX/lib/claude-sandbox" || true
+
+  echo ""
+  echo "claude-safe removed. Your ~/.bashrc PATH line (if you added one) and socat"
+  echo "were left untouched."
+  exit 0
+fi
+# ─────────────────────────────────────────────────────────────────────────────
+
 echo ""
 echo "This script will merge settings into ~/.claude/settings.json."
 echo "Existing settings outside these blocks are preserved."
@@ -44,14 +105,20 @@ echo ""
 echo "What will be added:"
 echo "  1. Sandbox isolation — restricts Claude to the current project directory;"
 echo "     blocks all home directories (/users/); enables seccomp syscall filters."
-echo "  2. Permission rules — pre-approves SLURM read-only commands (sinfo, squeue,"
-echo "     sacct, ...); blocks credential files, nc, socat, and Claude's own"
-echo "     settings files from being read or modified by the agent."
+echo "  2. Permission rules — lets SLURM read-only commands (sinfo, squeue, sacct)"
+echo "     run without a prompt; blocks credential files, nc, socat, and Claude's"
+echo "     own settings files from being read or modified by the agent."
 echo ""
 echo "Full settings (user-config/settings.json):"
 echo "────────────────────────────────────────────────────────"
 cat "$SCRIPT_DIR_EARLY/user-config/settings.json"
 echo "────────────────────────────────────────────────────────"
+echo ""
+echo "Note: Claude Code records every session to"
+echo "  ~/.claude/projects/<project>/<session-id>.jsonl"
+echo "Every prompt, tool call, and response is captured. Over months these"
+echo "become a detailed record of how you write and what you work on."
+echo "Delete sessions you do not want to keep."
 echo ""
 echo "Press Enter to continue or Ctrl+C to cancel."
 read -r
@@ -66,6 +133,7 @@ unset _cmd
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${HOME}/.local"
+MANIFEST="$PREFIX/lib/claude-sandbox/uninstall-manifest.json"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -115,6 +183,18 @@ system_has_bin() {
   done
   return 1
 }
+
+# ── bwrap (runtime prerequisite) ──────────────────────────────────────────────
+#
+# bwrap (bubblewrap) is what actually creates the filesystem/network namespace at
+# runtime — claude-safe cannot sandbox without it. It is provided system-wide on
+# CSCS. Warn rather than fail, so the install still completes on nodes where it
+# is provisioned separately (e.g. via a module), but make the gap explicit.
+
+if ! command -v bwrap >/dev/null 2>&1; then
+  warn "bwrap (bubblewrap) not found on PATH — claude-safe cannot sandbox without it."
+  warn "It is provided system-wide on CSCS; install or load it before running claude-safe."
+fi
 
 # ── socat ─────────────────────────────────────────────────────────────────────
 
@@ -221,6 +301,12 @@ fi
 mkdir -p "$PREFIX/bin"
 cat > "$CLAUDE_SAFE_DEST" <<'LAUNCHER'
 #!/usr/bin/env bash
+if ! command -v claude >/dev/null 2>&1; then
+  echo "claude-safe: the 'claude' CLI was not found on PATH." >&2
+  echo "claude-safe wraps an existing Claude Code install; install and sign in" >&2
+  echo "first, then re-run. See https://code.claude.com/docs" >&2
+  exit 127
+fi
 exec seccomp-wrapper claude "$@"
 LAUNCHER
 chmod +x "$CLAUDE_SAFE_DEST"
@@ -241,7 +327,8 @@ CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
 mkdir -p "${HOME}/.claude"
 
 python3 "$SCRIPT_DIR/scripts/merge-claude-settings.py" \
-  "$CLAUDE_SETTINGS" "$APPLY_SECCOMP_DEST" "$SCRIPT_DIR/user-config/settings.json"
+  "$CLAUDE_SETTINGS" "$APPLY_SECCOMP_DEST" "$SCRIPT_DIR/user-config/settings.json" \
+  "$MANIFEST"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
@@ -256,5 +343,14 @@ echo ""
 echo "If you have not already done so, add this to ~/.bashrc or ~/.bash_profile:"
 echo '  export PATH="$HOME/.local/bin:$PATH"'
 echo ""
-echo "Then start Claude Code with:"
-echo '  claude-safe'
+if command -v claude >/dev/null 2>&1; then
+  echo "Then start Claude Code with:"
+  echo "  claude-safe"
+else
+  echo "One prerequisite is still missing: the 'claude' CLI is not on your PATH."
+  echo "claude-safe wraps an existing Claude Code install — it does not install"
+  echo "Claude for you. Install and sign in first (see https://code.claude.com/docs),"
+  echo "then start it with:  claude-safe"
+fi
+echo ""
+echo "To remove everything this installed later:  ./install-claude-safe.sh --uninstall"

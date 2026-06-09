@@ -13,6 +13,11 @@ Settings are split by scope:
     project-config/settings.json; covers workflow decisions that vary per
     project (network egress, MCP).
 
+Each control below is annotated with the threat-model harm IDs it defends
+against. The harm catalog (H1, H2, …, H9-out) is defined in
+doc/threat-model.txt. Status notes — where defenses are partial,
+compensating, or depend on user attention — are captured per-control here.
+
 
 ── ~/.claude/settings.json (written by install-claude-safe.sh) ───────────────
 
@@ -21,11 +26,16 @@ per-repo setup. The install script preserves existing keys outside the
 "enableAllProjectMcpServers", "sandbox", and "permissions" blocks.
 
 enableAllProjectMcpServers: false
+  Defends: H6 (exfiltration via MCP server), H8 (identity abuse via MCP).
+
   Prevents project-local .mcp.json files from silently activating MCP servers
   when a project is cloned. Set globally so it applies even if the user never
   copies the project config template.
 
 sandbox.enabled: true
+  Defends: meta — without this, none of the H1, H2, H5', H6, H7, H8
+  defenses are active.
+
   Activates the bwrap + seccomp sandbox for all Claude Code sessions.
 
 sandbox.autoAllowBashIfSandboxed: true
@@ -34,6 +44,10 @@ sandbox.autoAllowBashIfSandboxed: true
   additional safety value.
 
 sandbox.allowUnsandboxedCommands: false
+  Defends: meta — prevents the agent from requesting an escape from the
+  sandbox at all. Without it an inattentive user could approve unsandboxed
+  execution, voiding every other defense.
+
   Hard-blocks all commands that would run outside the sandbox. The primary
   use case is long-running autonomous sessions (e.g. multi-day hyperparameter
   optimization) where no human is watching to approve prompts. In that context
@@ -42,11 +56,20 @@ sandbox.allowUnsandboxedCommands: false
   be aware that a sandbox users work around is no sandbox at all.
 
 sandbox.seccomp.applyPath
+  Defends: H1 (inner BPF filter layer beyond seccomp-wrapper), H6 (blocks
+  AF_UNIX sockets that could otherwise be used as covert egress paths).
+
   Path to Anthropic's apply-seccomp binary (~/.local/lib/claude-sandbox/).
   Omitted from the config if apply-seccomp was not installed (unsupported
   architecture) rather than writing a broken path.
 
 sandbox.filesystem.denyRead / allowRead
+  Defends: H2 (bash path), H7 (bash path), H8 (bash path), H9-in (when
+  input data paths are added to allowRead — every allowRead entry becomes
+  a bwrap --ro-bind). The native-tool path for H2, H7, H8 is defended
+  separately by permissions.deny patterns; see the bash-vs-native-tools
+  section below.
+
   denyRead: ["/users"] blocks all home directories on CSCS (where home
   directories live under /users/). This prevents the agent from reading the
   current user's ~/.ssh, API tokens, and other users' world-readable files on
@@ -102,12 +125,28 @@ sandbox.filesystem.denyRead / allowRead
       sandbox-disable vector.
 
 permissions.allow — SLURM read-only commands
-  sinfo, squeue, sacct, scontrol show *, sprio, sreport are pre-allowed.
-  These are read-only and have no side effects — the agent can query the
-  cluster freely. Set globally so these work in every project without per-repo
-  setup.
+  sinfo, squeue, sacct, scontrol show *, sprio, sreport are pre-allowed so they
+  run without a permission prompt.
+
+  IMPORTANT — these do NOT work inside the sandbox. Like every SLURM client they
+  authenticate to slurmctld/slurmdbd via MUNGE and reach it over the network,
+  both of which the sandbox blocks (apply-seccomp denies the AF_UNIX socket
+  MUNGE needs; bwrap --unshare-net removes the route to the controller). So
+  inside the sandbox these commands fail exactly like the write commands; the
+  allow rules only suppress the prompt, they do not make the commands function.
+  They work in the user's own (unsandboxed) shell.
+
+  The rules are kept deliberately: they are harmless (a failed allowed command
+  just returns an error the agent observes) and forward-compatible with v0.3,
+  where fine-grained socket scoping is planned to let SLURM clients run
+  in-sandbox. Set globally.
 
 SLURM write commands — NOT in permissions.allow
+  Defends: H3. Status: user confirmation is the only control between the
+  agent and a five-figure SLURM bill. No graceful middle (budget, rate
+  limit) — agent-layer policy is the expected solution; see context.txt
+  under "Documented gaps and their disposition".
+
   sbatch, srun, salloc, scancel, and scontrol update/hold/release/requeue
   are intentionally absent from the allow list. Claude Code will prompt for
   confirmation before running them. Job submissions consume allocation and
@@ -116,21 +155,74 @@ SLURM write commands — NOT in permissions.allow
   If you find yourself approving job submissions constantly, add them to allow:
     "Bash(sbatch *)", "Bash(srun *)", "Bash(salloc *)"
 
+  v0.2.x (planned): a SLURM GATEWAY closes the deeper problem prompt-or-allow
+  does not — that a submitted job runs UNSANDBOXED on a compute node (the
+  SLURM-path escape). The agent never runs the real sbatch: a stub shadows it
+  inside the sandbox and forwards a structured request to a broker OUTSIDE the
+  sandbox, which validates it, forces safe options, and submits a job that runs
+  re-sandboxed (seccomp-wrapper + bwrap) on the compute side. Built within
+  v0.2.x, not gated on v0.3. Note SLURM does not work from inside the sandbox
+  at all today (MUNGE/AF_UNIX + --unshare-net — see "permissions.allow SLURM
+  read-only commands" above). Full design in context.txt "SLURM-path escape".
+
 permissions.deny — credential files
-  **/.env* (Read/Edit/Write):
-    Covers hidden env files: .env, .envrc, .env.local, .env.production, etc.
-  **/*.env (Read/Edit/Write):
-    Covers non-hidden env files: production.env, etc.
-  **/*.pem, **/*.key (Read/Edit/Write):
-    PEM certificates and private key files.
-  **/credentials (Read/Edit/Write):
-    Credential files using the `credentials` naming convention (e.g.
+  Defends: H2 (native-tool path, plus the file-reading bash commands Claude
+  Code recognizes — cat/head/tail/sed). Status: covers well-known credential
+  patterns. Unusual locations (~/.netrc, ~/.kube/config, ~/.config/gh,
+  tokens stored at non-standard paths) are NOT covered and depend on the user
+  noticing prompts. The bash path for H2 is defended by bwrap denyRead. An
+  arbitrary subprocess (e.g. a python script that opens the file itself) is
+  NOT caught by these rules — only the OS bwrap layer catches that.
+
+  Pattern syntax + the Config-tab warning (Linux). Read/Edit/Write rules follow
+  gitignore semantics with the anchors at code.claude.com/docs/en/permissions:
+    //path  absolute from filesystem root     ~/path  home-relative
+    /path   project-root-relative             path    cwd-relative, any depth
+  We use the "//**/" form (filesystem-wide) so credential files are denied
+  anywhere, not just under the project directory.
+
+  The /sandbox Config tab warns "glob patterns not fully supported on Linux —
+  the following will be ignored" for ANY glob deny rule (a leading "**/", the
+  "//**/" anchor, or even a single "*"). This warning is about the bwrap SANDBOX
+  BOUNDARY ONLY: bwrap denies by bind-mounting specific paths and cannot express
+  a glob, so glob deny rules can't be baked into the OS boundary. It does NOT
+  mean the rules are unenforced. They are enforced by the PERMISSION LAYER —
+  Claude Code's gitignore matcher applied to the native Read/Edit/Write tools
+  and to recognized bash file commands (cat/head/tail/sed), which is
+  platform-independent. Confirmed on Santis 2026-06-04: a native Read of a .env
+  was DENIED by the permission layer, and `cat .env` in the cwd was blocked at
+  the OS layer by the mandatory-deny scan's /dev/null mount — both paths
+  protected. The warning is cosmetic for our purpose. (Only exact-path rules,
+  like the settings.json ones below, avoid it, because bwrap can mount over a
+  concrete path.)
+
+  //**/.env*  (Read/Edit/Write): hidden env files anywhere (.env, .envrc,
+    .env.local, .env.production, …).
+  //**/*.env  (Read/Edit/Write): non-hidden env files (production.env, …).
+  //**/*.pem, //**/*.key (Read/Edit/Write): PEM certs and private keys.
+  //**/credentials (Read/Edit/Write): the `credentials` convention (e.g.
     ~/.aws/credentials).
-  All of the above: the agent has no reason to read or modify credential
-  material. If it needs an env var it should be passed explicitly.
-  Set globally — these are invariant across all projects.
+  The "//**/" anchor is filesystem-wide and deliberately stronger than the
+  old cwd-anchored form: it now also covers home-dir credentials on the
+  native-tool path, matching bwrap's /users denyRead on the bash path.
+  Caveat: deny beats allow, so a filesystem-wide //**/*.key cannot be
+  re-allowed for one legitimate file — narrow the pattern if a workflow needs
+  a specific key. The agent has no reason to touch credential material; if it
+  needs an env var it should be passed explicitly. Set globally.
+
+  v0.3 note: these permission-layer rules exist ONLY because Claude Code's
+  Read/Edit/Write tools run in-process, outside bwrap (the native-tool
+  asymmetry). Under the v0.3 sandbox-interface contract all such tools run as
+  subprocesses, so the OS filesystem boundary covers them uniformly and these
+  rules become redundant — the credential-name intent migrates into bwrap
+  denyRead. See doc/sandbox-interface.txt.
 
 permissions.deny — nc / socat
+  Defends: H6. Status: compensating control — blocks two common bash-tool
+  exfiltration paths. The architectural defense for H6 is the
+  --unshare-net + socat proxy plus an allowlist; these rules close known
+  gaps until allowlist policy is configured.
+
   nc (netcat):
     A direct exfiltration tool with no legitimate use in a coding agent
     workflow. Hard deny globally.
@@ -140,28 +232,42 @@ permissions.deny — nc / socat
     reasoning — hard deny globally. Note: socat is also installed by the
     install script as a runtime dep for bwrap, so it will be on PATH.
 
-permissions.deny — .claude/settings.json
-  Edit(**/.claude/settings.json), Write(**/.claude/settings.json):
-    Blocks the Claude Code Edit and Write tools from overwriting any settings
-    file — both the user-global ~/.claude/settings.json and the project-level
-    .claude/settings.json. An agent that rewrites either can set
-    "sandbox": {"enabled": false} and escape the sandbox on the next session.
-    These are hard blocks — the agent cannot ask the user to approve, so there
-    is no approval prompt to social-engineer.
+permissions.deny — settings.json (sandbox-config integrity)
+  Defends: meta — preserves all other defenses by preventing the agent
+  from disabling the sandbox or removing any deny rule between sessions.
+
+  Edit/Write on three targets (the leading-**/ glob was dropped on Linux;
+  fixed 2026-06-01 to anchored forms — see the credential-files note above):
+    ~/.claude/settings.json       the machine-wide config, where the sandbox
+                                  is actually enabled. The OLD
+                                  **/.claude/settings.json never matched this
+                                  (it was cwd-anchored), so the home config was
+                                  unprotected on the native-tool path even
+                                  before the Linux drop. Now covered explicitly.
+    .claude/settings.json         the project-level config.
+    .claude/settings.local.json   project LOCAL settings. Critical: local
+                                  project settings OUTRANK user settings in
+                                  Claude Code's precedence, so an agent that
+                                  writes this file with "sandbox":{"enabled":
+                                  false} disables the sandbox next session.
+                                  The old config did not deny this file at all.
+  An agent that rewrites any of these escapes the sandbox on the next session.
+  Hard blocks — the agent cannot ask the user to approve, so there is no
+  prompt to social-engineer.
 
   These deny rules ARE necessary despite bwrap's null-device protection:
-    Inside the bwrap sandbox, Claude Code replaces .claude/settings.json with
-    a bind-mount of /dev/null, making it appear as a null character device.
-    Bash therefore cannot write to it (confirmed: echo > .claude/settings.json
-    returns Permission denied inside bwrap).
-    HOWEVER, the native Write tool runs outside bwrap in the Claude Code
-    process and CAN create .claude/settings.json as a real file on the
-    underlying filesystem — confirmed by testing. On the next session Claude
-    Code reads that real file and the sandbox is disabled. The deny rules
-    block the Write/Edit tools from being invoked at all, closing this vector.
+    Inside bwrap, Claude Code replaces .claude/* with /dev/null, so bash
+    cannot write them (echo > .claude/settings.json returns EPERM). But the
+    native Write tool runs OUTSIDE bwrap and CAN create these as real files on
+    the underlying filesystem (confirmed). The deny rules block the
+    Write/Edit tools entirely, closing the native vector; bwrap closes bash.
 
-  Bash redirection is blocked by bwrap's null-device mount — no further
-  mitigation needed there. The deny rules cover the native tool path.
+  Stronger hardening (recommended, needs admin): put "sandbox":{"enabled":
+  true} in /etc/claude-code/managed-settings.json. Managed settings cannot be
+  overridden by user/project/local settings, so the sandbox cannot be turned
+  off by editing any user-writable file — closing the override vector
+  structurally instead of by enumerating files to deny. A CSCS-admin ask;
+  pair it with the admin-side SLURM layer.
 
 
 ── project-config/settings.json ─────────────────────────────────────────────
@@ -172,6 +278,9 @@ only the workflow decisions that vary per project.
 
 permissions.deny — network egress
   ssh / scp / rsync:
+    Defends: H5 (SSH to compute nodes). Bash-tool deny is the active
+    control; bwrap does not block ssh-as-a-binary, only network reachability.
+
     The agent should not be able to exfiltrate data or reach other cluster
     nodes directly. On CSCS supercomputers, SSH to compute nodes from a login
     node is common for humans but should require explicit confirmation for an
@@ -180,6 +289,9 @@ permissions.deny — network egress
     commands on compute nodes — it will then prompt for confirmation.
 
   curl / wget:
+    Defends: H6 (compensating control until network.allowedDomains policy
+    is configured — see Network isolation section below).
+
     Outbound HTTP/HTTPS. The agent legitimately needs these to fetch
     documentation or download files, but unrestricted outbound access from a
     shared login node is a risk (data exfiltration, reaching internal cluster
@@ -193,6 +305,9 @@ permissions.deny — network egress
     invocations. Domain policy is an open decision for this project.
 
   mcp__*:
+    Defends: H6 (exfiltration via MCP server), H8 (identity abuse via MCP
+    credentials).
+
     Blocks all MCP tool calls. A compromised or malicious MCP server could
     otherwise be used as a pivot point. Disable unless you are deliberately
     using specific MCP servers you trust.
@@ -242,17 +357,21 @@ claude-safe (~/.local/bin/claude-safe):
 
 ── Network isolation ─────────────────────────────────────────────────────────
 
-The network isolation infrastructure is already in place in the sandbox-runtime:
-bwrap runs with --unshare-net, removing the network namespace entirely. All
-outbound traffic from inside the sandbox must go through host-side socat proxy
-sockets (HTTP port 3128, SOCKS5 port 1080) that are bind-mounted into the bwrap
-namespace — no other network path exists.
+Defends: H5' (solved by --unshare-net architecture), H6 (architecturally
+solved by --unshare-net + proxy; the active policy lives in
+sandbox.network.allowedDomains / sandbox.network.deniedDomains).
+
+The network isolation infrastructure is in the sandbox-runtime: bwrap runs
+with --unshare-net, removing the network namespace entirely. All outbound
+traffic from inside the sandbox must go through host-side socat proxy
+sockets (HTTP port 3128, SOCKS5 port 1080) that are bind-mounted into the
+bwrap namespace — no other network path exists.
 
 network.allowedDomains / network.deniedDomains:
-  Enforced at the proxy level (stronger than tool-level deny rules — applies to
-  all outbound traffic regardless of which tool makes the request). Configure in
-  user-config/settings.json for machine-wide policy or .claude/settings.json for
-  per-project policy. Example:
+  Enforced at the proxy level — applies to all outbound traffic regardless
+  of which tool makes the request, which is stronger than tool-level deny
+  rules. Configured in user-config/settings.json for machine-wide policy
+  or .claude/settings.json for per-project policy. Example:
 
     "sandbox": {
       "network": {
@@ -260,15 +379,94 @@ network.allowedDomains / network.deniedDomains:
       }
     }
 
-  Projects with known fixed endpoints (data portals, specific APIs) are good
-  candidates for an allowlist — remove curl/wget from the deny list and let the
-  proxy enforce instead, which is stronger (covers all tools, not just explicit
-  curl/wget invocations).
+  The agent cannot modify these settings — settings.json is hard-blocked
+  by the existing Edit(**/.claude/settings.json) deny rules. The user
+  maintains the file directly. The proxy picks up changes without
+  restart.
 
-  Projects doing general coding assistance are NOT good candidates: Claude
-  reads documentation from unpredictable domains and an allowlist breaks that
-  workflow. For these, keep curl/wget in the deny list as a compensating
-  control.
+Two postures, picked per project:
 
-  DECISION NEEDED: domain policy for this project — currently no allowedDomains
-  configured; curl/wget deny rules are the active control.
+  strict — default deny outside the allowlist. Best for production data
+    pipelines, unattended runs, and projects with a known fixed set of
+    endpoints. The user lists the domains the project actually needs.
+    When using strict, remove curl/wget from the project's
+    permissions.deny — the proxy is now the active control and applies
+    to all outbound traffic, not just explicit curl/wget.
+
+  permissive — default allow except a known-bad blocklist. Best for
+    general coding assistance and research where the agent reads
+    documentation from unpredictable domains. Accepts looser H6
+    protection in exchange for not fighting the workflow. Keep curl/wget
+    in the project's permissions.deny as a compensating control.
+
+When the proxy blocks a request, the agent sees an HTTP 403 with a
+structured error. The agent can surface this to the user ("I tried to
+access X; not on the allowlist") but cannot expand the allowlist
+itself. The user must edit the settings file to permit a new domain.
+This is deliberate: an agent that could expand its own permissions
+would bypass the H6 control entirely.
+
+
+── Audit trail ──────────────────────────────────────────────────────────────
+
+Claude Code writes a per-session JSONL transcript to
+~/.claude/projects/<encoded-project-path>/<session-id>.jsonl containing every
+user prompt, every tool call (Read / Edit / Write / Bash) with arguments,
+every tool result, and every model response. This is the audit log available
+for forensic incident review without admin cooperation.
+
+Covers:
+  - H2, H4, H7, H8 — every native-tool call with arguments
+  - H3 — every sbatch / srun / scancel invocation
+  - Agent intent — model responses captured verbatim
+
+Does not cover:
+  - Subprocess-level activity. If the agent runs `python script.py`, the
+    transcript captures the bash invocation and stdout/stderr but not what
+    the spawned process opened, wrote, or sent.
+  - Network at the wire level. The socat proxy bridges by default; it does
+    not log requests. Projects with high H6 exposure can enable socat
+    logging as an opt-in — see context.txt under "Documented gaps and
+    their disposition".
+  - Real-time alerting. Review is forensic only.
+
+Sensitivity:
+  The transcripts contain verbatim user prompts plus any content pasted
+  into them. Over time this becomes a comprehensive behavioral record —
+  writing style usable as a stylometric biometric, research direction,
+  occasionally secrets the user did not realize they were pasting (token
+  in an error message). Treat the transcript directory as sensitive
+  personal data: do not share whole transcripts casually, prune ones you no
+  longer need. The install script displays a notice about this at install
+  time.
+
+
+── Operational mitigations for uncovered harms ──────────────────────────────
+
+Some harms do not have an in-sandbox control. The sandbox handles what it
+can; the rest depends on operational discipline from the user or policy
+from the agent. Cross-reference: see "Documented gaps and their
+disposition" in context.txt for the disposition framing.
+
+H4 (project-directory data destruction)
+  The project directory is the agent's writable working surface; the
+  sandbox does not prevent the agent from writing to or deleting files
+  there. Recommended pattern:
+
+    - Keep precious data outside the project directory. Read-only access
+      from inside the sandbox is automatic for any path outside /users
+      (via the root bind mount).
+    - For paths inside /users (e.g. ~/data, ~/datasets), add them to
+      allowRead. Every allowRead entry becomes a bwrap --ro-bind, so the
+      agent can read but not modify.
+    - Take backups of the project directory before any long-running or
+      autonomous session. The sandbox does not preserve a snapshot.
+    - For shared scientific datasets that must remain unchanged, mount
+      them at a path outside the project directory and reference them
+      read-only.
+
+H3 (compute resource abuse)
+  See "SLURM write commands — NOT in permissions.allow" earlier in this
+  file. The prompt-per-submission pattern is the v0.2 disposition; an
+  agent-layer budget / rate-limit policy is the expected v0.3 path. v0.2
+  has no built-in budget mechanism.

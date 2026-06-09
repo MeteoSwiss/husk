@@ -19,13 +19,14 @@
       "Bash(sreport *)"
     ],
     "deny": [
-      "Edit(**/.claude/settings.json)",
-      "Write(**/.claude/settings.json)",
-      "Read(**/.env*)",   "Edit(**/.env*)",   "Write(**/.env*)",
-      "Read(**/*.env)",   "Edit(**/*.env)",   "Write(**/*.env)",
-      "Read(**/*.pem)",   "Edit(**/*.pem)",   "Write(**/*.pem)",
-      "Read(**/*.key)",   "Edit(**/*.key)",   "Write(**/*.key)",
-      "Read(**/credentials)", "Edit(**/credentials)", "Write(**/credentials)",
+      "Edit(~/.claude/settings.json)",       "Write(~/.claude/settings.json)",
+      "Edit(.claude/settings.json)",         "Write(.claude/settings.json)",
+      "Edit(.claude/settings.local.json)",   "Write(.claude/settings.local.json)",
+      "Read(//**/.env*)",  "Edit(//**/.env*)",  "Write(//**/.env*)",
+      "Read(//**/*.env)",  "Edit(//**/*.env)",  "Write(//**/*.env)",
+      "Read(//**/*.pem)",  "Edit(//**/*.pem)",  "Write(//**/*.pem)",
+      "Read(//**/*.key)",  "Edit(//**/*.key)",  "Write(//**/*.key)",
+      "Read(//**/credentials)", "Edit(//**/credentials)", "Write(//**/credentials)",
       "Bash(nc *)",
       "Bash(socat *)"
     ]

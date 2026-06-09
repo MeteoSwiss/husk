@@ -1,0 +1,191 @@
+Threat model
+============
+
+This document catalogs the harms the sandbox is designed to prevent. It
+intentionally does NOT describe current defenses, their implementation
+status, or which controls are configured today — those live in
+constraints.txt (per-control mapping to harm IDs) and context.txt (where
+the design work currently concentrates). The harm catalog (H1, H2, …,
+H9-out) defined below is the stable reference cited by both.
+
+## Adversary
+
+Two misuse vectors with effectively the same output:
+
+1. Prompt injection — untrusted content the agent reads (web pages, fetched
+   docs, shared files, MCP server responses, paste from a colleague) contains
+   instructions that hijack the agent's intent.
+
+2. Misaligned optimization — the agent, operating in good faith on a
+   legitimate task, finds a "creative" shortcut that satisfies the literal
+   objective by destroying the structure that defines it. Canonical case:
+   an agent asked to maximize a benchmark score deletes the benchmark
+   database, producing a perfect pass rate.
+
+We do not distinguish between these in the controls. Both produce an agent
+attempting actions outside the user's actual intent. The agent is treated
+as the adversary.
+
+## Capabilities
+
+The agent runs as the user's UID, with the user's filesystem and the user's
+network reachability (modulo the sandbox). It can:
+  - read and write anywhere the user can (modulo bwrap restrictions)
+  - spawn processes, fork, exec
+  - attempt kernel-CVE-based privilege escalation
+  - rely on an inattentive user approving permission prompts without reading
+
+By assumption it cannot already have root and cannot tamper with the
+sandbox layers from outside — they are installed before the agent starts.
+
+## Trust
+
+Trusted: the kernel, bwrap, libseccomp, the install script when run by the
+user, supercomputer admin policy.
+
+Untrusted: the agent, all content the agent ingests.
+
+Inattentive: the user. Controls must not depend on careful human review of
+each prompt.
+
+## The agent's execution paths
+
+The agent acts through three structurally different paths:
+
+  Bash tool — runs inside bwrap, subject to its mount namespace, network
+              namespace, and read-only mounts.
+
+  Native file tools (Read / Edit / Write) — run in the Claude Code process
+              outside bwrap, subject to permissions.deny patterns and
+              per-call user prompts.
+
+  SLURM-submitted jobs (sbatch / srun) — run on compute nodes via
+              slurmstepd, NOT forked from the agent's process tree.
+              None of the sandbox attributes propagate: not the bwrap
+              mount or network namespaces, not the seccomp filter, not
+              the proxy path. Environment variables DO propagate via
+              SLURM's --export=ALL default — which can give a false
+              impression of inheritance because conda activations and
+              PYTHONPATH work as expected — but no kernel-level
+              isolation reaches the compute node.
+
+Each harm below should be read with these paths in mind. A claim like
+"H2 is defended by bwrap denyRead" is true for the bash path; partial
+for the native-tool path; FALSE for the SLURM path.
+
+Two structural concerns recur across multiple harms:
+
+  - Bash vs. native-tool asymmetry: bwrap covers the bash path; the
+    native-tool path depends on deny patterns plus user prompts.
+    Affects H2, H7, H8.
+
+  - SLURM-path escape: none of the sandbox layers reach compute-node
+    jobs. Affects H2, H4, H6, H7, H8 whenever the agent has access to
+    sbatch. Critical for the unsupervised multi-day use case where the
+    prompt-per-submission disposition is null.
+
+## Harms
+
+H1  Privilege escalation
+    The agent uses a kernel CVE to gain root, then modifies cluster state,
+    leaks system-wide secrets, or persists into other users' sessions.
+
+    Defense architecture: three layers — innermost is our seccomp-wrapper
+    narrowing the syscall surface so that exotic CVEs (bpf, io_uring,
+    kexec, ptrace, pivot_root, …) become unreachable; middle is admin-side
+    syscall/LSM policy on the cluster; outermost is the kernel itself
+    rejecting privileged operations from a non-root UID. Syscall filtering
+    reduces the attack surface but does not eliminate it — a CVE in read()
+    or openat() is not caught at our layer. Our contribution is real
+    because that is where kernel exploits historically cluster, not where
+    they are guaranteed to live.
+
+H2  Credential theft
+    The agent reads SSH keys, API tokens, .env files, cluster credentials
+    from the user's own or other users' home directories. Enables
+    follow-on attacks beyond the cluster. Reachable through both
+    execution paths.
+
+H3  Compute resource abuse
+    The agent submits SLURM jobs at scale — bulk allocation, cryptomining,
+    fork-bomb-via-sbatch. Direct financial damage measured in $1k–$10k per
+    incident.
+
+H4  Project-directory data destruction
+    The agent deletes or modifies files in the project directory or other
+    working surfaces the user has write access to. The data may be unique,
+    expensive to regenerate, or impossible to reproduce.
+
+    By design, the project directory IS the agent's writable working
+    surface — this harm has no in-sandbox defense. Mitigation is
+    operational: separate precious data from working data, mount inputs
+    read-only (see H9-in), take backups.
+
+H5  SSH to compute nodes
+    The agent uses SSH from a login node to execute commands on compute
+    nodes — bypassing the SLURM scheduler, consuming reserved resources,
+    or reaching state not exposed to the login environment.
+
+H5' Lateral movement to internal services
+    The agent reaches internal cluster services (LDAP, NFS, monitoring)
+    that are not exposed to external networks but ARE reachable from
+    login nodes.
+
+    Defense architecture: bwrap --unshare-net removes the agent's network
+    namespace entirely. The only network path is through the socat proxy.
+    Whether internal services are reachable from the host is moot — if
+    they are not in the proxy allowlist, the agent cannot reach them.
+    Solved by architecture; the cluster's network design is not
+    load-bearing for this defense.
+
+H6  Internet exfiltration
+    The agent reads sensitive data (credentials, research IP, science
+    datasets) and POSTs it to an attacker-controlled endpoint. Distinct
+    from H2 — H2 is about reading; H6 is about getting data out.
+
+H7  Persistence into future sessions
+    The agent modifies user-controlled startup files (.bashrc, .profile,
+    ~/.local/bin/*, conda activate hooks, git hooks, .envrc) so that
+    subsequent shells, agents, or jobs execute attacker-controlled code.
+    Survives agent shutdown. Reachable through both execution paths.
+
+H8  Identity abuse
+    The agent uses the user's stored credentials (git push tokens, gh CLI,
+    Slack tokens, mail configs) to post, commit, or message under the
+    user's identity. Reputational and operational damage. Reachable
+    through both execution paths.
+
+H9-in   Input data poisoning
+        The agent corrupts data files that will be used as INPUT to a
+        scientific workflow before the workflow runs. The workflow then
+        produces invalid results that may be hard to distinguish from
+        valid ones.
+
+        Defense architecture: bwrap can mount input datasets read-only.
+        Every allowRead path is a bwrap --ro-bind. The recommended pattern
+        is to add scientific input paths to allowRead explicitly.
+
+H9-out  Output data correctness
+        The agent produces analysis code that itself corrupts results, or
+        contains scientific errors. The output looks plausible but is
+        wrong. Out of scope — see below.
+
+## Out of scope
+
+  - Targeted attacks against the model provider, runtime image, or proxy
+    infrastructure
+  - Physical attacks on the cluster
+  - CSCS-wide DoS (SLURM accounting bounds this in practice)
+  - User mistakes outside the agent session
+  - Inference-time data leakage to the model vendor (real concern; not
+    addressable by this sandbox)
+  - Centralized cross-user audit and real-time alerting (admin domain).
+    Per-user forensic audit is provided by Claude Code's own session
+    transcripts — see constraints.txt under "Audit trail".
+  - Subprocess-level activity beyond the bash invocation itself. The
+    transcript captures the bash command and its stdout/stderr but not
+    processes spawned by that command. Transcript-coverage limit, not a
+    defense gap.
+  - Output data correctness (H9-out): the sandbox cannot reason about
+    whether the agent's analysis code is scientifically correct; the user
+    reviews the code the agent produces.

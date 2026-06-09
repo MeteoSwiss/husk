@@ -10,6 +10,10 @@ Developed and tested on CSCS supercomputers (Balfrin, Santis).
 
 ## Getting started
 
+> **Prerequisite:** Claude Code must already be installed and authenticated.
+> `claude-safe` wraps your existing `claude` CLI — it does not install Claude
+> for you. See [Requirements](#requirements).
+
 Run the install script once from this repository:
 
 ```bash
@@ -34,6 +38,13 @@ claude-safe
 
 The sandbox is now active for all your projects.
 
+To remove everything later — the installed binaries and the settings blocks it
+added (your other settings are preserved) — run:
+
+```bash
+./install-claude-safe.sh --uninstall
+```
+
 **Optional — per-project restrictions:** For tighter control over what Claude
 can do within a specific project (network access, MCP servers), copy the
 template into your project and commit it:
@@ -52,10 +63,11 @@ directory. All home directories — yours and other users' — are not visible t
 the agent. Data on shared filesystems outside the home directories
 (e.g. `/scratch/`) is readable but not writable.
 
-**SLURM:** Read-only commands (`sinfo`, `squeue`, `sacct`, etc.) run freely.
-Job submissions (`sbatch`, `srun`, `salloc`) and cancellations (`scancel`)
-require your explicit confirmation — they affect the shared queue and consume
-allocation.
+**SLURM:** SLURM commands don't run inside the sandbox at all — it blocks the
+local authentication socket (MUNGE) they rely on and removes the network path
+to the scheduler. Run them yourself in your own shell. For the one (heavily
+restricted) way to let an *unattended* agent submit a job, see
+[Running SLURM jobs from an unattended sandbox](#running-slurm-jobs-from-an-unattended-sandbox).
 
 **Network access** *(per-project config):* `ssh`, `curl`, `wget`, and similar
 tools are blocked by default. This is a conservative starting point for shared
@@ -107,10 +119,101 @@ Settings are split into two files:
 
 ## Requirements
 
+- **Claude Code itself** — the `claude` CLI, installed and authenticated.
+  `claude-safe` wraps your existing Claude Code install; it does not install or
+  update Claude for you. Install it (e.g. `npm install -g
+  @anthropic-ai/claude-code`, or the native installer) and sign in first; see
+  the [Claude Code docs](https://code.claude.com/docs).
 - x86\_64 or aarch64 Linux, kernel ≥ 4.14
 - bubblewrap installed system-wide (present on all CSCS supercomputers; check
   with your administrators on other HPC systems)
 - `gcc`, `make`, `wget`, `python3` (standard on HPC login nodes)
+
+## Running SLURM jobs from an unattended sandbox
+
+> **⚠️ This is a deliberately crippled last resort, not a recommended workflow — read the whole section before using it.** If a human is around to run SLURM commands, do that and let the agent only edit code.
+
+SLURM commands do not work inside the sandbox: it blocks the local socket
+SLURM's authentication (MUNGE) needs and removes the network path to the
+scheduler. In an **unattended** run — days long, with no human to approve
+prompts — there is currently exactly one way to let the agent submit a job:
+**exempt a single, exact, immutable command from the sandbox.** That is enough
+to, say, drive a weeks-long hyperparameter search that re-submits the *same*
+training job with different numeric settings. It does not let the agent submit
+anything else.
+
+The safety of this rests entirely on three things you must get right by hand:
+
+**1. The job script — and everything it touches — must not be editable by the agent.**
+
+Put the script at an **absolute path outside your project directory**, owned
+by you (the sandbox makes your home read-only to the agent's shell, and the
+file-editing tools prompt or refuse outside the project). This applies to the
+**whole chain**: every file the script sources, every module it imports, every
+program it runs. An agent-writable `train.py` imported by a read-only
+`train.sh` reopens the hole completely.
+
+```
+~/slurm-jobs/train.sh     # the script you submit — read-only to the agent
+~/slurm-jobs/train.py     # and everything it imports — also read-only
+```
+
+**2. Allow exactly one command string, exempted from the sandbox.**
+
+In `~/.claude/settings.json`, exempt that one command and allow only its exact
+string — **no `*` wildcard**, the match must be exact:
+
+```json
+{
+  "sandbox": {
+    "excludedCommands": ["sbatch --partition=preemptive --time=2:00:00 /home/you/slurm-jobs/train.sh"]
+  },
+  "permissions": {
+    "allow": ["Bash(sbatch --partition=preemptive --time=2:00:00 /home/you/slurm-jobs/train.sh)"]
+  }
+}
+```
+
+Keep `allowUnsandboxedCommands: false` so this is the *only* command that ever
+leaves the sandbox. Any other `sbatch` stays sandboxed and simply fails —
+harmlessly. (If your Claude Code only matches `excludedCommands` by program
+name, use `"sbatch"` there instead — the exact `allow` rule is what restricts
+execution to the single command.)
+
+**3. The agent may dial parameters, never inject code.**
+
+The agent's only influence on the run must be **pure data through a strictly
+validated channel** — numbers within ranges, choices from a fixed list. Have
+your read-only script read the agent's settings from a data file and validate
+them hard before using them:
+
+```
+# the agent may edit ./params.json in the project:  {"lr": 0.01, "batch": 64, "loss": "mse"}
+# train.sh checks: lr and batch are numbers in range; loss is one of a fixed
+# enum {"mse", "cross_entropy"}; anything else aborts the job.
+```
+
+The data/code boundary is the hard part, and it is sharper than it looks.
+"Let the agent choose the loss function" sounds like data, but a loss *name*
+usually maps to imported code — a free-form string there is a code-injection
+channel. Only a **closed enum** is safe. The same caution applies to anything
+that can name a file, a module, a Python object, or a shell fragment.
+
+> **⚠️ The submitted job runs completely unsandboxed on the compute node.**
+> None of the sandbox's protections reach it. The exact-command rule pins
+> *which command runs*, not *what it does* — and what it does is decided
+> entirely by the script and everything it reads as code. If any link in that
+> chain is writable, or if one "parameter" can smuggle in code, the agent has
+> arbitrary, unsandboxed execution with your full credentials.
+
+This works, but it is narrow, brittle, and easy to get subtly wrong — the tool
+gives you no help verifying the chain is immutable or that the parameters are
+truly data-only; that is all on you. It exists only because there is no better
+option yet. A proper mechanism — a small broker that validates structured job
+requests outside the sandbox and re-sandboxes the job on the compute node — is
+planned but not yet available. Until then, prefer to **run SLURM yourself** and
+let the agent assist with code, or accept that an unattended agent cannot
+submit jobs.
 
 ## Known limitations
 
@@ -119,6 +222,18 @@ Settings are split into two files:
   friends are blocked in the project config template as a compensating control.
 - **SSH to compute nodes:** Blocked by default. Remove `Bash(ssh *)` from your
   project's deny list if you regularly need Claude to assist on compute nodes.
+- **SLURM:** SLURM commands don't work inside the sandbox at all (it blocks the
+  local authentication socket they use and the network path to the scheduler).
+  Run them in your own shell; for unattended submission see
+  [Running SLURM jobs from an unattended sandbox](#running-slurm-jobs-from-an-unattended-sandbox).
+  A submitted job runs *unsandboxed* on its compute node — a SLURM gateway (a
+  broker that re-sandboxes the job on the compute node) is planned for an
+  upcoming v0.2.x release.
+- **Large projects on Lustre:** on very large trees (many build directories) on
+  Lustre filesystems, the sandbox can stall for up to ~a minute while it sets up
+  its per-command filesystem rules. This is in the bundled sandbox and not
+  currently configurable; launch the agent from a leaner working directory (not
+  the build-heavy project root) to avoid it.
 
 ## License
 
