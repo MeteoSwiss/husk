@@ -9,7 +9,7 @@
  * need to replace or replicate their filter, just add to it.
  *
  * Build:
- *   make   (from the claude-safe/ directory)
+ *   make   (from the husk/ directory)
  *
  * Usage:
  *   ./seccomp-wrapper claude [args...]

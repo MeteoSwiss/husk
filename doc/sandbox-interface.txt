@@ -6,7 +6,7 @@ agent it wraps. An agent that satisfies the requirements below can be
 wrapped by the sandbox without modification to the sandbox layer.
 
 The sandbox is agent-agnostic. It wraps any process. The first integration
-wraps Anthropic's Claude Code (see integrations/claude-safe/); future
+wraps Anthropic's Claude Code (see integrations/husk/); future
 integrations are added by writing a launcher that invokes the sandbox
 with the agent binary as its target.
 

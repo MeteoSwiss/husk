@@ -9,7 +9,7 @@ cp /path/to/agentskills-internal/project-config/settings.json .claude/settings.j
 
 Commit `.claude/settings.json` so the restrictions apply to everyone working on the project. Claude Code automatically gitignores `.claude/settings.local.json`, which is the right place for per-user overrides.
 
-This file covers only the workflow decisions that vary per project. Machine-wide rules (credential files, nc/socat, SLURM allow list, settings.json protection, `enableAllProjectMcpServers`) are set globally by `install-claude-safe.sh` and apply automatically.
+This file covers only the workflow decisions that vary per project. Machine-wide rules (credential files, nc/socat, SLURM allow list, settings.json protection, `enableAllProjectMcpServers`) are set globally by `install-husk.sh` and apply automatically.
 
 ## What each entry does
 

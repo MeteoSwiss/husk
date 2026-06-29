@@ -425,7 +425,7 @@ message that surfaces in Claude's output, making it easy to spot which syscalls
 a new workload needs without rebuilding the filter each time.
 
 ```bash
-SECCOMP_WRAPPER_DEBUG=1 claude-safe
+SECCOMP_WRAPPER_DEBUG=1 husk
 ```
 
 A warning is printed to stderr at startup so the mode is never accidentally
@@ -436,7 +436,7 @@ not a feature for end users.
 ## Building a release binary
 
 Release tarballs ship binaries for both architectures. Build each one natively
-with `build_and_test.sh` from the `claude-safe/` directory. The script downloads
+with `build_and_test.sh` from the `husk/` directory. The script downloads
 and builds gperf and libseccomp from source into a temporary `.build/` directory,
 compiles `seccomp-wrapper` as a static binary, runs the smoke test, and removes
 all build artifacts. It produces an arch-tagged copy (`seccomp-wrapper-x86_64`
@@ -445,11 +445,11 @@ written if the smoke test passes.
 
 ```bash
 # On Balfrin (x86_64):
-cd claude-safe && ./build_and_test.sh   # → seccomp-wrapper-x86_64
+cd husk && ./build_and_test.sh   # → seccomp-wrapper-x86_64
 
 # On Santis (aarch64):
-cd claude-safe && ./build_and_test.sh   # → seccomp-wrapper-aarch64
-scp claude-safe/seccomp-wrapper-aarch64 balfrin:<path-to-repo>/claude-safe/
+cd husk && ./build_and_test.sh   # → seccomp-wrapper-aarch64
+scp husk/seccomp-wrapper-aarch64 balfrin:<path-to-repo>/husk/
 ```
 
 Then package the release from the repo root on Balfrin:
@@ -490,7 +490,7 @@ make check
 ./seccomp-wrapper claude [args...]
 
 # Via the launcher script (drop-in alias for `claude`)
-./claude-safe [args...]
+./husk [args...]
 
 # Or add to your shell config
 alias claude='seccomp-wrapper claude'

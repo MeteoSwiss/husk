@@ -1,16 +1,16 @@
 # release tarballs
-claude-safe-*.tar.gz
-claude-safe-*.SHA256SUMS
+husk-*.tar.gz
+husk-*.SHA256SUMS
 
-# claude-safe build output (build_and_test.sh artifacts)
-claude-safe/.build/
-claude-safe/seccomp-wrapper
-claude-safe/seccomp-wrapper-x86_64
-claude-safe/seccomp-wrapper-aarch64
-claude-safe/test/smoke
-claude-safe/test/test_ptrace
-claude-safe/test/test_personality_query
-claude-safe/test/test_personality_switch
+# husk build output (build_and_test.sh artifacts)
+husk/.build/
+husk/seccomp-wrapper
+husk/seccomp-wrapper-x86_64
+husk/seccomp-wrapper-aarch64
+husk/test/smoke
+husk/test/test_ptrace
+husk/test/test_personality_query
+husk/test/test_personality_switch
 
 # Skill eval workspaces (generated during testing)
 *-workspace/

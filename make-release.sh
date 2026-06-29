@@ -2,19 +2,19 @@
 # make-release.sh — package a release tarball
 #
 # Run this from the repo root on a tagged commit after building
-# seccomp-wrapper on BOTH architectures with claude-safe/build_and_test.sh:
+# seccomp-wrapper on BOTH architectures with husk/build_and_test.sh:
 #
 #   On Balfrin (x86_64):
-#     cd claude-safe && ./build_and_test.sh
+#     cd husk && ./build_and_test.sh
 #
 #   On Santis (aarch64):
-#     cd claude-safe && ./build_and_test.sh
-#     scp claude-safe/seccomp-wrapper-aarch64 balfrin:<path-to-repo>/claude-safe/
+#     cd husk && ./build_and_test.sh
+#     scp husk/seccomp-wrapper-aarch64 balfrin:<path-to-repo>/husk/
 #
 # Both arch-tagged binaries (seccomp-wrapper-x86_64, seccomp-wrapper-aarch64)
-# must be present in claude-safe/ before running this script.
+# must be present in husk/ before running this script.
 #
-# Output: claude-safe-<version>.tar.gz and claude-safe-<version>.SHA256SUMS
+# Output: husk-<version>.tar.gz and husk-<version>.SHA256SUMS
 
 set -euo pipefail
 
@@ -25,8 +25,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY_X86_64="${REPO_ROOT}/claude-safe/seccomp-wrapper-x86_64"
-BINARY_AARCH64="${REPO_ROOT}/claude-safe/seccomp-wrapper-aarch64"
+BINARY_X86_64="${REPO_ROOT}/husk/seccomp-wrapper-x86_64"
+BINARY_AARCH64="${REPO_ROOT}/husk/seccomp-wrapper-aarch64"
 CURRENT_ARCH="$(uname -m)"
 
 # ── version ───────────────────────────────────────────────────────────────────
@@ -47,36 +47,36 @@ if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+([.][0-9]+)?(-[A-Za-z0-9._-]+)?$ ]]; the
     exit 1
 fi
 
-ARCHIVE="${REPO_ROOT}/claude-safe-${VERSION}.tar.gz"
-PREFIX="claude-safe-${VERSION}"
+ARCHIVE="${REPO_ROOT}/husk-${VERSION}.tar.gz"
+PREFIX="husk-${VERSION}"
 STAGING="$(mktemp -d)"
 trap 'rm -rf "${STAGING}"' EXIT
 
 # ── preflight ─────────────────────────────────────────────────────────────────
 
-# Verify the entire claude-safe/ tree is clean so tarball source matches binaries.
-if ! git -C "${REPO_ROOT}" diff --quiet HEAD -- claude-safe/; then
-    echo "error: claude-safe/ has uncommitted changes."
+# Verify the entire husk/ tree is clean so tarball source matches binaries.
+if ! git -C "${REPO_ROOT}" diff --quiet HEAD -- husk/; then
+    echo "error: husk/ has uncommitted changes."
     echo "       The binaries may not match the source shipped in the tarball."
     echo "       Commit the changes or rebuild with build_and_test.sh first."
     exit 1
 fi
 
 if [[ ! -x "${BINARY_X86_64}" ]]; then
-    echo "error: claude-safe/seccomp-wrapper-x86_64 not found."
-    echo "       Build it on Balfrin: cd claude-safe && ./build_and_test.sh"
+    echo "error: husk/seccomp-wrapper-x86_64 not found."
+    echo "       Build it on Balfrin: cd husk && ./build_and_test.sh"
     exit 1
 fi
 
 if [[ ! -x "${BINARY_AARCH64}" ]]; then
-    echo "error: claude-safe/seccomp-wrapper-aarch64 not found."
-    echo "       Build it on Santis: cd claude-safe && ./build_and_test.sh"
+    echo "error: husk/seccomp-wrapper-aarch64 not found."
+    echo "       Build it on Santis: cd husk && ./build_and_test.sh"
     exit 1
 fi
 
 # Sanity-check only the binary for the current arch — the other was validated
 # by build_and_test.sh on its native machine.
-CURRENT_BINARY="${REPO_ROOT}/claude-safe/seccomp-wrapper-${CURRENT_ARCH}"
+CURRENT_BINARY="${REPO_ROOT}/husk/seccomp-wrapper-${CURRENT_ARCH}"
 if [[ ! -x "${CURRENT_BINARY}" ]]; then
     echo "error: no binary for current arch (${CURRENT_ARCH}) — cannot sanity check"
     exit 1
@@ -99,8 +99,8 @@ git -C "${REPO_ROOT}" archive --prefix="${PREFIX}/" HEAD \
     | tar xf - -C "${STAGING}"
 
 # Add compiled binaries (not tracked by git).
-cp "${BINARY_X86_64}"  "${STAGING}/${PREFIX}/claude-safe/seccomp-wrapper-x86_64"
-cp "${BINARY_AARCH64}" "${STAGING}/${PREFIX}/claude-safe/seccomp-wrapper-aarch64"
+cp "${BINARY_X86_64}"  "${STAGING}/${PREFIX}/husk/seccomp-wrapper-x86_64"
+cp "${BINARY_AARCH64}" "${STAGING}/${PREFIX}/husk/seccomp-wrapper-aarch64"
 
 echo "  [ok]   source + x86_64 binary + aarch64 binary"
 
@@ -121,6 +121,6 @@ echo "  [ok]   $(du -sh "${ARCHIVE}" | cut -f1)  ${ARCHIVE}"
 
 # ── checksums ─────────────────────────────────────────────────────────────────
 
-CHECKSUMS="${REPO_ROOT}/claude-safe-${VERSION}.SHA256SUMS"
-(cd "${REPO_ROOT}" && sha256sum "claude-safe-${VERSION}.tar.gz") > "${CHECKSUMS}"
+CHECKSUMS="${REPO_ROOT}/husk-${VERSION}.SHA256SUMS"
+(cd "${REPO_ROOT}" && sha256sum "husk-${VERSION}.tar.gz") > "${CHECKSUMS}"
 echo "  [ok]   ${CHECKSUMS}"

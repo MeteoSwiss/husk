@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install-claude-safe.sh — Set up the Claude Code agent sandbox on CSCS supercomputers.
+# install-husk.sh — Set up the Claude Code agent sandbox on CSCS supercomputers.
 #
 # CSCS supercomputers provide bubblewrap (bwrap) system-wide. This script installs the
 # remaining dependencies and configures ~/.claude/settings.json so the sandbox
@@ -14,8 +14,8 @@
 #                      @anthropic-ai/sandbox-runtime npm tarball; static binary,
 #                      no runtime deps; blocks AF_UNIX sockets and io_uring
 #   seccomp-wrapper  — syscall deny-list wrapper; pre-built static binary
-#                      from this repo's claude-safe/ directory
-#   claude-safe      — launcher script: runs  seccomp-wrapper claude [args...]
+#                      from this repo's husk/ directory
+#   husk             — launcher script: runs  seccomp-wrapper claude [args...]
 #
 # What this configures:
 #   ~/.claude/settings.json — enables sandbox, points to apply-seccomp,
@@ -23,20 +23,20 @@
 #                             and hard-blocks the agent from editing settings files
 #
 # Prerequisites:
-#   - The `claude` CLI installed and signed in. claude-safe wraps an existing
+#   - The `claude` CLI installed and signed in. husk wraps an existing
 #     Claude Code install; this script does NOT install or update Claude.
 #   - bubblewrap (bwrap) available system-wide (present on CSCS).
 #
 # Usage:
-#   ./install-claude-safe.sh              install / update
-#   ./install-claude-safe.sh --uninstall  remove everything this installed and
+#   ./install-husk.sh              install / update
+#   ./install-husk.sh --uninstall  remove everything this installed and
 #                                         revert ~/.claude/settings.json
 #
 # After running, add to ~/.bashrc or ~/.bash_profile if not already present:
 #   export PATH="$HOME/.local/bin:$PATH"
 #
 # Then start Claude Code with:
-#   claude-safe
+#   husk
 
 set -euo pipefail
 
@@ -52,16 +52,16 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-# ── Uninstall mode (./install-claude-safe.sh --uninstall) ────────────────────
+# ── Uninstall mode (./install-husk.sh --uninstall) ────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then
   PREFIX="${HOME}/.local"
   CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
-  MANIFEST="$PREFIX/lib/claude-sandbox/uninstall-manifest.json"
+  MANIFEST="$PREFIX/lib/husk/uninstall-manifest.json"
 
   echo ""
-  echo "This will remove claude-safe from your home directory:"
-  echo "  - delete  $PREFIX/bin/{claude-safe,seccomp-wrapper,seccomp-wrapper.sha256}"
-  echo "            $PREFIX/lib/claude-sandbox/apply-seccomp"
+  echo "This will remove husk from your home directory:"
+  echo "  - delete  $PREFIX/bin/{husk,seccomp-wrapper,seccomp-wrapper.sha256}"
+  echo "            $PREFIX/lib/husk/apply-seccomp"
   echo "  - revert the enableAllProjectMcpServers / sandbox / permissions blocks in"
   echo "    $CLAUDE_SETTINGS to their pre-install state (all other settings kept)"
   echo "  - socat at $PREFIX/bin/socat is LEFT in place (a shared dependency);"
@@ -81,18 +81,18 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   fi
 
   # Read the manifest (above) before deleting it here.
-  for f in "$PREFIX/bin/claude-safe" \
+  for f in "$PREFIX/bin/husk" \
            "$PREFIX/bin/seccomp-wrapper" \
            "$PREFIX/bin/seccomp-wrapper.sha256" \
-           "$PREFIX/lib/claude-sandbox/apply-seccomp" \
+           "$PREFIX/lib/husk/apply-seccomp" \
            "$MANIFEST"; do
     if [[ -e "$f" ]]; then rm -f "$f"; printf '  [ok]   removed %s\n' "$f"; fi
   done
-  rmdir "$PREFIX/lib/claude-sandbox" 2>/dev/null \
-    && printf '  [ok]   removed %s\n' "$PREFIX/lib/claude-sandbox" || true
+  rmdir "$PREFIX/lib/husk" 2>/dev/null \
+    && printf '  [ok]   removed %s\n' "$PREFIX/lib/husk" || true
 
   echo ""
-  echo "claude-safe removed. Your ~/.bashrc PATH line (if you added one) and socat"
+  echo "husk removed. Your ~/.bashrc PATH line (if you added one) and socat"
   echo "were left untouched."
   exit 0
 fi
@@ -133,7 +133,7 @@ unset _cmd
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PREFIX="${HOME}/.local"
-MANIFEST="$PREFIX/lib/claude-sandbox/uninstall-manifest.json"
+MANIFEST="$PREFIX/lib/husk/uninstall-manifest.json"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -187,13 +187,13 @@ system_has_bin() {
 # ── bwrap (runtime prerequisite) ──────────────────────────────────────────────
 #
 # bwrap (bubblewrap) is what actually creates the filesystem/network namespace at
-# runtime — claude-safe cannot sandbox without it. It is provided system-wide on
+# runtime — husk cannot sandbox without it. It is provided system-wide on
 # CSCS. Warn rather than fail, so the install still completes on nodes where it
 # is provisioned separately (e.g. via a module), but make the gap explicit.
 
 if ! command -v bwrap >/dev/null 2>&1; then
-  warn "bwrap (bubblewrap) not found on PATH — claude-safe cannot sandbox without it."
-  warn "It is provided system-wide on CSCS; install or load it before running claude-safe."
+  warn "bwrap (bubblewrap) not found on PATH — husk cannot sandbox without it."
+  warn "It is provided system-wide on CSCS; install or load it before running husk."
 fi
 
 # ── socat ─────────────────────────────────────────────────────────────────────
@@ -244,11 +244,11 @@ case "$(uname -m)" in
 esac
 
 if [[ -n "$ARCH" ]]; then
-  APPLY_SECCOMP_DEST="$PREFIX/lib/claude-sandbox/apply-seccomp"
+  APPLY_SECCOMP_DEST="$PREFIX/lib/husk/apply-seccomp"
   if [[ -x "$APPLY_SECCOMP_DEST" ]]; then
     skip "apply-seccomp already at $APPLY_SECCOMP_DEST — nothing to do"
   else
-    mkdir -p "$PREFIX/lib/claude-sandbox"
+    mkdir -p "$PREFIX/lib/husk"
     wget -q --tries=3 --timeout=30 -O "$WORK_DIR/sandbox-runtime.tgz" "$SANDBOX_RUNTIME_URL"
     echo "${SANDBOX_RUNTIME_SHA512}  $WORK_DIR/sandbox-runtime.tgz" | sha512sum -c - \
       || { echo "  [error] sandbox-runtime tarball checksum mismatch — aborting"; exit 1; }
@@ -260,26 +260,26 @@ if [[ -n "$ARCH" ]]; then
   fi
 fi
 
-# ── seccomp-wrapper + claude-safe launcher ────────────────────────────────────
+# ── seccomp-wrapper + husk launcher ────────────────────────────────────
 #
 # seccomp-wrapper installs a broad syscall deny-list (ptrace, kexec_load, bpf,
 # pivot_root, etc.) before exec'ing its argument. It stacks on top of
 # apply-seccomp's filter — the kernel applies both, most-restrictive wins.
 #
-# claude-safe is a thin launcher that calls: seccomp-wrapper claude [args...]
-# Users run claude-safe instead of claude.
+# husk is a thin launcher that calls: seccomp-wrapper claude [args...]
+# Users run husk instead of claude.
 
 log "seccomp-wrapper"
 
-SECCOMP_WRAPPER_SRC="$SCRIPT_DIR/claude-safe/seccomp-wrapper-${HOST_ARCH}"
+SECCOMP_WRAPPER_SRC="$SCRIPT_DIR/husk/seccomp-wrapper-${HOST_ARCH}"
 SECCOMP_WRAPPER_DEST="$PREFIX/bin/seccomp-wrapper"
 SECCOMP_WRAPPER_HASH_FILE="$PREFIX/bin/seccomp-wrapper.sha256"
-CLAUDE_SAFE_DEST="$PREFIX/bin/claude-safe"
+CLAUDE_SAFE_DEST="$PREFIX/bin/husk"
 
 if [[ ! -x "$SECCOMP_WRAPPER_SRC" ]]; then
-  echo "  [error] claude-safe/seccomp-wrapper-${HOST_ARCH} not found or not executable"
-  echo "          Build it on this machine: cd claude-safe && ./build_and_test.sh"
-  echo "          See claude-safe/README.md for details."
+  echo "  [error] husk/seccomp-wrapper-${HOST_ARCH} not found or not executable"
+  echo "          Build it on this machine: cd husk && ./build_and_test.sh"
+  echo "          See husk/README.md for details."
   exit 1
 fi
 
@@ -302,15 +302,15 @@ mkdir -p "$PREFIX/bin"
 cat > "$CLAUDE_SAFE_DEST" <<'LAUNCHER'
 #!/usr/bin/env bash
 if ! command -v claude >/dev/null 2>&1; then
-  echo "claude-safe: the 'claude' CLI was not found on PATH." >&2
-  echo "claude-safe wraps an existing Claude Code install; install and sign in" >&2
+  echo "husk: the 'claude' CLI was not found on PATH." >&2
+  echo "husk wraps an existing Claude Code install; install and sign in" >&2
   echo "first, then re-run. See https://code.claude.com/docs" >&2
   exit 127
 fi
 exec seccomp-wrapper claude "$@"
 LAUNCHER
 chmod +x "$CLAUDE_SAFE_DEST"
-ok "claude-safe launcher → $CLAUDE_SAFE_DEST"
+ok "husk launcher → $CLAUDE_SAFE_DEST"
 
 # ── ~/.claude/settings.json ───────────────────────────────────────────────────
 #
@@ -338,19 +338,19 @@ echo "  bwrap             — filesystem namespace (system-provided)"
 [[ -x "$APPLY_SECCOMP_DEST" ]] && \
 echo "  apply-seccomp     — AF_UNIX + io_uring BPF filter (Anthropic)"
 echo "  seccomp-wrapper   — broad syscall deny-list"
-echo "  claude-safe       — launcher: seccomp-wrapper claude"
+echo "  husk              — launcher: seccomp-wrapper claude"
 echo ""
 echo "If you have not already done so, add this to ~/.bashrc or ~/.bash_profile:"
 echo '  export PATH="$HOME/.local/bin:$PATH"'
 echo ""
 if command -v claude >/dev/null 2>&1; then
   echo "Then start Claude Code with:"
-  echo "  claude-safe"
+  echo "  husk"
 else
   echo "One prerequisite is still missing: the 'claude' CLI is not on your PATH."
-  echo "claude-safe wraps an existing Claude Code install — it does not install"
+  echo "husk wraps an existing Claude Code install — it does not install"
   echo "Claude for you. Install and sign in first (see https://code.claude.com/docs),"
-  echo "then start it with:  claude-safe"
+  echo "then start it with:  husk"
 fi
 echo ""
-echo "To remove everything this installed later:  ./install-claude-safe.sh --uninstall"
+echo "To remove everything this installed later:  ./install-husk.sh --uninstall"

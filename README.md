@@ -1,23 +1,64 @@
-# Claude Code on HPC supercomputers
+# husk — Claude Code on HPC supercomputers
 
 Claude Code is an AI coding assistant that runs in your terminal. On a shared
 supercomputer login node it needs some extra care: the agent runs as your user
 account, so without restrictions it could read your SSH keys, reach internal
 cluster services, or submit SLURM jobs without asking. This repository provides
-the tooling to run Claude safely in that environment.
+**husk**, the tooling to run Claude safely in that environment.
 
 Developed and tested on CSCS supercomputers (Balfrin, Santis).
+
+## Install from a release (recommended)
+
+Install on the cluster from a **published release tarball** — not by cloning and
+building. A release carries the prebuilt, architecture-correct `seccomp-wrapper`
+binaries, so nothing is compiled on Balfrin or Santis. (Building from a clone is
+only for development.)
+
+Releases are published at:
+
+> https://github.com/MeteoSwiss/husk/releases
+
+A single tarball works on **both** Balfrin (x86_64) and Santis (aarch64) — it
+ships both binaries and the installer picks the right one for the machine.
+
+1. **Download** the latest release tarball and its checksum file (on any machine
+   with a browser or network — e.g. your laptop):
+   - `husk-<version>.tar.gz`
+   - `husk-<version>.SHA256SUMS`
+
+2. **Upload** both to the cluster with `scp` (Balfrin shown; repeat for Santis,
+   or copy once if your `$HOME` is shared between them):
+
+   ```bash
+   scp husk-<version>.tar.gz husk-<version>.SHA256SUMS balfrin:~/
+   ```
+
+   > If the login node itself has outbound HTTPS, you can skip the laptop and
+   > `wget` the two files directly from the releases page instead.
+
+3. **Verify and unpack** on the cluster:
+
+   ```bash
+   sha256sum -c husk-<version>.SHA256SUMS   # must print: OK
+   tar xzf husk-<version>.tar.gz
+   cd husk-<version>
+   ```
+
+4. **Install** — continue with [Getting started](#getting-started) below, running
+   `./install-husk.sh` from the unpacked release directory.
 
 ## Getting started
 
 > **Prerequisite:** Claude Code must already be installed and authenticated.
-> `claude-safe` wraps your existing `claude` CLI — it does not install Claude
+> `husk` wraps your existing `claude` CLI — it does not install Claude
 > for you. See [Requirements](#requirements).
 
-Run the install script once from this repository:
+Run the install script once from the unpacked release directory (or a
+development clone):
 
 ```bash
-./install-claude-safe.sh
+./install-husk.sh
 ```
 
 > The script will show you exactly what it will add to `~/.claude/settings.json`
@@ -30,10 +71,10 @@ If `~/.local/bin` is not yet on your PATH, add this to `~/.bashrc` or
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Then start Claude Code with `claude-safe` instead of `claude`:
+Then start Claude Code with `husk` instead of `claude`:
 
 ```bash
-claude-safe
+husk
 ```
 
 The sandbox is now active for all your projects.
@@ -42,7 +83,7 @@ To remove everything later — the installed binaries and the settings blocks it
 added (your other settings are preserved) — run:
 
 ```bash
-./install-claude-safe.sh --uninstall
+./install-husk.sh --uninstall
 ```
 
 **Optional — per-project restrictions:** For tighter control over what Claude
@@ -120,7 +161,7 @@ Settings are split into two files:
 ## Requirements
 
 - **Claude Code itself** — the `claude` CLI, installed and authenticated.
-  `claude-safe` wraps your existing Claude Code install; it does not install or
+  `husk` wraps your existing Claude Code install; it does not install or
   update Claude for you. Install it (e.g. `npm install -g
   @anthropic-ai/claude-code`, or the native installer) and sign in first; see
   the [Claude Code docs](https://code.claude.com/docs).

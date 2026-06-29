@@ -6,7 +6,7 @@ CSCS supercomputers (shared HPC login nodes, x86_64 and aarch64, no root).
 
 ## Repository structure
 
-claude-safe/
+husk/
   src/
     seccomp_wrapper.c     Syscall deny-list wrapper source
   test/
@@ -19,14 +19,14 @@ claude-safe/
                           build instructions, design notes
 scripts/
   merge-claude-settings.py  Merges user-config/settings.json into ~/.claude/settings.json;
-                            called by install-claude-safe.sh
+                            called by install-husk.sh
 user-config/
   settings.json           Source of truth for the machine-wide blocks written to
                           ~/.claude/settings.json by the install script
 project-config/
   settings.json           Per-project template; copy to .claude/settings.json in your project
   README.md               Rationale and guidance for each entry
-install-claude-safe.sh    One-shot install script (see below)
+install-husk.sh    One-shot install script (see below)
 doc/
   constraints.txt         Rationale for every constraint and setting
   context.txt             This file
@@ -47,7 +47,7 @@ apply-seccomp: extracted from @anthropic-ai/sandbox-runtime npm tarball
   - blocks socket(AF_UNIX,...) and io_uring_*
   - wraps agent subprocess in nested user+PID+mount namespace
   - uses SCMP_ACT_ERRNO (soft: returns EPERM, agent can observe and report)
-  - placed at ~/.local/lib/claude-sandbox/apply-seccomp
+  - placed at ~/.local/lib/husk/apply-seccomp
 seccomp-wrapper: compiled natively on Balfrin (x86_64) and Santis (aarch64);
   aarch64 binary is scp'd to Balfrin before running make-release.sh
   - static binary (gcc -static), no runtime deps
@@ -61,19 +61,19 @@ seccomp-wrapper: compiled natively on Balfrin (x86_64) and Santis (aarch64);
     32-bit compat syscall numbers)
   - uses SCMP_ACT_KILL_PROCESS — kills offending subprocess, Claude survives
   - placed at ~/.local/bin/seccomp-wrapper
-claude-safe: launcher script at ~/.local/bin/claude-safe
+husk: launcher script at ~/.local/bin/husk
   - runs: exec seccomp-wrapper claude "$@"
-  - users invoke claude-safe instead of claude
+  - users invoke husk instead of claude
 
-## What install-claude-safe.sh does
+## What install-husk.sh does
 0. Prints a plain-English summary of what will be added to ~/.claude/settings.json,
    then shows the raw user-config/settings.json, then prompts to continue or cancel
 1. Builds socat from source into ~/.local if not already present
 2. Extracts apply-seccomp from @anthropic-ai/sandbox-runtime npm tarball
    (no npm needed — direct wget | tar)
-3. Copies claude-safe/seccomp-wrapper binary to ~/.local/bin/
+3. Copies husk/seccomp-wrapper binary to ~/.local/bin/
    Exits with error if the binary is not found — does not degrade silently
-4. Writes (overwrites) claude-safe launcher at ~/.local/bin/claude-safe
+4. Writes (overwrites) husk launcher at ~/.local/bin/husk
 5. Calls scripts/merge-claude-settings.py to write ~/.claude/settings.json:
    - reads user-config/settings.json for the managed blocks
    - injects seccomp.applyPath if apply-seccomp was installed
@@ -88,7 +88,7 @@ claude-safe: launcher script at ~/.local/bin/claude-safe
     "autoAllowBashIfSandboxed": true,   ← no bash prompts inside sandbox
     "allowUnsandboxedCommands": false,  ← hard-block; no unsandboxed commands
     "seccomp": {
-      "applyPath": "~/.local/lib/claude-sandbox/apply-seccomp"
+      "applyPath": "~/.local/lib/husk/apply-seccomp"
     },
     "filesystem": {
       "denyRead": ["/users"],           ← block all home dirs (CSCS: /users/)
@@ -151,7 +151,7 @@ claude-safe: launcher script at ~/.local/bin/claude-safe
 
 ## Development tools
 SECCOMP_WRAPPER_DEBUG=1: swaps KILL_PROCESS for ERRNO(ENOSYS) for one session.
-Documented in claude-safe/README.md. Development use only — do not set in
+Documented in husk/README.md. Development use only — do not set in
 production. Human users may set it; the AI agent cannot (it is the threat model).
 
 ## Documented gaps and their disposition
@@ -208,12 +208,12 @@ SLURM-path escape (affects H2 / H4 / H6 / H7 / H8)
         (non-porous + no-broker + no-admin = pick two).
         VERIFY-FIRST (gates the build): confirm claude's inner bwrap inherits
         an outer bind-mount over sbatch —
-          unshare -rm bash -c 'mount --bind fake /usr/bin/sbatch; exec claude-safe'
+          unshare -rm bash -c 'mount --bind fake /usr/bin/sbatch; exec husk'
         then have the agent run `which sbatch`. Sees fake => build it.
 
       v0.3-stable by design: the broker, the request schema, and the
       compute-side seccomp-wrapper+bwrap wrapper layer ON the
-      Anthropic/claude-safe sandbox and do NOT need reworking for v0.3 — only
+      Anthropic/husk sandbox and do NOT need reworking for v0.3 — only
       the thin delivery (stub shadowing + channel mount) re-wires there, and
       gets easier with an open agent. Make it a contract (see
       sandbox-interface.txt): the sandbox shadows sbatch and exposes the
@@ -292,7 +292,7 @@ H4 (project-directory data destruction)
   fix is possible without giving up the project dir as a working surface.
 
 Sandbox performance on Lustre / large trees (v0.2 known bug, not security)
-  Symptom: repeated ~60s freezes running claude-safe in a large project
+  Symptom: repeated ~60s freezes running husk in a large project
   tree (e.g. ICON, many build dirs) on Lustre, and when opening
   /sandbox -> Config. Leading cause (diagnosed Balfrin 2026-06-01): bwrap
   bind-MOUNTING the dangerous-file deny set on Lustre — FINDING the files

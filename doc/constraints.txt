@@ -3,7 +3,7 @@ Claude Code sandbox constraints
 
 This file documents the intent behind each constraint in
 project-config/settings.json and the global configuration written to
-~/.claude/settings.json by install-claude-safe.sh.
+~/.claude/settings.json by install-husk.sh.
 
 Settings are split by scope:
   ~/.claude/settings.json — machine-wide; applies to every project regardless
@@ -19,7 +19,7 @@ doc/threat-model.txt. Status notes — where defenses are partial,
 compensating, or depend on user attention — are captured per-control here.
 
 
-── ~/.claude/settings.json (written by install-claude-safe.sh) ───────────────
+── ~/.claude/settings.json (written by install-husk.sh) ───────────────
 
 Written to the user-global config so it applies to all projects without
 per-repo setup. The install script preserves existing keys outside the
@@ -59,7 +59,7 @@ sandbox.seccomp.applyPath
   Defends: H1 (inner BPF filter layer beyond seccomp-wrapper), H6 (blocks
   AF_UNIX sockets that could otherwise be used as covert egress paths).
 
-  Path to Anthropic's apply-seccomp binary (~/.local/lib/claude-sandbox/).
+  Path to Anthropic's apply-seccomp binary (~/.local/lib/husk/).
   Omitted from the config if apply-seccomp was not installed (unsupported
   architecture) rather than writing a broken path.
 
@@ -319,7 +319,7 @@ permissions.deny — network egress
 ── SECCOMP_WRAPPER_DEBUG ─────────────────────────────────────────────────────
 
 SECCOMP_WRAPPER_DEBUG=1 is a development-only escape hatch documented in
-claude-safe/README.md. It swaps SCMP_ACT_KILL_PROCESS for SCMP_ACT_ERRNO(ENOSYS)
+husk/README.md. It swaps SCMP_ACT_KILL_PROCESS for SCMP_ACT_ERRNO(ENOSYS)
 so blocked syscalls return an error instead of killing the process. Never set
 this in a production session — it disables enforcement for the duration of the
 run. The AI agent is the threat model here; human users can legitimately set
@@ -334,7 +334,7 @@ bubblewrap (bwrap):
   an isolated filesystem namespace with only the current project directory
   bind-mounted in.
 
-apply-seccomp (~/.local/lib/claude-sandbox/apply-seccomp):
+apply-seccomp (~/.local/lib/husk/apply-seccomp):
   Static binary from @anthropic-ai/sandbox-runtime, extracted by the install
   script. Wraps each agent subprocess in a nested user+PID+mount namespace
   (agent cannot see or ptrace the outer process tree) and applies a BPF filter
@@ -342,7 +342,7 @@ apply-seccomp (~/.local/lib/claude-sandbox/apply-seccomp):
   calls return EPERM, the agent can observe and report the error.
 
 seccomp-wrapper (~/.local/bin/seccomp-wrapper):
-  Static binary from claude-safe/, compiled on the target machine with
+  Static binary from husk/, compiled on the target machine with
   gcc -static. Installs a broad syscall deny-list (ptrace, kexec_load, bpf,
   pivot_root, etc.) using SCMP_ACT_KILL_PROCESS before exec'ing claude.
   Stacks on top of apply-seccomp — the kernel applies both filters,
@@ -350,9 +350,9 @@ seccomp-wrapper (~/.local/bin/seccomp-wrapper):
   subprocess is killed; Claude sees the exit code, reasons about it, and
   continues the session.
 
-claude-safe (~/.local/bin/claude-safe):
+husk (~/.local/bin/husk):
   Thin launcher script: exec seccomp-wrapper claude "$@"
-  Users invoke claude-safe instead of claude.
+  Users invoke husk instead of claude.
 
 
 ── Network isolation ─────────────────────────────────────────────────────────
