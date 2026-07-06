@@ -9,6 +9,10 @@
 # gperf is required by libseccomp's build system and is typically absent on
 # HPC login nodes.
 #
+# Offline / outage fallback: pre-place gperf.tar.gz and libseccomp.tar.gz in
+# seccomp-wrapper/.deps/ and the build uses them instead of the network. gperf is fetched
+# via ftpmirror.gnu.org (a live-mirror redirector) with ftp.gnu.org as fallback.
+#
 # Intended for release builds on the target HPC system. For development with
 # a system-wide or ~/.local libseccomp, use `make` directly.
 #
@@ -25,9 +29,17 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/.build"
 PREFIX="${BUILD_DIR}/prefix"
+# Optional offline cache: drop pre-downloaded tarballs here (named exactly
+# gperf.tar.gz / libseccomp.tar.gz) and the build uses them instead of the
+# network. Survives the cleanup trap (only .build/ is removed).
+DEPS_DIR="${SCRIPT_DIR}/.deps"
 
 GPERF_VERSION="3.1"
-GPERF_URL="https://ftp.gnu.org/gnu/gperf/gperf-${GPERF_VERSION}.tar.gz"
+# ftpmirror.gnu.org redirects to a live GNU mirror (resilient to ftp.gnu.org
+# outages); ftp.gnu.org is kept as an explicit fallback. The checksum below makes
+# any mirror safe — wrong bytes abort the build.
+GPERF_URL="https://ftpmirror.gnu.org/gperf/gperf-${GPERF_VERSION}.tar.gz"
+GPERF_URL_FALLBACK="https://ftp.gnu.org/gnu/gperf/gperf-${GPERF_VERSION}.tar.gz"
 # To obtain: wget "$GPERF_URL" && sha256sum gperf-${GPERF_VERSION}.tar.gz
 GPERF_SHA256="588546b945bba4b70b6a3a616e80b4ab466e3f33024a352fc2198112cdbb3ae2"
 
@@ -50,6 +62,43 @@ verify_checksum() {
     fi
 }
 
+# fetch DEST URL [URL...] — populate DEST from the first working source. Uses a
+# pre-staged copy in DEPS_DIR (same basename) first, so a seeded tree builds
+# fully offline. If every source fails, prints WHY and how to recover instead of
+# letting `set -e` abort into a bare cleanup with no message.
+fetch() {
+    local dest="$1"; shift
+    local name staged url
+    name="$(basename "${dest}")"
+    staged="${DEPS_DIR}/${name}"
+
+    if [[ -f "${staged}" ]]; then
+        cp "${staged}" "${dest}"
+        ok "using pre-staged ${name} (${DEPS_DIR}/)"
+        return 0
+    fi
+
+    for url in "$@"; do
+        echo "  fetching ${url}"
+        if wget --no-verbose --tries=3 --timeout=30 -O "${dest}" "${url}"; then
+            return 0
+        fi
+        echo "  [warn] failed from ${url}"
+        rm -f "${dest}"
+    done
+
+    {
+        echo "  [error] could not obtain ${name} — every source failed:"
+        printf '            %s\n' "$@"
+        echo "          Likely the host(s) are down or this machine has no outbound"
+        echo "          network (set https_proxy, or check connectivity / DNS)."
+        echo "          OFFLINE FIX: download ${name} on a networked machine, then:"
+        echo "            mkdir -p ${DEPS_DIR} && cp <downloaded> ${staged}"
+        echo "          and re-run — the build uses that copy and skips the network."
+    } >&2
+    exit 1
+}
+
 cleanup() {
     log "Cleaning up build artifacts"
     rm -rf "${BUILD_DIR}"
@@ -66,17 +115,15 @@ trap cleanup EXIT
 
 log "Preparing build directory"
 rm -rf "${BUILD_DIR}"
-mkdir -p "${BUILD_DIR}"
+mkdir -p "${BUILD_DIR}" "${DEPS_DIR}"
 
-log "Downloading gperf ${GPERF_VERSION}"
-wget -q --tries=3 --timeout=30 -O "${BUILD_DIR}/gperf.tar.gz" "${GPERF_URL}"
+log "Obtaining gperf ${GPERF_VERSION}"
+fetch "${BUILD_DIR}/gperf.tar.gz" "${GPERF_URL}" "${GPERF_URL_FALLBACK}"
 verify_checksum "${BUILD_DIR}/gperf.tar.gz" "${GPERF_SHA256}" "gperf"
-ok "gperf-${GPERF_VERSION}.tar.gz"
 
-log "Downloading libseccomp ${LIBSECCOMP_VERSION}"
-wget -q --tries=3 --timeout=30 -O "${BUILD_DIR}/libseccomp.tar.gz" "${LIBSECCOMP_URL}"
+log "Obtaining libseccomp ${LIBSECCOMP_VERSION}"
+fetch "${BUILD_DIR}/libseccomp.tar.gz" "${LIBSECCOMP_URL}"
 verify_checksum "${BUILD_DIR}/libseccomp.tar.gz" "${LIBSECCOMP_SHA256}" "libseccomp"
-ok "libseccomp-${LIBSECCOMP_VERSION}.tar.gz"
 
 # ── build gperf ───────────────────────────────────────────────────────────────
 

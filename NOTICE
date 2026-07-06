@@ -1,0 +1,28 @@
+husk
+Copyright (c) 2026, MeteoSwiss
+
+husk is licensed under the BSD 3-Clause License; see the LICENSE file.
+
+This product uses and adapts software from Anthropic's sandbox-runtime
+(https://github.com/anthropics/sandbox-runtime), which is licensed under the
+Apache License, Version 2.0. A copy of that license is available at:
+
+    https://www.apache.org/licenses/LICENSE-2.0
+
+Specifically:
+
+  * apply-seccomp
+    The login sandbox installs and runs Anthropic's `apply-seccomp` seccomp-BPF
+    helper. husk does not redistribute it: the install script downloads it,
+    unmodified, from the @anthropic-ai/sandbox-runtime package on the public npm
+    registry at install time (see install-husk.sh). That package carries its own
+    Apache-2.0 license terms.
+
+  * Compute-node filesystem cage
+    The SLURM broker's compute-node re-sandbox (slurm-broker/broker/src/settings.rs)
+    is an independent Rust reimplementation adapted from sandbox-runtime's Linux
+    filesystem model — read-default-allow / write-default-deny policy, credential
+    masking, and bubblewrap (bwrap) argument construction. It contains no source
+    code copied from sandbox-runtime; it reimplements the same approach.
+
+No other part of husk is derived from Apache-2.0-licensed material.

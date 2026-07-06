@@ -2,17 +2,24 @@
 # make-release.sh — package a release tarball
 #
 # Run this from the repo root on a tagged commit after building
-# seccomp-wrapper on BOTH architectures with husk/build_and_test.sh:
+# seccomp-wrapper on BOTH architectures with seccomp-wrapper/build_and_test.sh:
 #
 #   On Balfrin (x86_64):
 #     cd husk && ./build_and_test.sh
 #
 #   On Santis (aarch64):
 #     cd husk && ./build_and_test.sh
-#     scp husk/seccomp-wrapper-aarch64 balfrin:<path-to-repo>/husk/
+#     scp seccomp-wrapper/seccomp-wrapper-aarch64 balfrin:<path-to-repo>/seccomp-wrapper/
 #
 # Both arch-tagged binaries (seccomp-wrapper-x86_64, seccomp-wrapper-aarch64)
-# must be present in husk/ before running this script.
+# must be present in seccomp-wrapper/ before running this script.
+#
+# If the release includes the SLURM broker (slurm-broker/broker/), its prebuilt
+# per-arch binaries (husk-slurm-{broker,wrapper}-{x86_64,aarch64}) must also be
+# present in slurm-broker/ — built the same way as seccomp-wrapper:
+#   on each arch:  (cd slurm-broker && ./build-release.sh)
+#   then scp the foreign-arch binaries onto this machine.
+# Releases ship these compiled binaries; vendor/ is never packaged.
 #
 # Output: husk-<version>.tar.gz and husk-<version>.SHA256SUMS
 
@@ -25,8 +32,8 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY_X86_64="${REPO_ROOT}/husk/seccomp-wrapper-x86_64"
-BINARY_AARCH64="${REPO_ROOT}/husk/seccomp-wrapper-aarch64"
+BINARY_X86_64="${REPO_ROOT}/seccomp-wrapper/seccomp-wrapper-x86_64"
+BINARY_AARCH64="${REPO_ROOT}/seccomp-wrapper/seccomp-wrapper-aarch64"
 CURRENT_ARCH="$(uname -m)"
 
 # ── version ───────────────────────────────────────────────────────────────────
@@ -54,29 +61,29 @@ trap 'rm -rf "${STAGING}"' EXIT
 
 # ── preflight ─────────────────────────────────────────────────────────────────
 
-# Verify the entire husk/ tree is clean so tarball source matches binaries.
-if ! git -C "${REPO_ROOT}" diff --quiet HEAD -- husk/; then
-    echo "error: husk/ has uncommitted changes."
+# Verify the entire seccomp-wrapper/ tree is clean so tarball source matches binaries.
+if ! git -C "${REPO_ROOT}" diff --quiet HEAD -- seccomp-wrapper/; then
+    echo "error: seccomp-wrapper/ has uncommitted changes."
     echo "       The binaries may not match the source shipped in the tarball."
     echo "       Commit the changes or rebuild with build_and_test.sh first."
     exit 1
 fi
 
 if [[ ! -x "${BINARY_X86_64}" ]]; then
-    echo "error: husk/seccomp-wrapper-x86_64 not found."
+    echo "error: seccomp-wrapper/seccomp-wrapper-x86_64 not found."
     echo "       Build it on Balfrin: cd husk && ./build_and_test.sh"
     exit 1
 fi
 
 if [[ ! -x "${BINARY_AARCH64}" ]]; then
-    echo "error: husk/seccomp-wrapper-aarch64 not found."
+    echo "error: seccomp-wrapper/seccomp-wrapper-aarch64 not found."
     echo "       Build it on Santis: cd husk && ./build_and_test.sh"
     exit 1
 fi
 
 # Sanity-check only the binary for the current arch — the other was validated
 # by build_and_test.sh on its native machine.
-CURRENT_BINARY="${REPO_ROOT}/husk/seccomp-wrapper-${CURRENT_ARCH}"
+CURRENT_BINARY="${REPO_ROOT}/seccomp-wrapper/seccomp-wrapper-${CURRENT_ARCH}"
 if [[ ! -x "${CURRENT_BINARY}" ]]; then
     echo "error: no binary for current arch (${CURRENT_ARCH}) — cannot sanity check"
     exit 1
@@ -99,10 +106,31 @@ git -C "${REPO_ROOT}" archive --prefix="${PREFIX}/" HEAD \
     | tar xf - -C "${STAGING}"
 
 # Add compiled binaries (not tracked by git).
-cp "${BINARY_X86_64}"  "${STAGING}/${PREFIX}/husk/seccomp-wrapper-x86_64"
-cp "${BINARY_AARCH64}" "${STAGING}/${PREFIX}/husk/seccomp-wrapper-aarch64"
+cp "${BINARY_X86_64}"  "${STAGING}/${PREFIX}/seccomp-wrapper/seccomp-wrapper-x86_64"
+cp "${BINARY_AARCH64}" "${STAGING}/${PREFIX}/seccomp-wrapper/seccomp-wrapper-aarch64"
 
 echo "  [ok]   source + x86_64 binary + aarch64 binary"
+
+# Add prebuilt SLURM broker binaries, if this release includes the broker.
+# Same model as seccomp-wrapper: built per-arch (slurm-broker/build-release.sh),
+# scp'd together, bundled here. vendor/ is NOT shipped. Auto-skips on releases
+# that predate the broker (e.g. the broker source is absent from this tag).
+if [[ -f "${STAGING}/${PREFIX}/slurm-broker/broker/Cargo.toml" ]]; then
+    echo "==> Bundling SLURM broker binaries"
+    for bin in husk-slurm-broker husk-slurm-wrapper; do
+        for arch in x86_64 aarch64; do
+            src="${REPO_ROOT}/slurm-broker/${bin}-${arch}"
+            if [[ ! -x "${src}" ]]; then
+                echo "error: slurm-broker/${bin}-${arch} not found."
+                echo "       Build on each arch: (cd slurm-broker && ./build-release.sh)"
+                echo "       then scp the foreign-arch binaries here before make-release."
+                exit 1
+            fi
+            cp "${src}" "${STAGING}/${PREFIX}/slurm-broker/${bin}-${arch}"
+        done
+    done
+    echo "  [ok]   broker + wrapper (x86_64 + aarch64)"
+fi
 
 # ── pack ──────────────────────────────────────────────────────────────────────
 #

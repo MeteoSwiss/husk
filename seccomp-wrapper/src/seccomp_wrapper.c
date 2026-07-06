@@ -9,7 +9,7 @@
  * need to replace or replicate their filter, just add to it.
  *
  * Build:
- *   make   (from the husk/ directory)
+ *   make   (from the seccomp-wrapper/ directory)
  *
  * Usage:
  *   ./seccomp-wrapper claude [args...]
@@ -77,8 +77,23 @@ static const char *const BLOCKED_SYSCALLS[] = {
      * affect the host.
      */
 
-    /* --- side-channel / CPU pinning --- */
-    "sched_setaffinity",
+    /* --- side-channel / observation ---
+     *
+     * perf_event_open stays blocked — it is the real side-channel/observation
+     * primitive (hardware performance counters, kernel tracing).
+     *
+     * sched_setaffinity is intentionally NOT blocked. Every performance-oriented HPC
+     * workload pins ranks/threads to cores + NUMA nodes: `numactl --cpunodebind`
+     * (ICON's own launcher does exactly this), `srun --cpu-bind`, Cray MPICH rank
+     * binding, OpenMP OMP_PROC_BIND — all call sched_setaffinity, and blocking it
+     * KILLs the job with SIGSYS before the binary starts (observed: ICON's numactl
+     * step). The security cost is ~nil for this threat model (FS confidentiality +
+     * broker-escape, NOT microarchitectural side channels): SLURM's cpuset cgroup
+     * already confines the job to its ALLOCATED cores, so the kernel intersects any
+     * requested affinity mask with that cpuset — a job can only reshuffle within cores
+     * it already owns, never onto another job's. (CLOSE -> CHECK reclassification per
+     * README: profiled against the real workload.) --membind uses set_mempolicy/mbind,
+     * which were never on this list. */
     "perf_event_open",
 
     /* --- kernel loading --- */
@@ -247,11 +262,10 @@ static int install_filter(bool debug_mode)
             /*
              * Syscall not known to this kernel/libseccomp version — it simply
              * doesn't exist here and therefore cannot be called. Nothing to
-             * block; carry on.
+             * block; skip silently. This is NORMAL: one deny-list spans multiple
+             * arches/kernels, so some names are always absent. A note per skip is
+             * just noise — notably in SLURM job .err files.
              */
-            fprintf(stderr, "seccomp_wrapper: note: '%s' does not exist on"
-                    " this kernel version or architecture — skipping.\n",
-                    BLOCKED_SYSCALLS[i]);
             continue;
         }
 

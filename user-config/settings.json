@@ -6,7 +6,13 @@
     "allowUnsandboxedCommands": false,
     "filesystem": {
       "denyRead": ["/users"],
-      "allowRead": ["./"]
+      "allowRead": ["./"],
+      "denyWrite": [
+        "~/.claude/settings.json",
+        ".claude/settings.json",
+        ".claude/settings.local.json",
+        "~/.local/lib/husk"
+      ]
     }
   },
   "permissions": {
@@ -19,14 +25,30 @@
       "Bash(sreport *)"
     ],
     "deny": [
-      "Edit(~/.claude/settings.json)",       "Write(~/.claude/settings.json)",
-      "Edit(.claude/settings.json)",         "Write(.claude/settings.json)",
-      "Edit(.claude/settings.local.json)",   "Write(.claude/settings.local.json)",
-      "Read(//**/.env*)",  "Edit(//**/.env*)",  "Write(//**/.env*)",
-      "Read(//**/*.env)",  "Edit(//**/*.env)",  "Write(//**/*.env)",
-      "Read(//**/*.pem)",  "Edit(//**/*.pem)",  "Write(//**/*.pem)",
-      "Read(//**/*.key)",  "Edit(//**/*.key)",  "Write(//**/*.key)",
-      "Read(//**/credentials)", "Edit(//**/credentials)", "Write(//**/credentials)",
+      "Edit(~/.claude/settings.json)",
+      "Edit(.claude/settings.json)",
+      "Edit(.claude/settings.local.json)",
+      "Edit(~/.local/lib/husk/**)",
+      "Read(//**/.env*)",  "Edit(//**/.env*)",
+      "Read(//**/*.env)",  "Edit(//**/*.env)",
+      "Read(//**/*.pem)",  "Edit(//**/*.pem)",
+      "Read(//**/*.key)",  "Edit(//**/*.key)",
+      "Read(//**/*.cer)",  "Edit(//**/*.cer)",
+      "Read(//**/*.crt)",  "Edit(//**/*.crt)",
+      "Read(//**/*.p12)",  "Edit(//**/*.p12)",
+      "Read(//**/*.pfx)",  "Edit(//**/*.pfx)",
+      "Read(//**/*.jks)",  "Edit(//**/*.jks)",
+      "Read(//**/credentials)",         "Edit(//**/credentials)",
+      "Read(//**/.netrc)",              "Edit(//**/.netrc)",
+      "Read(//**/.git-credentials)",    "Edit(//**/.git-credentials)",
+      "Read(//**/.npmrc)",              "Edit(//**/.npmrc)",
+      "Read(//**/.pypirc)",             "Edit(//**/.pypirc)",
+      "Read(//**/.docker/config.json)", "Edit(//**/.docker/config.json)",
+      "Read(//**/.ssh/**)",             "Edit(//**/.ssh/**)",
+      "Read(//**/.aws/**)",             "Edit(//**/.aws/**)",
+      "Read(//**/.kube/**)",            "Edit(//**/.kube/**)",
+      "Read(//**/.config/gcloud/**)",   "Edit(//**/.config/gcloud/**)",
+      "Read(//**/.gnupg/**)",           "Edit(//**/.gnupg/**)",
       "Bash(nc *)",
       "Bash(socat *)"
     ]

@@ -14,8 +14,11 @@
 #                      @anthropic-ai/sandbox-runtime npm tarball; static binary,
 #                      no runtime deps; blocks AF_UNIX sockets and io_uring
 #   seccomp-wrapper  — syscall deny-list wrapper; pre-built static binary
-#                      from this repo's husk/ directory
-#   husk             — launcher script: runs  seccomp-wrapper claude [args...]
+#                      from this repo's seccomp-wrapper/ directory
+#   husk             — launcher script: runs  seccomp-wrapper claude [args...],
+#                      and on a SLURM machine also routes job submission through the
+#                      fail-closed broker automatically (spawned only when sbatch is
+#                      detected; no broker and no trace on a laptop)
 #
 # What this configures:
 #   ~/.claude/settings.json — enables sandbox, points to apply-seccomp,
@@ -44,6 +47,22 @@ set -euo pipefail
 
 SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── Optional flag: --slurm-partition NAME ───────────────────────────────────────
+# The single partition the SLURM broker forces onto every agent job. Recorded for
+# husk to export as HUSK_SLURM_PARTITION. Site-specific: Balfrin uses the
+# built-in default `preemptible`; Santis has no such partition (use `debug` or `shared`).
+# Extracted first so the positional --help/--uninstall checks below still see $1.
+SLURM_PARTITION_ARG=""
+_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --slurm-partition)   SLURM_PARTITION_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --slurm-partition=*) SLURM_PARTITION_ARG="${1#*=}"; shift ;;
+    *)                   _args+=("$1"); shift ;;
+  esac
+done
+set -- "${_args[@]:+${_args[@]}}"
+
 # ── --help ────────────────────────────────────────────────────────────────────
 # Prints this script's header comment block (the single source of truth for what
 # it does), so help text never duplicates or drifts from the header.
@@ -61,7 +80,9 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   echo ""
   echo "This will remove husk from your home directory:"
   echo "  - delete  $PREFIX/bin/{husk,seccomp-wrapper,seccomp-wrapper.sha256}"
-  echo "            $PREFIX/lib/husk/apply-seccomp"
+  echo "            $PREFIX/bin/{husk-slurm-wrapper,husk-slurm-broker} (if installed)"
+  echo "            $PREFIX/bin/husk-slurm (legacy, if left by an older install)"
+  echo "            $PREFIX/lib/husk/{apply-seccomp,sbatch-stub.py,slurm-partition}"
   echo "  - revert the enableAllProjectMcpServers / sandbox / permissions blocks in"
   echo "    $CLAUDE_SETTINGS to their pre-install state (all other settings kept)"
   echo "  - socat at $PREFIX/bin/socat is LEFT in place (a shared dependency);"
@@ -82,9 +103,14 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 
   # Read the manifest (above) before deleting it here.
   for f in "$PREFIX/bin/husk" \
+           "$PREFIX/bin/husk-slurm" \
+           "$PREFIX/bin/husk-slurm-wrapper" \
+           "$PREFIX/bin/husk-slurm-broker" \
            "$PREFIX/bin/seccomp-wrapper" \
            "$PREFIX/bin/seccomp-wrapper.sha256" \
            "$PREFIX/lib/husk/apply-seccomp" \
+           "$PREFIX/lib/husk/sbatch-stub.py" \
+           "$PREFIX/lib/husk/slurm-partition" \
            "$MANIFEST"; do
     if [[ -e "$f" ]]; then rm -f "$f"; printf '  [ok]   removed %s\n' "$f"; fi
   done
@@ -271,15 +297,15 @@ fi
 
 log "seccomp-wrapper"
 
-SECCOMP_WRAPPER_SRC="$SCRIPT_DIR/husk/seccomp-wrapper-${HOST_ARCH}"
+SECCOMP_WRAPPER_SRC="$SCRIPT_DIR/seccomp-wrapper/seccomp-wrapper-${HOST_ARCH}"
 SECCOMP_WRAPPER_DEST="$PREFIX/bin/seccomp-wrapper"
 SECCOMP_WRAPPER_HASH_FILE="$PREFIX/bin/seccomp-wrapper.sha256"
 CLAUDE_SAFE_DEST="$PREFIX/bin/husk"
 
 if [[ ! -x "$SECCOMP_WRAPPER_SRC" ]]; then
-  echo "  [error] husk/seccomp-wrapper-${HOST_ARCH} not found or not executable"
+  echo "  [error] seccomp-wrapper/seccomp-wrapper-${HOST_ARCH} not found or not executable"
   echo "          Build it on this machine: cd husk && ./build_and_test.sh"
-  echo "          See husk/README.md for details."
+  echo "          See seccomp-wrapper/README.md for details."
   exit 1
 fi
 
@@ -301,16 +327,103 @@ fi
 mkdir -p "$PREFIX/bin"
 cat > "$CLAUDE_SAFE_DEST" <<'LAUNCHER'
 #!/usr/bin/env bash
+# husk — sandboxed launcher for the Claude Code agent.
+#
+# Runs `seccomp-wrapper claude` inside the husk sandbox. On a machine with SLURM it
+# ALSO routes job submission through the fail-closed broker — automatically. The
+# broker is spawned ONLY when sbatch is detected (by the wrapper); on a laptop there
+# is no broker, no spool, and no trace. There is deliberately no flag to disable the
+# cage. (A single command drives both cases; the retired `husk-slurm` is gone.)
+set -euo pipefail
+
 if ! command -v claude >/dev/null 2>&1; then
   echo "husk: the 'claude' CLI was not found on PATH." >&2
   echo "husk wraps an existing Claude Code install; install and sign in" >&2
   echo "first, then re-run. See https://code.claude.com/docs" >&2
   exit 127
 fi
-exec seccomp-wrapper claude "$@"
+
+self="$(readlink -f "$0")"
+here="$(cd "$(dirname "$self")" && pwd)"     # the bin dir husk is installed in
+
+# Locate the SLURM-brokering pieces (installed together, or absent on unsupported
+# arches). The wrapper itself decides at runtime whether to broker (SLURM present)
+# or just exec the agent (no SLURM), so we always route through it when it exists.
+wrapper=""; broker=""; stub=""
+if [ -x "$here/husk-slurm-wrapper" ]; then wrapper="$here/husk-slurm-wrapper"; fi
+if [ -x "$here/husk-slurm-broker" ];  then broker="$here/husk-slurm-broker";  fi
+for p in "$here/../lib/husk/sbatch-stub.py" "$here/sbatch-stub.py"; do
+  if [ -r "$p" ]; then stub="$p"; break; fi
+done
+
+# Site partition (operator-recorded at install; agent-inaccessible). An explicit
+# HUSK_SLURM_PARTITION env var wins; otherwise use the recorded value. The broker
+# forces this partition onto every job.
+if [ -z "${HUSK_SLURM_PARTITION:-}" ]; then
+  for cfg in "$here/../lib/husk/slurm-partition" "$here/slurm-partition"; do
+    if [ -r "$cfg" ]; then
+      part="$(head -n1 "$cfg" | tr -d '[:space:]')"
+      if [ -n "$part" ]; then export HUSK_SLURM_PARTITION="$part"; fi
+      break
+    fi
+  done
+fi
+
+# No broker layer installed (e.g. unsupported arch) → run the plain cage.
+if [ -z "$wrapper" ] || [ -z "$broker" ]; then
+  exec seccomp-wrapper claude "$@"
+fi
+
+# Hand off to the fail-closed wrapper. Agent is `seccomp-wrapper claude` (NOT husk,
+# so there is no launcher recursion). The wrapper brokers iff it detects SLURM.
+args=("$wrapper")
+if [ -n "$stub" ]; then args+=(--stub "$stub"); fi
+args+=(--broker "$broker")
+exec "${args[@]}" -- seccomp-wrapper claude "$@"
 LAUNCHER
 chmod +x "$CLAUDE_SAFE_DEST"
 ok "husk launcher → $CLAUDE_SAFE_DEST"
+
+# ── SLURM brokering (optional) ────────────────────────────────────────────────
+#
+# Out-of-sandbox broker + fail-closed outer wrapper + in-sandbox sbatch stub. The
+# `husk` launcher (installed above) auto-detects SLURM and drives these; there is no
+# separate launcher. OPTIONAL: if the prebuilt broker binaries for this arch are
+# absent this is skipped and plain husk still works. The binaries are prebuilt
+# per-arch like seccomp-wrapper; build them first with:
+#   (cd slurm-broker && ./build-release.sh)
+log "SLURM brokering (optional)"
+
+SLURM_BROKER_SRC="$SCRIPT_DIR/slurm-broker/husk-slurm-broker-${HOST_ARCH}"
+SLURM_WRAPPER_SRC="$SCRIPT_DIR/slurm-broker/husk-slurm-wrapper-${HOST_ARCH}"
+HUSK_SLURM_INSTALLED=0
+if [[ -x "$SLURM_BROKER_SRC" && -x "$SLURM_WRAPPER_SRC" ]]; then
+  mkdir -p "$PREFIX/bin" "$PREFIX/lib/husk"
+  install -m 0755 "$SLURM_BROKER_SRC"  "$PREFIX/bin/husk-slurm-broker"
+  install -m 0755 "$SLURM_WRAPPER_SRC" "$PREFIX/bin/husk-slurm-wrapper"
+  install -m 0755 "$SCRIPT_DIR/slurm-broker/sbatch-stub.py" \
+                  "$PREFIX/lib/husk/sbatch-stub.py"
+  # husk-slurm is retired — `husk` now brokers SLURM itself. Remove any stale copy
+  # left by an older install so users don't keep invoking the dead launcher.
+  rm -f "$PREFIX/bin/husk-slurm"
+  ok "SLURM brokering → husk (broker + wrapper + stub installed; husk auto-brokers)"
+
+  # Record the site partition (if given) so husk exports it as
+  # HUSK_SLURM_PARTITION. Trusted: under ~/.local, agent-inaccessible from the
+  # sandbox. Absent → the broker uses its built-in default (preemptible).
+  SLURM_PARTITION="${SLURM_PARTITION_ARG:-${HUSK_SLURM_PARTITION:-}}"
+  if [[ -n "$SLURM_PARTITION" ]]; then
+    printf '%s\n' "$SLURM_PARTITION" > "$PREFIX/lib/husk/slurm-partition"
+    ok "SLURM partition → '$SLURM_PARTITION' (recorded in $PREFIX/lib/husk/slurm-partition)"
+  else
+    rm -f "$PREFIX/lib/husk/slurm-partition"
+    skip "SLURM partition not set — broker default 'preemptible' (set with --slurm-partition NAME; Santis has no preemptible, use debug or shared)"
+  fi
+  HUSK_SLURM_INSTALLED=1
+else
+  skip "SLURM brokering not installed — broker binaries not built for ${HOST_ARCH}"
+  echo "         enable with: (cd slurm-broker && ./build-release.sh)"
+fi
 
 # ── ~/.claude/settings.json ───────────────────────────────────────────────────
 #
@@ -338,7 +451,12 @@ echo "  bwrap             — filesystem namespace (system-provided)"
 [[ -x "$APPLY_SECCOMP_DEST" ]] && \
 echo "  apply-seccomp     — AF_UNIX + io_uring BPF filter (Anthropic)"
 echo "  seccomp-wrapper   — broad syscall deny-list"
-echo "  husk              — launcher: seccomp-wrapper claude"
+if [[ "${HUSK_SLURM_INSTALLED:-0}" == 1 ]]; then
+  echo "  husk              — launcher: seccomp-wrapper claude, + SLURM job brokering"
+  echo "                      (auto-detected; broker spawned only when sbatch is present)"
+else
+  echo "  husk              — launcher: seccomp-wrapper claude"
+fi
 echo ""
 echo "If you have not already done so, add this to ~/.bashrc or ~/.bash_profile:"
 echo '  export PATH="$HOME/.local/bin:$PATH"'

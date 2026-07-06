@@ -64,6 +64,37 @@ development clone):
 > The script will show you exactly what it will add to `~/.claude/settings.json`
 > and ask for confirmation before making any changes.
 
+### SLURM: record the partition (per machine)
+
+On a machine with SLURM, the broker forces **every** brokered job onto one
+partition, recorded at install time. The built-in default is `preemptible`, so
+installing bare on a site without that partition leaves the broker forcing one
+that does not exist — submissions then fail at the scheduler with
+`invalid partition specified`.
+
+**Balfrin** — use `preemptible`. It is also the built-in default, so a bare
+install works here:
+
+```bash
+./install-husk.sh --slurm-partition preemptible
+```
+
+**Santis** — has **no** `preemptible` partition, so it must be set explicitly.
+`debug` and `shared` both work (`debug` for short test jobs, `shared` when nodes
+are free):
+
+```bash
+./install-husk.sh --slurm-partition debug
+```
+
+On any other site, list what exists with `sinfo -s` and pick accordingly.
+
+Prefer a low-priority or preemptible queue where the site has one, so an
+unattended agent's jobs can be killed and do not consume your allocation's
+priority. The partition is **not** auto-detected: which queue an unattended
+agent submits to is an operator decision, not something to infer from cluster
+state. To change it later, re-run the installer with the new value.
+
 If `~/.local/bin` is not yet on your PATH, add this to `~/.bashrc` or
 `~/.bash_profile`:
 
@@ -104,11 +135,14 @@ directory. All home directories — yours and other users' — are not visible t
 the agent. Data on shared filesystems outside the home directories
 (e.g. `/scratch/`) is readable but not writable.
 
-**SLURM:** SLURM commands don't run inside the sandbox at all — it blocks the
-local authentication socket (MUNGE) they rely on and removes the network path
-to the scheduler. Run them yourself in your own shell. For the one (heavily
-restricted) way to let an *unattended* agent submit a job, see
-[Running SLURM jobs from an unattended sandbox](#running-slurm-jobs-from-an-unattended-sandbox).
+**SLURM:** `husk` handles SLURM automatically. On a cluster it routes job
+submission through a **fail-closed broker** — the agent can submit batch jobs and
+run read-only queries (`squeue`/`sinfo`/`sacct`/…), but the real commands run
+*outside* the sandbox, submitted jobs are re-sandboxed on the compute node, and the
+agent never gets the credentials to submit directly. The broker is spawned **only
+when SLURM is detected**; on a laptop there's no broker and no trace, and a
+sandboxed `sbatch` has nothing to talk to. See
+[Running SLURM jobs (the broker)](#running-slurm-jobs-the-broker).
 
 **Network access** *(per-project config):* `ssh`, `curl`, `wget`, and similar
 tools are blocked by default. This is a conservative starting point for shared
@@ -170,91 +204,62 @@ Settings are split into two files:
   with your administrators on other HPC systems)
 - `gcc`, `make`, `wget`, `python3` (standard on HPC login nodes)
 
-## Running SLURM jobs from an unattended sandbox
+## Running SLURM jobs (the broker)
 
-> **⚠️ This is a deliberately crippled last resort, not a recommended workflow — read the whole section before using it.** If a human is around to run SLURM commands, do that and let the agent only edit code.
+On a cluster, just run **`husk`** — it detects SLURM and starts a small,
+**fail-closed broker** that lets an unattended agent submit and monitor jobs — days
+long, with no human to approve prompts — **without ever handing the agent the
+credentials to do so**. On a machine with no SLURM, `husk` runs the plain sandbox,
+with no broker and no trace. (There's no separate command — `husk` does both.)
 
-SLURM commands do not work inside the sandbox: it blocks the local socket
-SLURM's authentication (MUNGE) needs and removes the network path to the
-scheduler. In an **unattended** run — days long, with no human to approve
-prompts — there is currently exactly one way to let the agent submit a job:
-**exempt a single, exact, immutable command from the sandbox.** That is enough
-to, say, drive a weeks-long hyperparameter search that re-submits the *same*
-training job with different numeric settings. It does not let the agent submit
-anything else.
+**Activate your uenv (or modules) first.** The broker inherits the software
+environment of the shell that launched it, and the agent cannot mount one from
+inside the cage. So `uenv start <image>` (or load your modules) *first*, then `husk`.
 
-The safety of this rests entirely on three things you must get right by hand:
+### How it works
 
-**1. The job script — and everything it touches — must not be editable by the agent.**
+Inside the sandbox, `sbatch` and the read-only query commands are shadowed by a
+stub. The stub hands each request to the trusted broker running **outside** the
+sandbox — the only place MUNGE and the network exist. The broker:
 
-Put the script at an **absolute path outside your project directory**, owned
-by you (the sandbox makes your home read-only to the agent's shell, and the
-file-editing tools prompt or refuse outside the project). This applies to the
-**whole chain**: every file the script sources, every module it imports, every
-program it runs. An agent-writable `train.py` imported by a read-only
-`train.sh` reopens the hole completely.
+1. **validates** the request as hostile input (see policy below);
+2. **re-sandboxes** the job on the compute node — the job runs inside the same
+   kind of cage as the login session (other users' homes hidden, credential
+   files masked, auto-exec files write-protected, network unshared), so a
+   prompt-injected job cannot read another user's data or escape the node; and
+3. submits it under policy and returns the job id.
 
-```
-~/slurm-jobs/train.sh     # the script you submit — read-only to the agent
-~/slurm-jobs/train.py     # and everything it imports — also read-only
-```
+Because only the trusted broker holds MUNGE and the network path, the agent
+**cannot bypass it** to submit directly — a sandboxed `sbatch` has nothing to
+talk to.
 
-**2. Allow exactly one command string, exempted from the sandbox.**
+### What the agent can do
 
-In `~/.claude/settings.json`, exempt that one command and allow only its exact
-string — **no `*` wildcard**, the match must be exact:
+- **Submit batch jobs** — `sbatch --partition=<site> job.sh`. The partition **must**
+  be the site's configured one — `preemptible` by default, set per machine at install
+  with `--slurm-partition` (Balfrin uses `preemptible`; Santis has no such partition,
+  so e.g. `debug`). Any other is rejected with a message telling the agent how to
+  resubmit (so design jobs to checkpoint and tolerate preemption). Risky options
+  (`--output`/`--error`/`--chdir`/`--export`/`--wrap`) are forced to safe values, and
+  the script is snapshotted at submit time (no edit-after-validate window).
+- **Monitor jobs (read-only)** — `squeue`, `sinfo`, `sacct`, `sstat`, `sprio`,
+  `sreport`, `sshare`. The broker runs them and returns their output; they change
+  no scheduler state.
+- **Everything else is rejected** — state-changing commands (`scancel`,
+  `scontrol update`, …), interactive `srun`/`salloc`, and any unknown command.
 
-```json
-{
-  "sandbox": {
-    "excludedCommands": ["sbatch --partition=preemptive --time=2:00:00 /home/you/slurm-jobs/train.sh"]
-  },
-  "permissions": {
-    "allow": ["Bash(sbatch --partition=preemptive --time=2:00:00 /home/you/slurm-jobs/train.sh)"]
-  }
-}
-```
+The submitted job still runs *your* script with *your* allocation — but now
+inside a cage, so an agent that tampers with its own job script is contained to
+that job's sandbox rather than turned loose unsandboxed on the node. If you want
+belt-and-suspenders, still keep the job script and its imports read-only to the
+agent (an absolute path outside the project) and pass the agent's choices as
+**validated data**, not as a code path.
 
-Keep `allowUnsandboxedCommands: false` so this is the *only* command that ever
-leaves the sandbox. Any other `sbatch` stays sandboxed and simply fails —
-harmlessly. (If your Claude Code only matches `excludedCommands` by program
-name, use `"sbatch"` there instead — the exact `allow` rule is what restricts
-execution to the single command.)
-
-**3. The agent may dial parameters, never inject code.**
-
-The agent's only influence on the run must be **pure data through a strictly
-validated channel** — numbers within ranges, choices from a fixed list. Have
-your read-only script read the agent's settings from a data file and validate
-them hard before using them:
-
-```
-# the agent may edit ./params.json in the project:  {"lr": 0.01, "batch": 64, "loss": "mse"}
-# train.sh checks: lr and batch are numbers in range; loss is one of a fixed
-# enum {"mse", "cross_entropy"}; anything else aborts the job.
-```
-
-The data/code boundary is the hard part, and it is sharper than it looks.
-"Let the agent choose the loss function" sounds like data, but a loss *name*
-usually maps to imported code — a free-form string there is a code-injection
-channel. Only a **closed enum** is safe. The same caution applies to anything
-that can name a file, a module, a Python object, or a shell fragment.
-
-> **⚠️ The submitted job runs completely unsandboxed on the compute node.**
-> None of the sandbox's protections reach it. The exact-command rule pins
-> *which command runs*, not *what it does* — and what it does is decided
-> entirely by the script and everything it reads as code. If any link in that
-> chain is writable, or if one "parameter" can smuggle in code, the agent has
-> arbitrary, unsandboxed execution with your full credentials.
-
-This works, but it is narrow, brittle, and easy to get subtly wrong — the tool
-gives you no help verifying the chain is immutable or that the parameters are
-truly data-only; that is all on you. It exists only because there is no better
-option yet. A proper mechanism — a small broker that validates structured job
-requests outside the sandbox and re-sandboxes the job on the compute node — is
-planned but not yet available. Until then, prefer to **run SLURM yourself** and
-let the agent assist with code, or accept that an unattended agent cannot
-submit jobs.
+> **Scope in this release:** single node, no MPI. Multi-process / multi-node MPI
+> (`srun`), a network allowlist for compute jobs (they currently run with the
+> network unshared), interactive `srun`/`salloc`, and read-only
+> `scontrol show`/`sacctmgr list` are on the roadmap — see
+> [`ROADMAP.md`](ROADMAP.md) and [`slurm-broker/BROKER.md`](slurm-broker/BROKER.md).
 
 ## Known limitations
 
@@ -263,18 +268,29 @@ submit jobs.
   friends are blocked in the project config template as a compensating control.
 - **SSH to compute nodes:** Blocked by default. Remove `Bash(ssh *)` from your
   project's deny list if you regularly need Claude to assist on compute nodes.
-- **SLURM:** SLURM commands don't work inside the sandbox at all (it blocks the
-  local authentication socket they use and the network path to the scheduler).
-  Run them in your own shell; for unattended submission see
-  [Running SLURM jobs from an unattended sandbox](#running-slurm-jobs-from-an-unattended-sandbox).
-  A submitted job runs *unsandboxed* on its compute node — a SLURM gateway (a
-  broker that re-sandboxes the job on the compute node) is planned for an
-  upcoming v0.2.x release.
+- **SLURM:** on a cluster `husk` auto-brokers; the broker
+  supports **single-node batch jobs** (`sbatch`, re-sandboxed on the compute
+  node) and **read-only queries** (`squeue`/`sinfo`/`sacct`/…) — see
+  [Running SLURM jobs (the broker)](#running-slurm-jobs-the-broker). Not yet:
+  multi-process / multi-node **MPI** (`srun`), a **network allowlist** for
+  compute jobs (they run with the network unshared), interactive `srun`/`salloc`,
+  and read-only `scontrol show`/`sacctmgr list` (see [`ROADMAP.md`](ROADMAP.md)).
+  The compute-node cage is a *subset* of the login cage — notably its credential
+  auto-scan uses a built-in pattern set rather than your `Read()` deny globs.
 - **Large projects on Lustre:** on very large trees (many build directories) on
   Lustre filesystems, the sandbox can stall for up to ~a minute while it sets up
   its per-command filesystem rules. This is in the bundled sandbox and not
   currently configurable; launch the agent from a leaner working directory (not
   the build-heavy project root) to avoid it.
+
+## Acknowledgements
+
+husk builds on Anthropic's open-source
+[sandbox-runtime](https://github.com/anthropics/sandbox-runtime) (Apache-2.0):
+the login sandbox installs and runs its `apply-seccomp` helper, and the broker's
+compute-node filesystem cage is a Rust reimplementation adapted from its Linux
+model (read/write policy, credential masking, bubblewrap argument construction).
+See [`NOTICE`](NOTICE) for details.
 
 ## License
 

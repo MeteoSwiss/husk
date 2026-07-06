@@ -2,19 +2,33 @@
 husk-*.tar.gz
 husk-*.SHA256SUMS
 
-# husk build output (build_and_test.sh artifacts)
-husk/.build/
-husk/seccomp-wrapper
-husk/seccomp-wrapper-x86_64
-husk/seccomp-wrapper-aarch64
-husk/test/smoke
-husk/test/test_ptrace
-husk/test/test_personality_query
-husk/test/test_personality_switch
+# seccomp-wrapper build output (build_and_test.sh artifacts)
+seccomp-wrapper/.build/
+seccomp-wrapper/.deps/
+seccomp-wrapper/seccomp-wrapper
+seccomp-wrapper/seccomp-wrapper-x86_64
+seccomp-wrapper/seccomp-wrapper-aarch64
+seccomp-wrapper/test/smoke
+seccomp-wrapper/test/test_ptrace
+seccomp-wrapper/test/test_personality_query
+seccomp-wrapper/test/test_personality_switch
 
 # Skill eval workspaces (generated during testing)
 *-workspace/
 _dev/
+
+# Rust / slurm-broker
+# Cargo.lock is committed (reproducibility). Vendored crates + the crates-io->
+# vendor redirect are a LOCAL offline-build convenience only (`cargo vendor`),
+# never released. Releases ship prebuilt per-arch binaries (build-release.sh),
+# like seccomp-wrapper/seccomp-wrapper-*.
+slurm-broker/broker/target/
+slurm-broker/vendor/
+slurm-broker/broker/.cargo/config.toml
+slurm-broker/husk-slurm-broker-x86_64
+slurm-broker/husk-slurm-broker-aarch64
+slurm-broker/husk-slurm-wrapper-x86_64
+slurm-broker/husk-slurm-wrapper-aarch64
 
 # Python
 __pycache__/
