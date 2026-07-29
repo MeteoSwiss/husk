@@ -18,6 +18,11 @@
 //!    the per-task wrap defeats (1) entirely. Dropping it silently would also change
 //!    what the job does without saying so, so they carry `Class::Rejected` with a reason.
 //!
+//! Deliberately NOT here, and why: `--nodelist`/`--exclude` (avoiding a flaky node is a
+//! JOB-level choice — both are already Allowed in `sbatch.rs`, and a single-node step has
+//! exactly one node to pick from), and `--cpu-freq` (site-restricted, nothing needs it;
+//! the rejection message names it if that changes).
+//!
 //! The registry starts deliberately SMALL. Rejecting an option a real workload needs
 //! costs one line and produces a message that says exactly what to add; allowing one
 //! nobody has thought about is how gates get holes. Same loop as "unsupported sbatch
@@ -95,6 +100,12 @@ pub const REGISTRY: &[OptSpec] = &[
     spec!("--time", "-t", true, Class::Allowed, v_time),
     spec!("--cpu-bind", "", true, Class::Allowed, v_bind),
     spec!("--gpu-bind", "", true, Class::Allowed, v_bind),
+    // NUMA memory placement (`local`, `map_mem:0,1`, `mask_mem:0x3`). Binding is
+    // naturally per-task, so the step is where it belongs; it is already Allowed for
+    // sbatch, and it is the same family as `numactl --membind`, which ICON's own
+    // launcher uses. Performance, not containment: set_mempolicy/mbind cannot reach
+    // outside the job's cpuset.
+    spec!("--mem-bind", "", true, Class::Allowed, v_bind),
     spec!("--distribution", "-m", true, Class::Allowed, v_dist),
     spec!("--hint", "", true, Class::Allowed, v_hint),
     spec!("--exclusive", "", false, Class::Allowed, always_true),
@@ -267,6 +278,29 @@ mod tests {
         assert_eq!(st.options, v(&["--cpus-per-task=4"]));
         let st = interpret(&v(&["-N4", "./a"])).unwrap();
         assert!(st.options.is_empty(), "{:?}", st.options);
+    }
+
+    #[test]
+    fn node_selection_stays_a_job_level_choice() {
+        // --nodelist/--exclude are how you avoid a flaky node, and that is decided when
+        // the JOB picks its node: both are Allowed in sbatch.rs. A single-node step has
+        // one node to choose from, so allowing them here would be dead surface.
+        for argv in [
+            v(&["--nodelist=nid001000", "./a"]),
+            v(&["-x", "nid001000", "./a"]),
+            v(&["--cpu-freq=High", "./a"]),
+        ] {
+            let err = interpret(&argv).expect_err("must be rejected");
+            assert!(err.contains("unsupported srun option"), "{argv:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn allows_numa_memory_binding() {
+        let st = interpret(&v(&["--mem-bind=local", "./a"])).unwrap();
+        assert_eq!(st.options, v(&["--mem-bind=local"]));
+        let st = interpret(&v(&["--mem-bind", "map_mem:0,1", "./a"])).unwrap();
+        assert_eq!(st.options, v(&["--mem-bind=map_mem:0,1"]));
     }
 
     #[test]
