@@ -1,6 +1,16 @@
 # husk — cage profiles (design)
 
-**Status: design, decided 2026-07-29. Not yet implemented.**
+**Status: decided 2026-07-29. Topology selection + forcing IMPLEMENTED (`broker/src/profile.rs`);
+the seccomp profile flag is not.**
+
+| piece | state |
+|---|---|
+| `Profile` enum, broker-side selection | done — `profile.rs` |
+| single-node **forced** via `--nodes=1` | done — `--nodes` is `Class::Forced`, policy.rs validates + the profile emits |
+| multi-node rejected with a teaching message | done |
+| MUNGE mask in the floor | done, verified 33/33 on Balfrin |
+| AF_UNIX block as a `seccomp-wrapper --profile` flag | **not yet** — see Open |
+| rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | **not yet** — arrives with the srun step-broker |
 
 ## Why profiles exist
 

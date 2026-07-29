@@ -232,7 +232,7 @@ expect_status p4 submitted sbatch.directive_partition "#SBATCH partition directi
 # (We use a sentinel export var, NOT ALL: the broker itself legitimately forces
 # --export=ALL for uenv jobs, so ALL can't distinguish a leak from the broker's own.)
 reset_spool
-mkreq p5 sbatch "[\"--partition=$PART\",\"-o\",\"/users/victim/.bashrc\",\"--chdir=/evil\",\"--export=SNEAKYVAR\",\"--nodes=2\"]" /work "$VALID_BODY"
+mkreq p5 sbatch "[\"--partition=$PART\",\"-o\",\"/users/victim/.bashrc\",\"--chdir=/evil\",\"--export=SNEAKYVAR\",\"--time=01:00:00\"]" /work "$VALID_BODY"
 run_broker dry "$SPOOL/out.p5"
 ARGV_LINE="$(grep -m1 '^argv:' "$SPOOL/out.p5" || true)"
 p5_ok=1; p5_why=""
@@ -241,8 +241,8 @@ grep -q '/evil'                 <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked --
 grep -q 'SNEAKYVAR'             <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked agent --export; "; }
 grep -q 'output=/work/slurm-%j.out' <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --output; "; }
 grep -q 'chdir=/work'           <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --chdir; "; }
-grep -q 'nodes=2'               <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="dropped benign --nodes; "; }
-if [ "$p5_ok" = 1 ]; then check PASS policy sbatch.force_safe "dangerous -o/--chdir/agent --export forced safe; benign --nodes kept"
+grep -q 'time=01:00:00'         <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="dropped benign --time; "; }
+if [ "$p5_ok" = 1 ]; then check PASS policy sbatch.force_safe "dangerous -o/--chdir/agent --export forced safe; benign --time kept"
 else check FAIL policy sbatch.force_safe "${p5_why%; }"; fi
 
 # P6 — a read-only query is routed to Query (status=ok), not rejected.
@@ -278,6 +278,30 @@ mkreq p11 sbatch "[\"--partition=$PART\",\"--get-user-env\"]" /work "$VALID_BODY
 run_broker dry "$SPOOL/out.p11"
 expect_status p11 rejected sbatch.unknown_option "unsupported CLI option rejected (allowlist)"
 
+# P11b — multi-node is REJECTED, not silently downgraded to one node. The cage profile is
+# single-node (multi-node needs an IP path for the PMI bootstrap), and a job that asked
+# for 4 nodes but ran on 1 would report success having used a quarter of the resources.
+reset_spool
+mkreq p11b sbatch "[\"--partition=$PART\",\"--nodes=4\"]" /work "$VALID_BODY"
+run_broker dry "$SPOOL/out.p11b"
+expect_status p11b rejected sbatch.multinode "multi-node rejected (single-node cage profile)"
+
+# P11c — and the topology is FORCED, not merely permitted: --nodes=1 is emitted even when
+# the agent never mentioned it, so the scheduler cannot spread --ntasks over nodes and
+# leave the job wearing a single-node cage on a multi-node allocation.
+reset_spool
+mkreq p11c sbatch "[\"--partition=$PART\",\"--ntasks=8\"]" /work "$VALID_BODY"
+run_broker dry "$SPOOL/out.p11c"
+# Match the `argv:` line ONLY. The probe body carries its own `#SBATCH --nodes=1`, so a
+# whole-file grep passes even against a broker that forces nothing — it was a false
+# positive on the first try. The forced value has to appear on the real command line,
+# because that is what outranks the directive.
+if grep -E '^argv:' "$SPOOL/out.p11c" 2>/dev/null | grep -q -- '--nodes=1'; then
+  check PASS policy sbatch.nodes_forced "--nodes=1 forced onto the argv of a submission that never asked"
+else
+  check FAIL policy sbatch.nodes_forced "--nodes=1 NOT on the forced argv — profile is inferred, not guaranteed"
+fi
+
 # P12 — a benign option carrying an out-of-grammar / injection VALUE is rejected.
 # (';' is a shell metacharacter; harmless here — literal inside the JSON string.)
 reset_spool
@@ -285,14 +309,15 @@ mkreq p12 sbatch "[\"--partition=$PART\",\"--job-name=pwn;id\"]" /work "$VALID_B
 run_broker dry "$SPOOL/out.p12"
 expect_status p12 rejected sbatch.bad_value "out-of-grammar option value rejected"
 
-# P13 — benign resource options are validated + RE-EMITTED canonically (glued -N2,
-# separated -c 4, and =-form all normalise to --long=value).
+# P13 — benign resource options are validated + RE-EMITTED canonically (glued -J, ""
+# separated -c 4, and =-form all normalise to --long=value). NB not -N: the cage profile
+# owns the topology, so --nodes is Forced and never a passthrough.
 reset_spool
-mkreq p13 sbatch "[\"--partition=$PART\",\"-N2\",\"-c\",\"4\",\"--time=01:00:00\"]" /work "$VALID_BODY"
+mkreq p13 sbatch "[\"--partition=$PART\",\"-Jrun1\",\"-c\",\"4\",\"--time=01:00:00\"]" /work "$VALID_BODY"
 run_broker dry "$SPOOL/out.p13"
 ARGV13="$(grep -m1 '^argv:' "$SPOOL/out.p13" || true)"
 p13_ok=1; p13_why=""
-grep -q 'nodes=2'         <<<"$ARGV13" || { p13_ok=0; p13_why+="no canonical --nodes; "; }
+grep -q 'job-name=run1'   <<<"$ARGV13" || { p13_ok=0; p13_why+="no canonical --job-name; "; }
 grep -q 'cpus-per-task=4' <<<"$ARGV13" || { p13_ok=0; p13_why+="no canonical --cpus-per-task; "; }
 grep -q 'time=01:00:00'   <<<"$ARGV13" || { p13_ok=0; p13_why+="no --time; "; }
 if [ "$p13_ok" = 1 ]; then check PASS policy sbatch.canonicalize "resource opts validated + re-emitted canonically"

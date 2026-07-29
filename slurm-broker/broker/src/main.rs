@@ -3,6 +3,7 @@
 //! safe options, re-sandboxes the job, and submits. See BROKER.md / PROTOCOL.md.
 
 mod policy;
+mod profile;
 mod protocol;
 mod sbatch;
 mod session;

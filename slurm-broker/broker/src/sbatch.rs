@@ -97,7 +97,10 @@ pub const REGISTRY: &[OptSpec] = &[
     spec!("--repo", "", true, Class::Forced, always_true),
     spec!("--wrap", "", true, Class::Forced, always_true),
     // ---- Allowed: benign resource options, validated + re-emitted ----
-    spec!("--nodes", "-N", true, Class::Allowed, v_nodes),
+    // Forced, not Allowed: the cage profile is a function of the node count, so the
+    // broker emits it (see profile.rs). policy.rs validates the agent's request first and
+    // REJECTS anything but one node - forcing alone would silently downgrade a 4-node job.
+    spec!("--nodes", "-N", true, Class::Forced, v_nodes),
     spec!("--ntasks", "-n", true, Class::Allowed, v_uint),
     spec!("--ntasks-per-node", "", true, Class::Allowed, v_uint),
     spec!("--ntasks-per-core", "", true, Class::Allowed, v_uint),
@@ -357,7 +360,10 @@ pub fn body_reject_reason(body: &str) -> Option<String> {
             "--output" | "-o" | "--error" | "-e" | "--chdir" | "-D" | "--export"
         );
         // Options with dedicated validation + teaching messages in policy.rs.
-        let dedicated = matches!(name, "--partition" | "-p" | "--uenv" | "--view" | "--repo");
+        let dedicated = matches!(
+            name,
+            "--partition" | "-p" | "--uenv" | "--view" | "--repo" | "--nodes" | "-N"
+        );
         if dominated || dedicated {
             if takes_value(name) && !tok.contains('=') {
                 i += 1;
@@ -464,9 +470,9 @@ mod tests {
 
     #[test]
     fn interpret_cli_drops_forced_and_ignored_reemits_allowed_canonically() {
-        // Forced (--export/--chdir) and Ignored (--mail-user) are dropped; Allowed
-        // options are re-emitted in canonical --long=value form regardless of the
-        // spelling the agent used (glued -N2, separated -c 4, --time=..).
+        // Forced (--export/--chdir/--nodes) and Ignored (--mail-user) are dropped;
+        // Allowed options are re-emitted in canonical --long=value form regardless of
+        // the spelling the agent used (glued -c4, separated -c 4, --time=..).
         let cli = option_tokens(&split_glued_short_opts(&v(&[
             "--partition=preemptible", "--export=NONE", "--chdir=/evil",
             "-N2", "-c", "4", "--time=01:00:00", "--mail-user=x@y.z", "--exclusive",
@@ -474,8 +480,11 @@ mod tests {
         let out = interpret_cli(&cli).expect("should be accepted");
         // partition/export/chdir Forced → gone; mail Ignored → gone.
         assert!(!out.iter().any(|x| x.contains("NONE") || x.contains("/evil") || x.contains("mail") || x.contains("partition")));
+        // --nodes is Forced too: the cage profile owns the topology, so the agent's
+        // glued -N2 must not survive to the real command line (policy.rs rejects >1
+        // node outright, and emits --nodes=1 itself).
+        assert!(!out.iter().any(|x| x.contains("nodes")), "{out:?}");
         // resource options canonicalised:
-        assert!(out.contains(&"--nodes=2".to_string()), "{out:?}");
         assert!(out.contains(&"--cpus-per-task=4".to_string()), "{out:?}");
         assert!(out.contains(&"--time=01:00:00".to_string()), "{out:?}");
         assert!(out.contains(&"--exclusive".to_string()), "flag re-emitted bare: {out:?}");
@@ -522,7 +531,10 @@ mod tests {
     fn interpret_cli_rejects_out_of_grammar_values() {
         // A value carrying shell metacharacters / spaces / wrong shape is rejected.
         assert!(interpret_cli(&v(&["--time", "; rm -rf /"])).is_err());
-        assert!(interpret_cli(&v(&["--nodes", "2;evil"])).is_err());
+        assert!(interpret_cli(&v(&["--cpus-per-task", "2;evil"])).is_err());
+        // NB --nodes is Forced, so a hostile value is DROPPED here rather than rejected;
+        // it never reaches sbatch either way, and policy.rs rejects anything but one node
+        // before this runs (see policy::tests::rejects_multi_node_and_hostile_node_values).
         assert!(interpret_cli(&v(&["--job-name", "a b`whoami`"])).is_err());
         assert!(interpret_cli(&v(&["--mem", "4G"])).is_ok());
         assert!(interpret_cli(&v(&["--gpus", "a100:2"])).is_ok());
@@ -628,15 +640,16 @@ mod tests {
     #[test]
     fn accepts_a_realistic_multi_option_job() {
         // The other direction: a normal resource request must NOT be over-rejected, and
-        // is canonicalised regardless of spelling (glued -N4, separated -c 8, =-forms).
+        // is canonicalised regardless of spelling (separated -c 8, =-forms). -N is
+        // absent because it is Forced — the cage profile emits it.
         let cli = option_tokens(&split_glued_short_opts(&v(&[
-            "--partition=preemptible", "-N", "4", "--ntasks-per-node=4", "-c", "8",
+            "--partition=preemptible", "--ntasks-per-node=4", "-c", "8",
             "--time=24:00:00", "--mem=0", "--gpus=4", "-C", "gpu", "-A", "myproj",
             "-J", "train-run_1", "--exclusive",
         ])));
         let out = interpret_cli(&cli).expect("a normal job must be accepted");
         for want in [
-            "--nodes=4", "--ntasks-per-node=4", "--cpus-per-task=8", "--time=24:00:00",
+            "--ntasks-per-node=4", "--cpus-per-task=8", "--time=24:00:00",
             "--mem=0", "--gpus=4", "--constraint=gpu", "--account=myproj",
             "--job-name=train-run_1", "--exclusive",
         ] {

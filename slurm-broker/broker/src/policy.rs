@@ -1,6 +1,7 @@
 //! All broker policy lives here. Input is hostile. See BROKER.md.
 
 use crate::protocol::{Request, PROTOCOL_VERSION};
+use crate::profile;
 use crate::sbatch;
 use crate::session::Session;
 use crate::settings::{self, FsPolicy};
@@ -76,6 +77,19 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
         }
     }
 
+    // ---- topology: pick the cage profile, and force it rather than infer it ----
+    // Checked across CLI *and* #SBATCH, like the partition: a body directive would reach
+    // slurmd, and `--nodes` is Forced in the registry so the agent's own token never
+    // survives to the real command line. The profile then EMITS `--nodes=1` below, which
+    // is what makes the single-node cage true by construction — reading the request is not
+    // enough, since `--ntasks N` alone lets the scheduler spread tasks over nodes.
+    let requested_nodes = sbatch::option_value(&cli, &["-N", "--nodes"])
+        .or_else(|| sbatch::option_value(&directives, &["-N", "--nodes"]));
+    let profile = match profile::Profile::select(requested_nodes.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => return Decision::Reject(reason),
+    };
+
     // ---- uenv: inherited from the launching session; the agent may NOT choose it ----
     // The broker forces --uenv/--view from the trusted session (below) and never uses
     // --repo. A #SBATCH directive in the body is not rewritten, so an agent-supplied uenv
@@ -128,6 +142,9 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     // ---- forced options (these outrank any #SBATCH directive: CLI > directive) ----
     let mut options: Vec<String> = Vec::new();
     options.push(format!("--partition={required}"));
+    // The cage profile's own forced options (today: --nodes=1). Emitted with the other
+    // forced values, before the validated passthrough, so they outrank any #SBATCH.
+    options.extend(profile.forced_sbatch_options());
     if let Some(u) = &session.uenv {
         options.push(format!("--uenv={u}"));
         // Force a NORMALIZED `--view` (uenvname:viewname). Raw UENV_VIEW is mount-qualified
@@ -411,7 +428,7 @@ mod tests {
     fn strips_agent_overrides_of_owned_options() {
         let o = opts(
             req(
-                &["--partition=preemptible", "--export=SNEAKYVAR", "--chdir=/evil", "--nodes=2"],
+                &["--partition=preemptible", "--export=SNEAKYVAR", "--chdir=/evil", "--time=01:00:00"],
                 "echo hi\n",
             ),
             &no_uenv(),
@@ -421,7 +438,8 @@ mod tests {
         assert!(has(&o, "--export=ALL")); // broker forces this (F24)
         assert!(!o.iter().any(|x| x.contains("SNEAKYVAR"))); // agent's --export value stripped
         assert!(!has(&o, "--chdir=/evil")); // agent's stripped
-        assert!(has(&o, "--nodes=2")); // benign passthrough kept
+        assert!(has(&o, "--time=01:00:00")); // benign passthrough kept
+        assert!(has(&o, "--nodes=1")); // cage profile forces the topology
     }
 
     /// Run a generated script with a stubbed `seccomp-wrapper` on PATH and return
@@ -534,6 +552,59 @@ mod tests {
         let policy_arg = line.find("'--ro-bind'").expect("policy arg on the line");
         let mask = line.find("$_husk_mask").expect("mask on the line");
         assert!(mask > policy_arg, "mask must follow the config binds: {line}");
+    }
+
+    #[test]
+    fn rejects_multi_node_and_hostile_node_values() {
+        // Multi-node must FAIL rather than be quietly downgraded to one node: a job that
+        // asked for four and ran on one would report success having computed with a
+        // quarter of the resources. Checked on the CLI, in the body, and for values that
+        // are not node counts at all.
+        for argv in [
+            vec!["--partition=preemptible", "-N", "2"],
+            vec!["--partition=preemptible", "-N2"],
+            vec!["--partition=preemptible", "--nodes=4"],
+            vec!["--partition=preemptible", "--nodes=1-4"],
+            vec!["--partition=preemptible", "--nodes=2;evil"],
+        ] {
+            match decide(&req(&argv, "echo hi\n"), &no_uenv(), &FsPolicy::default()) {
+                Decision::Reject(r) => {
+                    assert!(r.contains("single-node"), "{argv:?} -> {r}");
+                    assert!(r.contains("--nodes=1"), "must teach the fix: {argv:?} -> {r}");
+                }
+                _ => panic!("{argv:?} must be rejected"),
+            }
+        }
+        // ...and in the body, where the directive would otherwise reach slurmd.
+        let body = "#!/bin/bash\n#SBATCH --nodes=2\nsrun hostname\n";
+        match decide(
+            &req(&["--partition=preemptible"], body),
+            &no_uenv(),
+            &FsPolicy::default(),
+        ) {
+            Decision::Reject(r) => assert!(r.contains("single-node"), "{r}"),
+            _ => panic!("a body #SBATCH --nodes=2 must be rejected"),
+        }
+    }
+
+    #[test]
+    fn single_node_is_forced_not_merely_permitted() {
+        // The cage profile must be true by CONSTRUCTION: `--ntasks N` alone lets the
+        // scheduler spread tasks over nodes, so reading the request is not enough. The
+        // broker emits --nodes=1 whether or not the agent mentioned it, and exactly once.
+        for argv in [
+            vec!["--partition=preemptible"],
+            vec!["--partition=preemptible", "-N", "1"],
+            vec!["--partition=preemptible", "--ntasks=8"],
+        ] {
+            let o = opts(req(&argv, "echo hi\n"), &no_uenv());
+            assert_eq!(
+                o.iter().filter(|x| x.starts_with("--nodes")).count(),
+                1,
+                "exactly one --nodes must be emitted for {argv:?}: {o:?}"
+            );
+            assert!(has(&o, "--nodes=1"), "{argv:?} -> {o:?}");
+        }
     }
 
     #[test]
@@ -677,14 +748,14 @@ mod tests {
 
     #[test]
     fn canonicalizes_benign_resource_options() {
-        // Resource options are validated and re-emitted canonically: glued (-N2),
+        // Resource options are validated and re-emitted canonically: glued (-c4),
         // short-separated (-c 4) and =-forms all normalise to --long=value, and no raw
-        // agent token reaches the submission.
+        // agent token reaches the submission. (-N is no longer among them: it is Forced,
+        // owned by the cage profile.)
         let o = opts(
-            req(&["--partition=preemptible", "-N2", "-c", "4", "--time=01:00:00", "--gpus=a100:2"], "echo hi\n"),
+            req(&["--partition=preemptible", "-c4", "--time=01:00:00", "--gpus=a100:2"], "echo hi\n"),
             &no_uenv(),
         );
-        assert!(has(&o, "--nodes=2"), "{o:?}");
         assert!(has(&o, "--cpus-per-task=4"), "{o:?}");
         assert!(has(&o, "--time=01:00:00"), "{o:?}");
         assert!(has(&o, "--gpus=a100:2"), "{o:?}");
