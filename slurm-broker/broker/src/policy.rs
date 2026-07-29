@@ -193,7 +193,7 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     Decision::Submit(Submission {
         options,
         job_args: req.job_args.clone(),
-        wrapped_script: wrap_script(&req.script.body, &bwrap_args),
+        wrapped_script: wrap_script(&req.script.body, &bwrap_args, profile),
     })
 }
 
@@ -207,7 +207,7 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
 /// TODO(hardware/MPI): the network/fabric policy is still single-node only —
 /// `--unshare-net` breaks multi-node/MPI (no fabric); revisit for the MPI phase.
 /// Confirm the uenv /user-environment mount inherits through `--ro-bind / /`.
-fn wrap_script(body: &str, bwrap_args: &[String]) -> String {
+fn wrap_script(body: &str, bwrap_args: &[String], profile: profile::Profile) -> String {
     let mut head = String::new();
     let mut tail = String::new();
     let mut in_head = true;
@@ -257,6 +257,7 @@ fn wrap_script(body: &str, bwrap_args: &[String]) -> String {
     // the compute node knows which exist — same reason the GPU binds use --dev-bind-try.
     // Appended AFTER {bwrap} so it still wins over any config-driven allowRead.
     let mask_paths = settings::CREDENTIAL_SOCKET_DIRS.join(" ");
+    let sec = profile.seccomp_profile();
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
@@ -270,7 +271,7 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
     _husk_seen=\"$_husk_seen $_r\"\n\
     _husk_mask=\"$_husk_mask --tmpfs $_r\"\n\
   done\n\
-  seccomp-wrapper bwrap {bwrap} $_husk_mask -- /bin/bash \"$0\" \"$@\"\n\
+  seccomp-wrapper --profile={sec} bwrap {bwrap} $_husk_mask -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
   if [ \"$_husk_rc\" = 159 ]; then\n\
     echo \"husk: job killed by SIGSYS - a syscall blocked by husk's seccomp-wrapper.\" >&2\n\
@@ -457,7 +458,7 @@ mod tests {
         std::fs::write(&stub, stub_body).unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let script = wrap_script("#!/bin/bash\necho AGENT_BODY_RAN\n", &[]);
+        let script = wrap_script("#!/bin/bash\necho AGENT_BODY_RAN\n", &[], profile::Profile::SingleNode);
         let path = dir.join("job.sh");
         std::fs::write(&path, script).unwrap();
 
@@ -543,11 +544,20 @@ mod tests {
         // Ordering is the security property: bwrap applies binds in order and the last
         // one wins, so an allowRead that re-exposes a parent directory must not be able
         // to resurrect MUNGE. The mask therefore has to come AFTER the policy args.
-        let script = wrap_script("#!/bin/bash\ntrue\n", &["--ro-bind".into(), "/run".into(), "/run".into()]);
+        let script = wrap_script(
+            "#!/bin/bash\ntrue\n",
+            &["--ro-bind".into(), "/run".into(), "/run".into()],
+            profile::Profile::SingleNode,
+        );
         let line = script
             .lines()
-            .find(|l| l.contains("seccomp-wrapper bwrap"))
+            .find(|l| l.contains("seccomp-wrapper"))
             .expect("guard line");
+        // The cage profile must reach the syscall layer too, not just the mount layer.
+        assert!(
+            line.contains("--profile=single-node"),
+            "guard must pass the profile to seccomp-wrapper: {line}"
+        );
         // args are sh_quote'd, so they appear as '--ro-bind' '/run' '/run'
         let policy_arg = line.find("'--ro-bind'").expect("policy arg on the line");
         let mask = line.find("$_husk_mask").expect("mask on the line");

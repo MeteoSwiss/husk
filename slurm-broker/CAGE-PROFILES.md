@@ -1,7 +1,7 @@
 # husk — cage profiles (design)
 
-**Status: decided 2026-07-29. Topology selection + forcing IMPLEMENTED (`broker/src/profile.rs`);
-the seccomp profile flag is not.**
+**Status: decided 2026-07-29. Broker-side selection, forcing and the seccomp profile flag
+are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 
 | piece | state |
 |---|---|
@@ -9,7 +9,7 @@ the seccomp profile flag is not.**
 | single-node **forced** via `--nodes=1` | done — `--nodes` is `Class::Forced`, policy.rs validates + the profile emits |
 | multi-node rejected with a teaching message | done |
 | MUNGE mask in the floor | done, verified 33/33 on Balfrin |
-| AF_UNIX block as a `seccomp-wrapper --profile` flag | **not yet** — see Open |
+| AF_UNIX block as a `seccomp-wrapper --profile` flag | done — `--profile=login\|single-node`, unknown = fatal; smoke tests 5-7 |
 | rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | **not yet** — arrives with the srun step-broker |
 
 ## Why profiles exist
@@ -59,7 +59,7 @@ network and credential reach the job requires.
 
 | profile | escape-relevant delta | status |
 |---|---|---|
-| **login** | interactive adversary with tool access; no compute resources | today: Anthropic runtime + husk settings |
+| **login** | interactive adversary with tool access; no compute resources | today: Anthropic runtime + husk settings. AF_UNIX is already blocked here by their `apply-seccomp`, per **Bash command** — not on the runtime process, which needs unix sockets for MCP/IDE. husk's login profile takes that block over at the same granularity when step 5 drops their runtime. |
 | **single node** | none — needs no IP at all (measured) | the Chapter-1 target |
 | **multi node** | requires an IP path for the PMI bootstrap | **rejected today**; own phase |
 

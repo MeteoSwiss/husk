@@ -64,6 +64,20 @@ impl Profile {
             Profile::SingleNode => vec!["--nodes=1".to_string()],
         }
     }
+
+    /// The `--profile` value passed to `seccomp-wrapper`, which decides the syscall
+    /// rules layered on top of its base deny-list. Kept here so the topology decision has
+    /// exactly one home: the broker picks a profile, and every layer of the cage derives
+    /// from that name rather than re-deriving it.
+    ///
+    /// For `SingleNode` this adds the AF_UNIX block — measured safe for MPI (gate C12:
+    /// zero AF_UNIX calls in a caged 2-rank run), and it gives the compute cage the same
+    /// restriction the agent already has on the login side.
+    pub fn seccomp_profile(&self) -> &'static str {
+        match self {
+            Profile::SingleNode => "single-node",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +99,13 @@ mod tests {
             assert!(err.contains("single-node"), "must say what is supported: {err}");
             assert!(err.contains("--nodes=1"), "must say how to fix it: {err}");
         }
+    }
+
+    #[test]
+    fn single_node_names_its_seccomp_profile() {
+        // The name must match what seccomp-wrapper accepts; an unknown one is fatal
+        // there (fail-closed), so a mismatch shows up as every job failing to launch.
+        assert_eq!(Profile::SingleNode.seccomp_profile(), "single-node");
     }
 
     #[test]

@@ -22,6 +22,7 @@ TEST_SMOKE       = test/smoke
 TEST_PTRACE      = test/test_ptrace
 TEST_PERS_QUERY  = test/test_personality_query
 TEST_PERS_SWITCH = test/test_personality_switch
+TEST_AF_UNIX     = test/test_af_unix
 
 .PHONY: all install check clean
 
@@ -39,14 +40,17 @@ $(TEST_PTRACE): test/test_ptrace.c
 $(TEST_PERS_QUERY): test/test_personality_query.c
 	$(CC) $(CFLAGS_TEST) -o $@ $<
 
+$(TEST_AF_UNIX): test/test_af_unix.c
+	$(CC) $(CFLAGS_TEST) -o $@ $<
+
 $(TEST_PERS_SWITCH): test/test_personality_switch.c
 	$(CC) $(CFLAGS_TEST) -o $@ $<
 
 install: $(TARGET)
 	install -m 0755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
 
-check: $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH)
-	./$(TEST_SMOKE) ./$(TARGET) ./$(TEST_PTRACE) ./$(TEST_PERS_QUERY) ./$(TEST_PERS_SWITCH)
+check: $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) $(TEST_AF_UNIX)
+	./$(TEST_SMOKE) ./$(TARGET) ./$(TEST_PTRACE) ./$(TEST_PERS_QUERY) ./$(TEST_PERS_SWITCH) ./$(TEST_AF_UNIX)
 
 clean:
 	rm -f $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH)

@@ -32,7 +32,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+/*
+ * Cage profiles — see slurm-broker/CAGE-PROFILES.md.
+ *
+ * The profile names the topology the wrapped process runs in, and topology is the
+ * threat axis: it decides what network and credential reach the process needs. The
+ * base deny-list below applies to every profile; a profile only ever ADDS.
+ *
+ * PROFILE_LOGIN is the default precisely because it must stay today's behaviour: the
+ * husk launcher wraps the whole agent SESSION (`seccomp-wrapper claude`), and the agent
+ * runtime legitimately uses unix sockets for its own IPC (MCP servers, IDE integration).
+ *
+ * AF_UNIX is nevertheless already blocked on the login side — by Anthropic's
+ * apply-seccomp, applied per BASH COMMAND rather than to the runtime process. The
+ * difference is granularity, not policy: the agent's commands cannot open a unix socket,
+ * while the runtime that supervises them can. When ROADMAP step 5 drops their runtime,
+ * this profile takes that block over at the same granularity, and PROFILE_LOGIN stops
+ * being "base only". Until then, adding it here would restrict the runtime itself, which
+ * their filter never did.
+ *
+ * An unknown --profile is FATAL rather than a fallback to the default: a typo must not
+ * silently produce a weaker cage than the caller asked for.
+ */
+enum wrapper_profile {
+    PROFILE_LOGIN,        /* default: base deny-list only */
+    PROFILE_SINGLE_NODE,  /* brokered single-node compute job: + AF_UNIX */
+};
 
 /* -------------------------------------------------------------------------
  * Syscalls to BLOCK.
@@ -192,7 +220,7 @@ static const char *const BLOCKED_SYSCALLS[] = {
  * for older kernels, change to SCMP_ACT_KILL (kills only the calling thread)
  * or SCMP_ACT_ERRNO(EPERM) (returns an error).
  * ---------------------------------------------------------------------- */
-static int install_filter(bool debug_mode)
+static int install_filter(bool debug_mode, enum wrapper_profile profile)
 {
     scmp_filter_ctx ctx;
     int rc;
@@ -279,6 +307,41 @@ static int install_filter(bool debug_mode)
     }
 
     /*
+     * PROFILE_SINGLE_NODE — block AF_UNIX socket creation.
+     *
+     * Measured on Balfrin (gate C12, job 4972255): a caged 2-rank MPI job makes ZERO
+     * AF_UNIX socket()/connect() calls. PMI bootstraps over TCP, shared memory is mmap,
+     * the CXI fabric is ioctl — the MPI stack has no use for unix sockets. So a compute
+     * job can carry the same AF_UNIX restriction the agent already has on the login side
+     * (via Anthropic's apply-seccomp), closing an accidental divergence rather than a
+     * designed one.
+     *
+     * ERRNO(EPERM), NOT KILL_PROCESS — a deliberate exception to this file's
+     * fail-loud default. The security outcome is IDENTICAL: the socket is never created
+     * either way, so nothing reaches MUNGE or any other daemon. What differs is only
+     * what happens to a caller that PROBES: glibc's NSS tries nscd/sssd over AF_UNIX and
+     * falls back to /etc/passwd when it fails, and that fallback yields a CORRECT answer.
+     * Killing there would destroy a job for a benign, self-healing probe and buy no
+     * containment. Fail-loud exists to stop a silent WRONG ANSWER (the MPI job that
+     * "succeeded" as two independent one-rank jobs); it is not a goal in itself.
+     * Anthropic's filter makes the same call for the same syscall.
+     *
+     * socketpair(AF_UNIX) is deliberately NOT blocked: it returns a pair of the
+     * process's own fds with no filesystem path, so it cannot reach a daemon. Reaching
+     * one requires socket()+connect() to a sun_path, which is what this rule stops.
+     */
+    if (profile == PROFILE_SINGLE_NODE) {
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
+                              SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
+        if (rc != 0) {
+            fprintf(stderr, "seccomp_wrapper: seccomp_rule_add('socket(AF_UNIX)')"
+                    " failed: %s\n", strerror(-rc));
+            seccomp_release(ctx);
+            return -1;
+        }
+    }
+
+    /*
      * personality(2) — argument-filtered rule.
      *
      * personality(0xffffffff) is a read-only query (returns the current persona
@@ -334,12 +397,37 @@ static int install_filter(bool debug_mode)
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        fprintf(stderr, "usage: seccomp-wrapper [--] <command> [args...]\n");
+        fprintf(stderr, "usage: seccomp-wrapper [--profile=login|single-node] [--] <command> [args...]\n");
         return 1;
     }
 
-    /* skip optional "--" separator */
     char **cmd = argv + 1;
+
+    /*
+     * Optional --profile=NAME, ahead of the optional "--". Unknown names are FATAL:
+     * silently falling back to the default would hand the caller a weaker cage than it
+     * asked for, and the caller here is the broker's re-exec guard.
+     */
+    enum wrapper_profile profile = PROFILE_LOGIN;
+    if (strncmp(cmd[0], "--profile=", 10) == 0) {
+        const char *name = cmd[0] + 10;
+        if (strcmp(name, "login") == 0) {
+            profile = PROFILE_LOGIN;
+        } else if (strcmp(name, "single-node") == 0) {
+            profile = PROFILE_SINGLE_NODE;
+        } else {
+            fprintf(stderr, "seccomp-wrapper: unknown profile '%s'"
+                    " (known: login, single-node)\n", name);
+            return 1;
+        }
+        cmd++;
+        if (cmd[0] == NULL) {
+            fprintf(stderr, "seccomp-wrapper: no command after --profile\n");
+            return 1;
+        }
+    }
+
+    /* skip optional "--" separator */
     if (strcmp(cmd[0], "--") == 0) {
         cmd++;
         if (cmd[0] == NULL) {
@@ -376,7 +464,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (install_filter(debug_mode) != 0) {
+    if (install_filter(debug_mode, profile) != 0) {
         return 1;
     }
 
