@@ -28,13 +28,6 @@
 //! nobody has thought about is how gates get holes. Same loop as "unsupported sbatch
 //! option → add it to the registry" (BRINGUP.md, Probe F).
 
-// Not yet reachable from the binary: `policy::decide` still rejects tool="srun"
-// outright, because the step-broker that would consume this does not exist yet. The
-// allowlist lands first so the security-critical half is written and tested before the
-// process plumbing, rather than under time pressure alongside it. Remove this when the
-// step-broker wires it in.
-#![allow(dead_code)]
-
 use crate::sbatch::{Class, OptSpec, Registry};
 
 macro_rules! spec {

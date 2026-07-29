@@ -10,7 +10,8 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | multi-node rejected with a teaching message | done |
 | MUNGE mask in the floor | done, verified 33/33 on Balfrin |
 | AF_UNIX block as a `seccomp-wrapper --profile` flag | done — `--profile=login\|single-node`, unknown = fatal; smoke tests 5-7 |
-| rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | **not yet** — arrives with the srun step-broker |
+| rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | done — `settings::CageKind::Rank` + `rank::wrap_command` |
+| in-cage `srun` stub, step-broker, guard bootstrap | done — **untested on hardware** |
 
 ## Why profiles exist
 

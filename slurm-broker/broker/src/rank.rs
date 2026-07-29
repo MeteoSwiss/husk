@@ -28,11 +28,6 @@ use crate::settings::sh_quote;
 ///
 /// `spool_dir` is Slurm's `SlurmdSpoolDir` as resolved by the step-broker (trusted);
 /// `rank_args` are the static bwrap arguments from `FsPolicy::rank_bwrap_args`.
-///
-/// Not yet called from the binary — the step-broker that would issue the `srun` does not
-/// exist yet. Landed with the allowlist and the rank cage so the security-critical
-/// construction is written and executed under test before the process plumbing.
-#[allow(dead_code)]
 pub fn wrap_command(
     profile: Profile,
     rank_args: &[String],

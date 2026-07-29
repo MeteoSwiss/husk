@@ -455,11 +455,6 @@ impl FsPolicy {
 
     /// The RANK cage: as the job cage, plus the fabric devices, minus the private
     /// `/dev/shm`. See `CageKind`.
-    ///
-    /// Not yet called from the binary — the step-broker that launches ranks does not
-    /// exist yet. Landed with the step allowlist so the cage is defined and tested
-    /// before the process plumbing arrives, not during it.
-    #[allow(dead_code)]
     pub fn rank_bwrap_args(&self, workdir: &str) -> Vec<String> {
         self.bwrap_args(workdir, CageKind::Rank)
     }
