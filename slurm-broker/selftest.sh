@@ -424,8 +424,15 @@ run_live_probe() {
       "FP "*) FP_LINES+=("${line#FP }") ;;
     esac
   done < "$out"
-  grep -q 'HUSK-PROBE-END' "$out" || \
+  if ! grep -q 'HUSK-PROBE-END' "$out"; then
     check FAIL containment "$reqid.output" "job output has no probe end-marker (cage may have failed to launch)$hint — see $out"
+    # Carry the actual error into the report. When the cage fails to launch, the reason
+    # (e.g. `bwrap: Can't mkdir ...`) is in the job output and NOWHERE else — a report
+    # that only names a path on a remote machine costs a round-trip to diagnose.
+    echo "  --- first 15 lines of $out ---"
+    sed -n '1,15p' "$out" 2>/dev/null | sed 's/^/  | /'
+    echo "  --- end ---"
+  fi
 }
 
 # ============================ CONTAINMENT TIER =================================
@@ -487,6 +494,29 @@ if [ "$n" -gt 2 ]; then
   echo "RESULT FAIL containment fs.users /users shows $n entries - other homes visible"
 else
   echo "RESULT PASS containment fs.users /users shows $n entries - homes hidden"
+fi
+
+# MUNGE is how a process proves its identity to slurmctld. A brokered job never needs
+# it (submissions go through the broker; PMI uses its own shared secret), and without it
+# an IP route alone does not buy a submission channel — a wall independent of
+# --unshare-net (AV8). Login-side this is free from apply-seccomp AF_UNIX block; the
+# compute guard has no such block, so the socket is masked by mount instead.
+# Count entries PER DIRECTORY: `ls -A dir1 dir2` prints a "dir:" header for each, so
+# counting its non-blank lines reports 2 for two EMPTY dirs — which failed a working
+# mask on Balfrin (2026-07-29). Also read the mount table, which is mechanism rather
+# than inference: a tmpfs mounted there is the mask, an empty dir could be anything.
+munge_n=0
+for d in /run/munge /var/run/munge; do
+  [ -d "$d" ] || continue
+  munge_n=$(( munge_n + $(ls -A "$d" 2>/dev/null | wc -l) ))
+done
+# `grep -c` prints 0 AND exits non-zero on no-match, so `|| echo 0` would emit TWO lines.
+munge_mnt=$(grep -c " /run/munge " /proc/self/mountinfo 2>/dev/null || true)
+munge_mnt=${munge_mnt:-0}
+if [ "$munge_n" -gt 0 ]; then
+  echo "RESULT FAIL containment cred.munge munge dir non-empty ($munge_n entries, tmpfs_mounts=$munge_mnt) - job could authenticate to slurmctld"
+else
+  echo "RESULT PASS containment cred.munge munge socket not reachable (entries=0 tmpfs_mounts=$munge_mnt)"
 fi
 
 if ( : > /husk-probe-root-write ) 2>/dev/null; then

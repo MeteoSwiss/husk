@@ -86,7 +86,17 @@ never supplied by the stub — the untrusted side cannot opt out of the cage.
   end/preemption (leak-free like the sbatch `BrokerHandle` drop-kill).
 - Step-spool location + isolation (per-job dir under the workdir; the sbatch spool
   precedent applies).
-- **Does per-task `bwrap` work when launched by slurmstepd?** (gate **C3** below.)
+- ~~Does per-task `bwrap` work when launched by slurmstepd?~~ **ANSWERED — yes** (gate
+  **C3**, Balfrin 2026-07-28, `-n1` and `-n2`, full `seccomp-wrapper bwrap` stack). The
+  mechanism this chapter is built on is confirmed on hardware.
+- ~~Step-broker concurrency~~ **ANSWERED (C7, Balfrin)**: steps run concurrently, with and
+  without `--overlap` — the step-broker need not serialise and a long step will not wedge
+  it. (Not yet shown for steps contending for the same node's CPUs.)
+- **The per-task cage must preserve the PMI bootstrap.** Uncaged `srun` MPI works at
+  `-n1` and `-n2`; caged it fails at `pals_init2()=ENOENT` with *and* without
+  `--unshare-net`, so a masked path — not the netns — is the cause (gate **C8** bisects
+  it). This blocks Chapter 1 before any fabric question. `--mpi` stays a modelled,
+  value-validated option, but need not be forced: `MpiDefault=cray_shasta` works.
 
 ---
 
@@ -129,7 +139,10 @@ gate.
 - Whether IP `--unshare-net` can be kept alongside an open fabric (C1).
 - How VNIs are exposed to the job and whether they can be forged/escaped (**C2** — the
   security of the whole "checked hole").
-- Exact `/dev/cxi*` set + any capability/hugepages requirement (**C3/C4**).
+- ~~Exact `/dev/cxi*` set + any capability/hugepages requirement~~ **ANSWERED (C4,
+  Balfrin)**: bind `/dev/cxi[0-9]*` only (4 NICs; `cxi_sbl` is 0600 root and excluded),
+  no capability beyond the device node, no hugepages, `/sys/class/cxi` already covered by
+  `--ro-bind / /`.
 - Whether to add seccomp on CXI ioctls (likely not without breaking the fabric — the VNI
   is the boundary, not syscall filtering).
 
@@ -181,6 +194,364 @@ design needs), run by the operator on a compute node; distinct from `selftest.sh
 - **C5 — singleton MPI init** (Stage 0 viability). *Probe: `./mpi_hello` with no srun.*
 - **C6 — 1-rank NIC dependency** (Stage 1 cage choice). *Probe: does `srun -n1 ./mpi_hello`
   need `/dev/cxi` present, or run fine without it?*
+- **C7 — concurrent steps.** Can several `srun` steps run at once, or do they serialize?
+  Decides whether the single step-broker may block on a long step. *Probe: two overlapping
+  `srun … sleep 5`, with and without `--overlap`; time them.*
+- **C8 — which cage element breaks the PMI bootstrap?** Uncaged `srun` MPI works, caged
+  fails at `pals_init2()=ENOENT`; the netns is exonerated (it fails without
+  `--unshare-net` too), so a masked path is the cause. **Chapter-1 blocker.** *Probe:
+  caged-vs-uncaged env diff, visibility test on every path-valued `PALS*`/`PMI*` variable,
+  then a bisection dropping one masking element per run.*
+
+### Hardware results — run 1, Balfrin, 2026-07-28
+
+`sbatch -N2 -n2`, job 4965235, nodes nid001100+nid001101, uenv `icon:default`, x86_64.
+
+**C3 — ANSWERED, PASS. The load-bearing gate for Chapter 1 is green.**
+`srun -n1` and `srun -n2` both launched `seccomp-wrapper bwrap --ro-bind / / --dev /dev
+--proc /proc --tmpfs /tmp --tmpfs /dev/shm --unshare-net -- /bin/hostname` and returned
+the two node names. Userns nesting survives stepd's task setup, and because
+`seccomp-wrapper` was on PATH this exercised the **full compute-cage stack**, not plain
+bwrap. Note the srun was issued from the *un-caged* batch script — which is precisely
+the step-broker's position in the design, so it is the right test. It says nothing about
+an in-cage `srun` reaching slurmctld, and does not need to: mediating that is Chapter 1.
+
+**C1 — LEANS ORTHOGONAL (enumeration), not yet confirmed (data plane).** CXI endpoints
+seen by `fi_info -p cxi`: **8 uncaged, 8 under `bwrap --unshare-net` with `/dev/cxi*`
+bound, 8 under bwrap without `--unshare-net`, 0 with no device bound.** So enumeration is
+**device-gated and netns-independent**, and no capability beyond the device node was
+needed (an unprivileged bwrap userns enumerated all 8). The best-case rank-cage — keep
+`--unshare-net` for IP isolation *and* bind the NICs — is therefore available as far as
+enumeration goes. **Enumeration is not traffic**: C1-def (a real 2-rank MPI run through
+each cage shape) is still open, and only that confirms the data plane.
+
+**C4 — ANSWERED for Balfrin.** 4 NICs `/dev/cxi0…3`, plus `/dev/cxi_sbl` at **0600
+root:root** (Slingshot base-link, an admin device) → the cage binds `/dev/cxi[0-9]*`
+**only**; a user job cannot open `cxi_sbl` anyway and the cage should not bind what it
+cannot use. Accelerators: `/dev/nvidia0…3`, `nvidiactl`, `nvidia-modeset`, `nvidia-uvm`,
+`nvidia-uvm-tools`, `nvidia-nvswitchctl`, `nvidia-caps/`, and `/dev/dri/{card0…3,
+renderD128…131}`. `/sys/class/cxi` **and** `/sys/class/infiniband` both present — both
+are already covered read-only by the cage's `--ro-bind / /`, so no new bind is needed.
+`HugePages_Total: 0` → no hugepage requirement to model.
+
+**C2 — UNANSWERED, and the reason is instructive.** No `SLINGSHOT_*`/VNI variable exists
+in the **job** environment. That is expected rather than alarming: the switch plugin
+allocates VNIs per **step**, so the batch script is the wrong scope to look in. The probe
+now dumps the env from inside an `srun` step and records `SwitchType` from
+`scontrol show config` — if `SwitchType` turns out to be `switch/none`, there is no
+hardware job isolation on this fabric and Chapter 2's "checked hole" premise needs
+rethinking before anything else.
+
+**C5 / C6 / C1-def — NOT ANSWERED: probe bug, not a hardware finding.** The probe chose
+its compiler by presence and preferred `cc`; under the uenv `/usr/bin/cc` is plain gcc
+with no `mpi.h`, while the uenv's `mpicc` was right there. Fixed by *try-compiling* with
+each candidate and keeping the first that builds — compiling is the only honest test of
+"this toolchain has MPI". The generalisable point: **probe on capability, not on name.**
+
+### Hardware results — run 2, Balfrin, 2026-07-29
+
+Same shape (`-N2 -n2`, job 4965322). Slurm **23.02.7**.
+
+**C2 — the Chapter-2 premise HOLDS.**
+`SwitchType = switch/hpe_slingshot`, `SwitchParameters = vnis=32768-65535,job_vni`.
+There *is* a switch plugin allocating VNIs, with a per-job VNI (`job_vni`) out of the
+32768–65535 range. So "the fabric confines a job's traffic in hardware" is a real
+mechanism on this machine, not an assumption — the checked-hole design has something to
+rest on. Still open, and still the crux: **whether an in-cage rank can use an
+un-allocated VNI.** That is the AV8-over-fabric escape test and needs a libfabric
+program; `SwitchType` tells us the lock exists, not that it cannot be picked. No
+`SLINGSHOT_*` variable was visible even inside a step, but the probe's grep was
+over-anchored (`^PMI` cannot match `SLURM_PMI_*`), so that "NONE" is not yet evidence.
+
+**C7 — ANSWERED: steps run CONCURRENTLY.** Two `srun … sleep 5` finished in 5s both with
+`--overlap` and with plain `srun`. The step-broker therefore does **not** need to
+serialise, and a long-running step will not wedge it — a real simplification for
+Chapter 1. Caveat on the strength of this: with `-N2 -n2` the two steps landed on
+*different nodes*, so it does not yet prove concurrency when steps contend for the same
+CPUs on one node.
+
+**C5 — singleton init works** (again): `./mpi_hello` with no launcher returns
+`rank 0/1`. Stage 0 remains technically viable, though it stays rejected as a shortcut.
+
+**C6 / C1-def — still open, and run 2 taught us why.** Three separate causes, only one of
+them about hardware:
+1. *Probe bug — node-local build dir.* The binary was compiled into `mktemp -d` under
+   `/tmp`, which is node-local; the 2-rank runs died with `execve(): No such file or
+   directory` on nid001101. Every multi-node number in run 2 is void. Fixed: build on the
+   submit dir, and **verify** visibility with an `srun test -x` across all nodes.
+2. *Probe bug — no uncaged control.* There was no `srun -n1` baseline, so a failure could
+   not be attributed to the cage. Fixed: every caged run now has an uncaged twin, run
+   first; if the baseline fails, the probe says the cage is *not* implicated.
+3. *A real finding — the PMI bootstrap, not the NIC.* The caged runs hit
+   `_pmi_pals_init: pals_init2() failed: 2` → `PMI_Init returned 1`. Run 2's probe
+   labelled this "1-rank MPI_Init touches the NIC" — an attribution it was in no position
+   to make. It now classifies failures (`PMI/launcher` vs `fabric/NIC` vs `binary not
+   visible`) and calibrates the launcher against an uncaged baseline. *(Run 3 localised
+   this further — see below; run 2's guess that the uenv's MPICH simply cannot bootstrap
+   under `srun` was **wrong**.)*
+
+### Hardware results — run 3, Balfrin, 2026-07-29
+
+`-N2 -n2`, job 4965387, nodes nid001096+nid001097. First run with a shared build dir and
+uncaged controls — i.e. the first run whose MPI numbers mean anything.
+
+**The uncaged baseline works, including across nodes.** `MpiDefault = cray_shasta`;
+`srun --mpi=list` offers `cray_shasta, pmi2, pmix (pmix_v4)`. Plain `srun -n2` (no `--mpi`
+flag) returned `rank 0/2` and `rank 1/2` on **two different nodes**, so the inter-node
+fabric, the launcher and PMI are all healthy outside the cage. `srun -n1` likewise.
+
+**Correction to run 2.** The PALS failure is **not** a launcher-configuration problem and
+the uenv's MPICH bootstraps fine under `srun`. Consequently the design note that the
+step-broker must force a site-configured `--mpi=` type is **not supported** — the default
+already works here. `--mpi` stays a *modelled, value-validated* option in the step
+allowlist (a rank may legitimately ask for `pmix`), but forcing it is not required.
+
+**The cage is what breaks PMI — and the network namespace is exonerated.** Both caged
+shapes failed *identically* at `pals_init2() failed: 2` (ENOENT): with `--unshare-net`
+**and without it**. Since the no-netns variant fails too, the IP namespace is not the
+cause. Something the cage **masks** is missing — a filesystem-visibility problem, which
+is the pre-registered risk arriving with a name attached.
+
+This is good news for **C1**: the best-case rank-cage (keep `--unshare-net`, bind the
+NICs) is still standing. It is a **Chapter-1** blocker, not a Chapter-2 one — a 1-rank
+`srun` fails on it, before any fabric question arises.
+
+**C8 (new gate) — which cage element?** Guessing is unnecessary; the answer is
+mechanically findable. The probe now (a) diffs the task environment caged vs uncaged,
+(b) takes every path-valued `PALS*`/`PMI*` variable and tests whether that path exists
+inside the cage — the mount namespace as oracle again — and (c) bisects the cage:
+`full`, `no_tmp_mask`, `no_shm_mask`, `dev_bind`, `no_proc_mask`, `robind_only`, one
+masking element dropped per run, until `MPI_Init` survives. Prime suspects are
+`--tmpfs /tmp` and `--tmpfs /dev/shm` hiding the PALS apinfo/rendezvous file, but the
+bisection decides it, not this paragraph.
+
+### Hardware results — runs 4 and 5, Balfrin, 2026-07-29 — **C8 SOLVED**
+
+Run 4 (job 4965415) killed the masking theory: **every** bisect arm failed, including
+`robind_only` = bare `bwrap --ro-bind / /` with no mask at all. That bisection was
+incomplete — every arm still had a **read-only root**, so the one property shared by all
+failures was the one never varied. Run 5 (job 4965492) varied it and straced the failure:
+
+```
+openat("/var/spool/slurmd/mpi_cray_shasta/4965492.33/apinfo", O_RDWR) = -1 EROFS
+```
+
+**The mechanism, exactly.** Slurm's `mpi/cray_shasta` plugin writes a per-step `apinfo`
+file under `SlurmdSpoolDir`; Cray MPICH opens it **`O_RDWR`** — read-write, though it
+only consumes it — and `--ro-bind / /` makes the whole tree read-only. Nothing was
+hidden: the probe's own listing shows `mpi_cray_shasta/<jobid>.<stepid>` present *inside*
+the cage. **Visibility was never the problem; writability was.** That is why no
+mask-removal arm ever helped, and why `robind_only` failed too.
+
+Two of my earlier readings were wrong and are corrected here: the `2` in
+`pals_init2() failed: 2` is a PALS return code, **not** `ENOENT` — I built the whole
+"hidden path" theory on that misreading; and the pre-registered guess that the PMI
+rendezvous would be hidden by `--tmpfs /tmp` is not what happened.
+
+**Consequences.** This is a **Chapter-1** blocker with a small, targeted fix, not a
+structural one. The cage does not need a writable root — it needs one per-step
+directory writable. The step id is not known at submit time, so the **guard computes the
+path inside the task** from `SLURM_JOB_ID`/`SLURM_STEP_ID` and binds only that directory
+— the same "glob in the guard, not in the broker" pattern used for the GPU device binds.
+Gate **C9** tests the candidates: coarse `mpi_cray_shasta` bind, precise per-step bind,
+and `--mpi=pmi2`/`pmix` (which may need no write at all), each with an uncaged control.
+
+Also observed: `srun -n1 env` returned **zero** lines uncaged while the caged variant
+returned 191, so run 5's env dump was empty rather than "nothing lost" — the probe now
+uses `sh -c /usr/bin/env` and prints a sample line, because a silent dump that looks like
+a clean result is worse than a loud failure.
+
+### Hardware results — run 6, Balfrin, 2026-07-29 — **C9 answered: both fixes work**
+
+Job 4965535. **The apinfo file is user-owned** (`-rw------- 27069 30382`), so the wall was
+purely the namespace's read-only mount — not kernel permissions. A bind is sufficient;
+no privilege question arises. Results at 1 rank, each with an uncaged control:
+
+| candidate | result |
+|---|---|
+| `--bind` whole `mpi_cray_shasta` dir | **OK** |
+| `--bind` only this step's dir, path computed in-task | **OK** |
+| `--mpi=pmi2`, full cage, **no carve-out** | **OK** |
+| `--mpi=pmix`, full cage, **no carve-out** | **OK** |
+
+So there are two independent fixes, and the `--mpi=pmix`/`pmi2` one is preferable on
+security grounds: it needs **no writable carve-out into a Slurm-owned directory at all**.
+The per-step bind stays the fallback if a workload requires the site-default
+`cray_shasta`. Both are small; neither touches the cage's shape.
+
+**What the env dump finally showed — the control plane is TCP.** `PALS_APINFO`,
+`PALS_SPOOL_DIR`, and crucially `PMI_CONTROL_PORT=29468`, `SLURM_STEP_RESV_PORTS=
+29468-29469`, `SLURM_STEP_LAUNCHER_PORT`, `PMI_SHARED_SECRET`. The `cray_shasta` PMI
+bootstraps over **TCP ports**, which is why the netns question was always going to
+resurface. (The earlier `env_lost_in_cage` list was a false positive of my own: it diffed
+`NAME=value` lines across *two different steps*, so per-step values looked "lost". Now
+diffs names only.)
+
+**The 2-rank arm failed — but that arm was confounded.** It changed rank count *and*
+added `--unshare-net`, so its failure attributes to neither:
+
+```
+[PE_0]:_pmi_set_af_in_use:PMI ERROR: Unable to obtain IP address information on nid001097
+```
+
+That is the netns having no routable address, exactly what a TCP control plane would hit.
+But "exactly what I expected" is not evidence, and I built the wrong theory from a
+plausible-looking error message twice already in this investigation.
+
+### C10 (new gate) — where does `--unshare-net` stop being affordable?
+
+One variable at a time: **PMI type × geometry × netns**, 11 arms — `cray_shasta` and
+`pmix`/`pmi2`, at 1 rank / 2 ranks on one node / 2 ranks across two nodes, each with and
+without `--unshare-net`. This is the gate that decides the rank-cage's network boundary:
+
+- If 1 rank and same-node multi-rank survive `--unshare-net`, Stage 1 and single-node
+  multi-GPU keep **full IP isolation** and Chapter 1 ships without touching the network.
+- If only multi-**node** needs IP, the boundary lands exactly where Chapter 2 / the
+  network phase already expected it, and AV8 stays closed for the single-node case.
+- If even 1 rank needs IP, the current cage's unconditional `--unshare-net` has to be
+  reopened as a design question before any of this ships.
+
+Requires an allocation with **≥2 tasks per node** (`-N2 --ntasks-per-node=2`) so the
+same-node 2-rank arms have somewhere to run.
+
+### Hardware results — run 7, Balfrin, 2026-07-29
+
+Job 4965622. **One clean result, and it is the one Stage 1 needed:**
+
+> **`cs_1rank_netns` — OK.** A single rank, in the full cage, with the per-step apinfo
+> bind, **with `--unshare-net`**. So a 1-rank `srun` job keeps **complete IP isolation**.
+> ICON-single-rank — the actual near-term target — needs no network concession at all.
+
+Everything else in the matrix was invalidated by bugs in my own harness, so no other arm
+is evidence of anything:
+
+1. **All five `pmix`/`pmi2` arms** died on `bwrap: Can't find source path
+   .../mpi_cray_shasta/<jobid>.<stepid>`. Those PMIs never create the `cray_shasta` step
+   directory, and `--bind` is fatal on a missing source. I unified the arms' bwrap body to
+   avoid confounds and thereby broke every arm that didn't need the carve-out. → `--bind-try`.
+2. **No arm bound `/dev/cxi*`.** The 2-node arms therefore ran with no NIC at all (one
+   segfaulted, rc=139). A matrix meant to inform the rank cage must use the rank cage's
+   device set. → CXI binds in every arm.
+3. **Both same-node 2-rank arms HUNG** (killed at the 90s wall) and were reported as
+   ordinary failures. A hang is a distinct outcome and now says so. The likely cause is
+   the pre-registered one: per-task `--tmpfs /dev/shm` gives each rank a *private*
+   `/dev/shm`, so same-node ranks cannot share segments. → new `shm private|shared` axis,
+   with `--bind /dev/shm /dev/shm` arms to confirm or refute it directly.
+4. **C11 answered nothing**: its caged arms lacked the apinfo fix (so they failed for the
+   already-known reason and printed nothing), and its regex guessed the output format —
+   `provider ofi_rxd` is a provider *list*, not a selection. → caged arms now carry the
+   fix, and the probe dumps the verbose lines instead of pattern-matching a format nobody
+   has looked at yet.
+
+The standing lesson, now earned three times in this investigation: **when a probe and a
+hypothesis disagree, suspect the probe first** — and never let one arm's fix (the unified
+body) silently become another arm's precondition.
+
+### Hardware results — run 8, Balfrin, 2026-07-29 — **the rank cage is decided**
+
+Job 4965756. A properly controlled matrix. Every "OK" below is a **real** communicator
+(N lines, each reporting size N and the correct allreduce), not merely exit 0:
+
+| geometry | `--unshare-net` | `/dev/shm` | result |
+|---|---|---|---|
+| 1 rank | **yes** | private | **OK** |
+| 2 ranks, same node | yes *or* no | private | **HANG** |
+| 2 ranks, same node | **yes** | **shared** | **OK** |
+| 2 ranks, two nodes | no | private | **OK** |
+| 2 ranks, two nodes | **yes** | private | **FAIL** — `_pmi_set_af_in_use: Unable to obtain IP address` |
+
+Three conclusions, each now resting on a control that differs in exactly one variable:
+
+1. **Everything on ONE node keeps full IP isolation.** 1 rank and same-node multi-rank
+   both work with `--unshare-net`. Single-node multi-GPU — 4 GPUs on Balfrin — is
+   achievable inside the cage with the network namespace intact.
+2. **`--tmpfs /dev/shm` per task is what breaks same-node multi-rank**, exactly as
+   pre-registered. Sharing `/dev/shm` fixes it, and the netns is irrelevant to it (both
+   shm variants pass with and without). Ranks talk over shared memory; a private tmpfs per
+   rank cuts that channel.
+3. **Multi-NODE genuinely needs IP.** Same geometry, same everything, only the netns
+   differs: without it OK, with it the PMI cannot obtain an address. That is the network
+   phase's problem, precisely located — not something to be worked around in Chapter 1.
+
+**Design: a per-job `/dev/shm` subdirectory.** Binding the node's whole `/dev/shm` would
+work but exposes every other user's segments to the caged job — a containment regression.
+Instead the guard creates `/dev/shm/husk-$SLURM_JOB_ID` and binds *that* onto `/dev/shm`
+inside each rank's cage: this job's ranks share segments, other users' stay invisible.
+Gate C10 now tests this `jobdir` variant directly against the `shared` one.
+
+**Correction — the `--mpi=pmix` recommendation was unsupported and now looks wrong.**
+Run 6 scored `caged_mpi_pmix`/`pmi2` as OK, and I concluded they were preferable because
+they need no writable carve-out. Both arms ran at **`-n1`**, where MPICH's *singleton
+init* is indistinguishable from a real PMI bootstrap — the probe was reading exit status
+only. Run 8 exposed it: at 2 ranks, `--mpi=pmix` printed `MPI rank 0/1` **twice** and
+exited 0 — two independent singleton jobs, not a communicator. So:
+
+- The **per-step apinfo bind with the site-default `cray_shasta` is the fix with actual
+  evidence** behind it (the passing 2-rank rows above all used it).
+- The pmix/pmi2 route is unproven and currently appears to **degrade silently to
+  singletons**, which is the worst possible failure mode — a "successful" run that
+  computed the wrong thing.
+- The probe now asserts the communicator on every multi-rank arm (`ranks_ok`), so exit 0
+  can never again be mistaken for a working MPI job.
+
+**C11 — the caged job is genuinely on CXI.** With the NICs bound:
+`MPICH CH4 OFI detected 4 NICs/node`, `netmod using cxi provider (domain_name=cxi0)`,
+`CXI counters initialized`. Without them the job **segfaults** rather than quietly falling
+back to `tcp` — so the silent-degradation worry did not materialise here, though a
+segfault is a poor way to learn it and the assertion stays in.
+
+### Hardware results — run 9, Balfrin, 2026-07-29 — **discovery phase complete**
+
+Job 4965792. Every run-8 conclusion reproduced, and the two open items closed:
+
+- **`cs_1node2rank_netns_jobdir` — OK, real 2-rank communicator.** The proposed design
+  (per-job `/dev/shm/husk-$SLURM_JOB_ID` bound onto `/dev/shm`) works *with*
+  `--unshare-net`. It is not a compromise over binding the whole `/dev/shm` — it is
+  equivalent in function and strictly better in containment.
+- **All four `pmix`/`pmi2` arms → `WRONG SIZE`.** With the assertion in place they report
+  `MPI rank 0/1` twice: two singletons. The route is now closed by direct evidence rather
+  than inference. Note they fail this way *with and without* the netns, so the cage is not
+  what breaks them — this MPICH build simply does not wire up through Slurm's pmix/pmi2.
+  *Untested control:* uncaged 2-rank pmix. It does not matter here (cray_shasta works and
+  is the site default) but it would matter at a site where pmix is the only option, so the
+  probe now carries an uncaged 2-rank arm for that case.
+- `cs_1rank_netns`, `cs_1node2rank_netns_shm`, `cs_2node2rank_nonet` all reproduced;
+  `cs_2node2rank_netns` failed again. The netns boundary is confirmed twice over.
+
+---
+
+## Chapter 1 — the rank cage, as specified by hardware
+
+Everything below is measured on Balfrin, not inferred. Per task, the guard runs:
+
+```
+--ro-bind / /                                  # root read-only (unchanged)
+--dev /dev  --dev-bind-try /dev/cxi[0-9]*      # fabric NICs; NOT /dev/cxi_sbl (0600 root)
+            --dev-bind-try /dev/nvidia*        # as today
+--proc /proc
+--tmpfs /tmp
+--bind /dev/shm/husk-$SLURM_JOB_ID /dev/shm    # per-JOB shm, created by the guard (0700)
+--bind-try $SlurmdSpoolDir/mpi_cray_shasta/$SLURM_JOB_ID.$SLURM_STEP_ID  <same>
+--unshare-net                                  # KEPT — full IP isolation
++ the existing filesystem policy (homes hidden, credentials masked, workdir writable)
+```
+
+Two paths are computed **inside the task**, not by the broker: the step id does not exist
+at submit time, and the job's shm directory is per-node. Same pattern as the GPU device
+binds — *glob in the guard, not in the broker*.
+
+**Scope: single node.** Multi-node steps must be **rejected** by the step allowlist with a
+teaching message, because they require an IP path for the PMI bootstrap, and dropping
+`--unshare-net` reopens AV8 (a job that reaches `slurmctld` can submit un-caged jobs).
+That is a network-phase decision, not a Chapter-1 workaround. What single-node buys:
+1-rank `srun` (the ICON target) and full single-node multi-GPU.
+
+**C1 status — honest.** `fi_info` enumerates all 8 CXI endpoints under `--unshare-net`,
+and a caged 2-node run on CXI works *without* the netns, so netns and the fabric look
+orthogonal. But no inter-node run has ever completed *with* the netns — the PMI bootstrap
+fails first — so orthogonality for real inter-node **traffic** remains unproven. It is
+moot while multi-node is out of scope; re-test it if the network phase gives PMI an IP
+path.
 
 ---
 

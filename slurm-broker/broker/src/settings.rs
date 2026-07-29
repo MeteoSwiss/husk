@@ -37,6 +37,35 @@ const GPU_DEVICES: &[&str] = &[
     "/dev/nvidia-nvswitch2", "/dev/nvidia-nvswitch3",
 ];
 
+/// Credential-daemon socket directories to mask, so a caged job cannot AUTHENTICATE to
+/// the cluster services even where it can reach them.
+///
+/// **Not emitted as static bwrap args** — the mask is applied by the re-exec guard on the
+/// COMPUTE NODE (see `policy::wrap_script`), because `--tmpfs DEST` is neither
+/// absent-safe nor symlink-safe and only the compute node knows which of these exist.
+/// Both failure modes were real, and both killed the cage outright (verified 2026-07-29):
+///   * absent DEST under `--ro-bind / /` -> `bwrap: Can't mkdir /run/munge: Read-only
+///     file system`. (`--ro-bind-try` tolerates a missing SOURCE, not a missing DEST, and
+///     there is no `--tmpfs-try`.)
+///   * `/var/run` is a symlink to `/run` on any modern Linux, so masking both paths makes
+///     the second one resolve onto the first one's fresh tmpfs and bwrap dies.
+///
+/// The guard therefore tests each path, resolves it, and de-duplicates before mounting.
+///
+/// MUNGE is how a process proves its identity to slurmctld/slurmd. On the LOGIN side
+/// it is already unreachable — `apply-seccomp` blocks AF_UNIX outright — but the
+/// compute guard does not block AF_UNIX (PMI, nsswitch and shared-memory wire-up need
+/// it), so `/run/munge/munge.socket.2` came along with `--ro-bind / /` and was
+/// reachable inside the job. Nothing in a brokered job needs it: submissions go
+/// through the broker, and PMI authenticates with its own `PMI_SHARED_SECRET`.
+///
+/// Why it matters beyond defence in depth: it DECOUPLES "the job has a network route"
+/// from "the job can submit un-caged jobs" (AV8). `--unshare-net` is one wall; this is
+/// a second, independent one that survives if multi-node MPI ever forces the netns to
+/// be relaxed. A tmpfs (not `--ro-bind /dev/null`) because the target is a directory —
+/// but only ever mounted on a path the guard has confirmed exists, see above.
+pub(crate) const CREDENTIAL_SOCKET_DIRS: &[&str] = &["/run/munge", "/var/run/munge"];
+
 /// Auto-executing / auto-loaded files re-bound READ-ONLY within every writable
 /// root, so a job can't plant a payload that fires LATER on the login node (AV2)
 /// — a git hook, an MCP server config, a project settings file, editor tasks.
@@ -841,6 +870,23 @@ mod tests {
         assert!(cmd.contains("--dev-bind-try /dev/nvidiactl /dev/nvidiactl"));
         assert!(cmd.contains("--dev-bind-try /dev/nvidia0 /dev/nvidia0"));
         assert!(cmd.contains("--dev-bind-try /dev/nvidia-uvm /dev/nvidia-uvm"));
+    }
+
+    #[test]
+    fn credential_masks_are_not_static_bwrap_args() {
+        // The MUNGE mask is applied by the re-exec guard on the COMPUTE NODE, never here:
+        // `--tmpfs DEST` kills bwrap when DEST is absent under a read-only root, and again
+        // when two list entries resolve to the same directory (/var/run -> /run). Both
+        // shipped once and took the whole cage down. Only the compute node knows which
+        // paths exist, so the decision cannot be made at submit time.
+        // Behaviour is pinned by policy::tests::credential_mask_is_applied_only_for_paths_that_exist.
+        let cmd = joined(&FsPolicy::default(), "/work");
+        for d in CREDENTIAL_SOCKET_DIRS {
+            assert!(
+                !cmd.contains(&format!("--tmpfs {d}")),
+                "{d} must not be a static arg - see the constant's docs"
+            );
+        }
     }
 
     #[test]

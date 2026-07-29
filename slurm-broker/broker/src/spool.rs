@@ -280,10 +280,26 @@ fn cap_output(bytes: &[u8]) -> String {
     s
 }
 
+/// Environment variables stripped from the submission, so no brokered job can run with a
+/// WEAKENED enforcement layer.
+///
+/// `SECCOMP_WRAPPER_DEBUG=1` makes seccomp-wrapper return `ENOSYS` instead of killing —
+/// i.e. blocked syscalls proceed to return, and the program carries on. That is an
+/// off-switch, and `--export=ALL` would otherwise carry it from the launching shell into
+/// every job. A diagnostic mode may change what we OBSERVE, never what we ENFORCE (the
+/// same reason the broker has `--dry-run` and not a debug mode): to identify a blocked
+/// syscall, re-run the job under `strace` INSIDE the unchanged cage — the filter still
+/// kills, strace merely shows which call it died attempting.
+const STRIPPED_SUBMIT_ENV: &[&str] = &["SECCOMP_WRAPPER_DEBUG"];
+
 fn run_sbatch(argv: &[String]) -> Result<u64, String> {
     use std::process::Command;
-    let output = Command::new(&argv[0])
-        .args(&argv[1..])
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..]);
+    for k in STRIPPED_SUBMIT_ENV {
+        cmd.env_remove(k);
+    }
+    let output = cmd
         .output()
         .map_err(|e| format!("failed to run sbatch: {e}"))?;
     if !output.status.success() {

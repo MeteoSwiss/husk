@@ -24,13 +24,22 @@ note() { printf '  %s\n' "$*"; }
 fnd()  { printf 'FINDING %-4s %-22s %s\n' "$1" "$2" "${*:3}"; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/husk-fabric-probe.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
+# The multi-rank runs execute on OTHER nodes, so the test binary must live on a SHARED
+# filesystem. $TMPDIR/mktemp is node-local /tmp on Alps: run 2 (2026-07-28) died with
+# `execve(): No such file or directory` on the second node, which invalidated every
+# 2-rank result. Build on the submit dir instead and VERIFY visibility (C5 below).
+SHARED="${SLURM_SUBMIT_DIR:-$PWD}/.husk-fabric-probe.$$"
+mkdir -p "$SHARED" 2>/dev/null || SHARED="$WORK"
+trap 'rm -rf "$WORK" "$SHARED"' EXIT
 
 # bwrap profile mirroring the compute cage (root ro + fresh /dev,/proc,/tmp). Callers
 # append device binds / --unshare-net as needed. --dev gives a bare devtmpfs, so CXI
 # nodes must be re-bound explicitly (that's the whole point of the C1/C4 questions).
 BWRAP_BASE=(--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /dev/shm)
-cxi_binds() { local d; for d in /dev/cxi*; do [ -e "$d" ] && printf -- '--dev-bind-try %s %s ' "$d" "$d"; done; }
+# Only the numbered NIC nodes (/dev/cxi0…). Deliberately NOT /dev/cxi_sbl — Balfrin
+# shows it as 0600 root:root (Slingshot base-link, an admin device), so a user job
+# cannot open it anyway and the cage should not bind what it cannot use.
+cxi_binds() { local d; for d in /dev/cxi[0-9]*; do [ -e "$d" ] && printf -- '--dev-bind-try %s %s ' "$d" "$d"; done; }
 
 # ============================================================================
 head2 "context"
@@ -73,8 +82,29 @@ head2 "C2 — how VNIs / the fabric are exposed to the job (env)"
 env | grep -iE 'SLINGSHOT|(^|_)VNI|CXI|^FI_|PMI|SLURM_(NETWORK|STEP|JOB_ID|NTASKS|NODELIST)' \
     | sort | while IFS= read -r l; do note "$l"; done
 env | grep -iqE 'VNI|SLINGSHOT' \
-  && fnd C2 vni_env "VNI/Slingshot env present (see above) — record which var carries the VNI list" \
-  || fnd C2 vni_env "no VNI/Slingshot env visible (run INSIDE an allocation; -n>=1)"
+  && fnd C2 vni_env_job "VNI/Slingshot env present in the JOB env (see above)" \
+  || fnd C2 vni_env_job "no VNI/Slingshot env in the JOB env — expected: the switch plugin sets it per STEP, see vni_env_step"
+
+# The switch plugin allocates the VNIs. Which plugin is configured decides whether
+# there IS hardware job isolation on this fabric at all — the premise of Chapter 2.
+if have scontrol; then
+  sw="$(scontrol show config 2>/dev/null | grep -iE '^(SwitchType|SwitchParameters)' | tr -s ' ' | paste -sd';' -)"
+  fnd C2 switch_plugin "${sw:-<no SwitchType line — scontrol unreachable or switch/none>}"
+fi
+
+# VNI env is set on the STEP, not the batch/job environment — dump it from inside a step.
+# Also captures PMI/PMIX paths, which Chapter 2 needs (the rendezvous socket the cage hides).
+if have srun && [ -n "${SLURM_JOB_ID:-}" ]; then
+  # Unanchored on purpose: run 2 reported "NONE" partly because `^PMI` cannot match
+  # SLURM_PMI_*/PMIX_* spellings. Match the substrings anywhere in the variable name.
+  step_env="$(srun -n1 env 2>/dev/null | grep -iE 'SLINGSHOT|VNI|CXI|PMI|PALS|APINFO|SPOOL|MPICH|^FI_' | sort)"
+  if [ -n "$step_env" ]; then
+    printf '%s\n' "$step_env" | while IFS= read -r l; do note "step: $l"; done
+    fnd C2 vni_env_step "fabric/PMI env IS set at STEP scope (see 'step:' lines above)"
+  else
+    fnd C2 vni_env_step "NONE even inside a step — cross-check switch_plugin above"
+  fi
+fi
 
 # ============================================================================
 head2 "C1 — does --unshare-net break the CXI provider?  (fi_info -p cxi)"
@@ -137,11 +167,7 @@ fi
 head2 "C5/C6/C1-def — MPI: singleton, 1-rank NIC dependency, 2-rank over the cage"
 # Optional: needs a compiler + MPI. Answers whether ICON-single-rank can skip srun
 # (C5), whether 1 rank needs /dev/cxi (C6), and confirms C1 with a real 2-rank run.
-CCX=""; for c in cc mpicc; do have "$c" && { CCX="$c"; break; }; done
-if [ -z "$CCX" ]; then
-  fnd C5 mpi_build "SKIP — no cc/mpicc on PATH (activate a uenv with an MPI toolchain)"
-else
-  cat > "$WORK/mpi_hello.c" <<'C'
+cat > "$WORK/mpi_hello.c" <<'C'
 #include <mpi.h>
 #include <stdio.h>
 int main(int argc, char** argv){
@@ -152,30 +178,421 @@ int main(int argc, char** argv){
   MPI_Finalize(); return 0;
 }
 C
-  if "$CCX" -o "$WORK/mpi_hello" "$WORK/mpi_hello.c" 2>"$WORK/cc.log"; then
-    fnd C5 mpi_build "OK ($CCX)"
-    # C5 — singleton init, NO launcher (Stage 0 viability):
-    if out="$("$WORK/mpi_hello" 2>&1)"; then fnd C5 singleton_init "OK ($out) — Stage 0: ICON-1-rank may run with NO srun in the current cage"
-    else fnd C5 singleton_init "FAIL — $out (singleton init unsupported; Stage 1/srun needed)"; fi
-    # C6 — does 1 rank need /dev/cxi? run srun -n1 under a cage WITHOUT the device:
-    if have srun && [ -n "${SLURM_JOB_ID:-}" ]; then
-      if out="$(srun -n1 bwrap "${BWRAP_BASE[@]}" --unshare-net --bind "$WORK" "$WORK" -- "$WORK/mpi_hello" 2>&1)"; then
-        fnd C6 rank1_no_cxi "OK ($out) — 1 rank runs WITHOUT /dev/cxi → Stage-1 cage can stay --unshare-net"
-      else
-        fnd C6 rank1_no_cxi "needs more ($out) — 1-rank MPI_Init touches the NIC; bind /dev/cxi for Stage 1"
-      fi
-      # C1-def — 2 ranks, definitive: uncaged vs the two cage shapes.
-      read -r -a CXIB <<<"$(cxi_binds)"
-      run2() { srun -n2 "$@" 2>&1 | tr '\n' ' '; }
-      fnd C1 mpi2_uncaged "$(run2 "$WORK/mpi_hello")"
-      fnd C1 mpi2_unshare_net_cxi "$(run2 bwrap "${BWRAP_BASE[@]}" "${CXIB[@]}" --unshare-net --bind "$WORK" "$WORK" -- "$WORK/mpi_hello")"
-      fnd C1 mpi2_no_unshare_cxi "$(run2 bwrap "${BWRAP_BASE[@]}" "${CXIB[@]}" --bind "$WORK" "$WORK" -- "$WORK/mpi_hello")"
+# Which compiler has MPI is NOT decidable by name: in a Cray-native environment `cc` IS
+# the MPI wrapper, but under a uenv /usr/bin/cc is plain gcc with no mpi.h while the
+# uenv's mpicc works (Balfrin 2026-07-28: picking `cc` by presence alone failed here).
+# So try each candidate and keep the first that actually BUILDS — compiling is the only
+# honest test of "this toolchain has MPI".
+CCX=""
+for c in mpicc cc; do
+  have "$c" || continue
+  if "$c" -o "$SHARED/mpi_hello" "$WORK/mpi_hello.c" >"$WORK/cc.$c.log" 2>&1; then CCX="$c"; break; fi
+  note "compile with $(command -v "$c") failed: $(grep -m1 -iE 'error|fatal' "$WORK/cc.$c.log" 2>/dev/null || tail -1 "$WORK/cc.$c.log" 2>/dev/null)"
+done
+
+# Classify a failure blob. Run 2 reported a PMI bootstrap failure under the label
+# "1-rank MPI_Init touches the NIC", which is a wrong attribution — never let the
+# probe name a cause it did not isolate.
+why() {
+  case "$1" in
+    *pals_init*|*PMI_Init*|*PMIX*|*pmi_*)        echo "PMI/launcher bootstrap" ;;
+    *"No such file or directory"*|*"Can't find source path"*)
+                                                 echo "binary not visible on that node" ;;
+    *cxi*|*libfabric*|*ofi*|*"NIC"*)             echo "fabric/NIC" ;;
+    *"Permission denied"*|*EACCES*)              echo "permissions" ;;
+    *)                                           echo "unclassified" ;;
+  esac
+}
+one_line() { printf '%s' "$1" | tr '\n' ' '; }
+
+if [ -z "$CCX" ]; then
+  fnd C5 mpi_build "FAIL — no compiler on PATH built an MPI hello (tried mpicc, cc; see notes above)"
+elif ! have srun || [ -z "${SLURM_JOB_ID:-}" ]; then
+  fnd C5 mpi_build "OK ($CCX = $(command -v "$CCX"))"
+  if out="$("$SHARED/mpi_hello" 2>&1)"; then fnd C5 singleton_init "OK ($out)"
+  else fnd C5 singleton_init "FAIL — $(one_line "$out")"; fi
+  fnd C6 rank1 "SKIP — not in a SLURM allocation"
+else
+  fnd C5 mpi_build "OK ($CCX = $(command -v "$CCX"))"
+
+  # C5 — singleton init, NO launcher (Stage 0 viability):
+  if out="$("$SHARED/mpi_hello" 2>&1)"; then
+    fnd C5 singleton_init "OK ($out) — Stage 0: ICON-1-rank may run with NO srun in the current cage"
+  else
+    fnd C5 singleton_init "FAIL [$(why "$out")] — $(one_line "$out")"
+  fi
+
+  # Is the binary actually on a shared filesystem? If not, every multi-node result below
+  # is meaningless (run 2's failure mode) — so state it before reporting them.
+  nn="${SLURM_JOB_NUM_NODES:-1}"
+  if srun -N"$nn" -n"$nn" test -x "$SHARED/mpi_hello" >/dev/null 2>&1; then
+    fnd C5 binary_shared "OK — $SHARED is visible on all $nn node(s)"
+  else
+    fnd C5 binary_shared "FAIL — $SHARED is NOT shared across nodes; multi-node results below are INVALID"
+  fi
+
+  # ---- launcher calibration -------------------------------------------------
+  # Run 2: MPICH fell back to PALS (`pals_init2() failed`) and PMI_Init failed under a
+  # bare `srun`. Whether that is the cage or the launcher cannot be told without an
+  # UNCAGED baseline, so establish one first and reuse whatever bootstraps.
+  fnd C5 mpi_default "$(scontrol show config 2>/dev/null | grep -iE '^MpiDefault' | tr -s ' ' || echo '<scontrol unavailable>')"
+  types="$(srun --mpi=list 2>&1 | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+           | grep -viE 'mpi plugin|possible values|^none$|^$' || true)"
+  note "srun --mpi=list -> $(one_line "$types")"
+
+  BASE_OK=0; MPIF=(); MPILBL="(default)"
+  for m in "" $types; do
+    if [ -z "$m" ]; then cand=(); lbl="(default)"; else cand=(--mpi="$m"); lbl="--mpi=$m"; fi
+    if out="$(srun ${cand[@]+"${cand[@]}"} -n2 "$SHARED/mpi_hello" 2>&1)"; then
+      BASE_OK=1; MPIF=(${cand[@]+"${cand[@]}"}); MPILBL="$lbl"
+      fnd C1 mpi2_uncaged "OK with $lbl — $(one_line "$out")"
+      break
+    fi
+    note "uncaged 2-rank with $lbl failed [$(why "$out")]: $(one_line "$out" | cut -c1-160)"
+  done
+  [ "$BASE_OK" = 1 ] || fnd C1 mpi2_uncaged \
+    "FAIL for EVERY --mpi type (see notes) — NO uncaged baseline, so the caged runs below CANNOT be attributed to the cage"
+  fnd C5 launcher_used "$MPILBL"
+
+  SR=(srun ${MPIF[@]+"${MPIF[@]}"})
+  # A hung probe burns the allocation and reports nothing (a local dry run wedged in
+  # strace for 5+ minutes), so every diagnostic srun below runs under a wall clock.
+  WALL=90
+  TMO=(); have timeout && TMO=(timeout -k 5 "$WALL")
+  srun_t() { ${TMO[@]+"${TMO[@]}"} "${SR[@]}" "$@"; }
+
+  # Exit 0 is NOT success for a multi-rank run. Run 8: `--mpi=pmix` at 2 ranks printed
+  # "MPI rank 0/1" TWICE and exited 0 — two INDEPENDENT singleton MPI jobs, not a
+  # 2-rank communicator. MPICH falls back to singleton init when a PMI does not wire up,
+  # so every multi-rank arm must assert the communicator it actually formed: N lines,
+  # each reporting size N and the correct allreduce (0+1+...+(N-1)).
+  ranks_ok() { # $1 output, $2 expected rank count
+    local want=$(( $2 * ($2 - 1) / 2 ))
+    [ "$(printf '%s\n' "$1" | grep -c "MPI rank [0-9]*/$2 allreduce=$want")" = "$2" ]
+  }
+
+  # C6 — control first (uncaged 1 rank), then the same rank in a cage with NO /dev/cxi.
+  if out="$("${SR[@]}" -n1 "$SHARED/mpi_hello" 2>&1)"; then
+    fnd C6 rank1_uncaged "OK ($(one_line "$out")) — baseline for the caged run below"
+    if out="$("${SR[@]}" -n1 bwrap "${BWRAP_BASE[@]}" --unshare-net --bind "$SHARED" "$SHARED" -- "$SHARED/mpi_hello" 2>&1)"; then
+      fnd C6 rank1_caged_no_cxi "OK — 1 rank runs caged WITHOUT /dev/cxi → Stage-1 cage can stay --unshare-net"
     else
-      fnd C6 rank1 "SKIP — not in a SLURM allocation"
+      fnd C6 rank1_caged_no_cxi "FAIL [$(why "$out")] — differs from the uncaged baseline, so this IS the cage: $(one_line "$out" | cut -c1-200)"
     fi
   else
-    fnd C5 mpi_build "FAIL to compile — $(tail -1 "$WORK/cc.log" 2>/dev/null)"
+    fnd C6 rank1_uncaged "FAIL [$(why "$out")] — uncaged 1 rank already broken, cage not implicated: $(one_line "$out" | cut -c1-200)"
   fi
+
+  # C1-def — 2 ranks through each cage shape, against the uncaged baseline above.
+  read -r -a CXIB <<<"$(cxi_binds)"
+  run2() { out="$("${SR[@]}" -n2 "$@" 2>&1)"; }
+  run2 bwrap "${BWRAP_BASE[@]}" "${CXIB[@]}" --unshare-net --bind "$SHARED" "$SHARED" -- "$SHARED/mpi_hello" \
+    && fnd C1 mpi2_unshare_net_cxi "OK — netns and CXI ARE orthogonal: $(one_line "$out")" \
+    || fnd C1 mpi2_unshare_net_cxi "FAIL [$(why "$out")] — $(one_line "$out" | cut -c1-240)"
+  run2 bwrap "${BWRAP_BASE[@]}" "${CXIB[@]}" --bind "$SHARED" "$SHARED" -- "$SHARED/mpi_hello" \
+    && fnd C1 mpi2_no_unshare_cxi "OK — caged with the fabric, net NOT unshared: $(one_line "$out")" \
+    || fnd C1 mpi2_no_unshare_cxi "FAIL [$(why "$out")] — $(one_line "$out" | cut -c1-240)"
+fi
+
+# ============================================================================
+head2 "C8 — WHICH cage element breaks the PMI bootstrap?  (bisection)"
+# Run 4 (Balfrin, 2026-07-29) killed the "a mask hides it" theory: EVERY variant failed,
+# including `robind_only` = plain `bwrap --ro-bind / /` with no mask at all. That
+# bisection was incomplete — every arm still had a READ-ONLY root, so the one property
+# common to all failures was never varied. Bisect the cage's PROPERTIES this time
+# (writability, then namespaces), widest-first, and stop guessing about paths: dump the
+# launcher's actual env, list the candidate spool dirs caged vs uncaged, keep the FULL
+# error text (run 4's was truncated at 100 chars, discarding the informative tail), and
+# strace the failing open() if strace exists.
+if [ -n "${CCX:-}" ] && have srun && [ -n "${SLURM_JOB_ID:-}" ] && [ "${BASE_OK:-0}" = 1 ]; then
+  # Absolute path + a shell: run 5 got uncaged=0 lines from a bare `srun -n1 env` while
+  # the caged variant returned 191, so the bare form resolves to something that prints
+  # nothing here. Never trust a silent dump — the sample line below proves it worked.
+  srun_t -n1 sh -c '/usr/bin/env' 2>/dev/null | sort > "$WORK/env.uncaged"
+  srun_t -n1 bwrap "${BWRAP_BASE[@]}" --bind "$SHARED" "$SHARED" -- sh -c '/usr/bin/env' 2>/dev/null | sort > "$WORK/env.caged"
+  fnd C8 env_dump_sample "uncaged first line: $(head -1 "$WORK/env.uncaged" 2>/dev/null)"
+  # Sanity FIRST: run 4 reported "no env lost" and printed no task-env lines, which is
+  # equally consistent with both dumps being EMPTY. Count them before believing either.
+  fnd C8 env_dump_lines "uncaged=$(wc -l < "$WORK/env.uncaged" 2>/dev/null) caged=$(wc -l < "$WORK/env.caged" 2>/dev/null)"
+  # Compare NAMES, not NAME=value: the two dumps come from two different steps, so
+  # per-step values (PALS_APID, SLURM_STEP_ID, …) differ and a value-wise diff reports
+  # them as "lost" when nothing was stripped at all (run 6 did exactly that).
+  lost="$(comm -23 <(cut -d= -f1 "$WORK/env.uncaged" | sort -u) \
+                   <(cut -d= -f1 "$WORK/env.caged"   | sort -u) 2>/dev/null | tr '\n' ' ')"
+  fnd C8 env_lost_in_cage "${lost:-<none — the cage passes the environment through>}"
+  # The whole uncaged task env, verbatim: we are looking for a variable whose spelling we
+  # guessed wrong twice already, so stop filtering and read it.
+  while IFS= read -r l; do note "task env: $l"; done < "$WORK/env.uncaged"
+
+  # Candidate PMI/PALS spool locations, caged vs uncaged — the mount table as oracle.
+  for p in /var/spool/slurmd /var/spool/slurmd/mpi_cray_shasta /var/run/palsd /run/palsd \
+           /var/spool/pals /var/opt/cray/pals /tmp; do
+    u="$(srun_t -n1 sh -c "ls -1 '$p' 2>&1 | head -5 | tr '\n' ' '" 2>/dev/null)"
+    c="$(srun_t -n1 bwrap "${BWRAP_BASE[@]}" -- sh -c "ls -1 '$p' 2>&1 | head -5 | tr '\n' ' '" 2>/dev/null)"
+    [ -z "$u$c" ] && continue
+    fnd C8 "spool_$(printf '%s' "$p" | tr '/' '_')" "uncaged=[$u] caged=[$c]"
+  done
+
+  # Bisect the cage's PROPERTIES, widest first. rw_root is the key new arm: it has the
+  # mount+user namespaces but a WRITABLE root, so it separates "read-only" from "namespace".
+  bisect() {
+    local lbl="$1"; shift
+    if out="$(srun_t -n1 bwrap "$@" --bind "$SHARED" "$SHARED" -- "$SHARED/mpi_hello" 2>&1)"; then
+      fnd C8 "bisect_$lbl" "OK — MPI_Init survives this cage shape"
+    else
+      fnd C8 "bisect_$lbl" "FAIL [$(why "$out")] $(one_line "$out" | cut -c1-140)"
+    fi
+  }
+  bisect rw_root      --bind / /
+  bisect rw_root_tmp  --bind / / --tmpfs /tmp
+  bisect ro_root      --ro-bind / /
+  bisect ro_root_rwtmp --ro-bind / / --bind /tmp /tmp
+  bisect ro_root_rwvar --ro-bind / / --bind /var /var
+  bisect ro_root_rwrun --ro-bind / / --bind /run /run
+  bisect full         --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /dev/shm
+
+  # Full, untruncated failure text of the minimal failing cage — the tail may name a path.
+  out="$(srun_t -n1 bwrap --ro-bind / / --bind "$SHARED" "$SHARED" -- "$SHARED/mpi_hello" 2>&1)"
+  printf '%s\n' "$out" | head -25 | while IFS= read -r l; do note "ro_root err: $l"; done
+
+  # Name the missing file directly, if strace is available.
+  if have strace; then
+    st="$(srun_t -n1 bwrap --ro-bind / / --bind "$SHARED" "$SHARED" -- \
+          strace -f -e trace=openat,open,connect,stat "$SHARED/mpi_hello" 2>&1 \
+          | grep -iE 'ENOENT|EROFS|EACCES|EPERM' | tail -12)"
+    if [ -n "$st" ]; then
+      printf '%s\n' "$st" | while IFS= read -r l; do note "strace: $l"; done
+      fnd C8 strace "captured — see 'strace:' lines for the failing syscall/path"
+    else
+      fnd C8 strace "ran but matched nothing (ptrace may be blocked in the userns)"
+    fi
+  else
+    fnd C8 strace "SKIP — strace not on PATH"
+  fi
+else
+  fnd C8 bisect "SKIP — needs a working uncaged MPI baseline in a SLURM allocation"
+fi
+
+# ============================================================================
+head2 "C9 — candidate fixes for the apinfo EROFS"
+# Run 5 (Balfrin, job 4965492) named the mechanism exactly, via strace:
+#   openat("/var/spool/slurmd/mpi_cray_shasta/<jobid>.<stepid>/apinfo", O_RDWR) = EROFS
+# Cray MPICH opens the per-step apinfo file READ-WRITE; `--ro-bind / /` makes the whole
+# tree read-only. The file is VISIBLE — nothing is masked — it is WRITABILITY that is
+# missing, which is why no mask-removal arm ever helped. Two candidate fixes:
+#   (a) a minimal read-write carve-out for that one per-step directory, and
+#   (b) a PMI implementation that does not need to write at all (pmi2 / pmix).
+# Each caged arm gets an UNCAGED control, so a failing --mpi type is never mistaken for
+# a cage failure.
+if [ -n "${CCX:-}" ] && have srun && [ -n "${SLURM_JOB_ID:-}" ] && [ "${BASE_OK:-0}" = 1 ]; then
+  spooldir="$(scontrol show config 2>/dev/null | awk -F'=' '/^SlurmdSpoolDir/{gsub(/ /,"",$2); print $2}')"
+  [ -n "$spooldir" ] || spooldir=/var/spool/slurmd
+  CRAYDIR="$spooldir/mpi_cray_shasta"
+  export CRAYDIR SHARED
+  fnd C9 spool_dir "$CRAYDIR"
+  # Ownership/mode decides whether a read-write BIND is even enough: if the file is
+  # root-owned and not user-writable, the wall is kernel permissions, not the namespace.
+  note "step dirs : $(srun_t -n1 sh -c "ls -ln '$CRAYDIR' 2>&1 | head -4 | tr '\n' ' '" 2>/dev/null)"
+  note "apinfo    : $(srun_t -n1 sh -c "ls -ln '$CRAYDIR'/*/apinfo 2>&1 | head -3 | tr '\n' ' '" 2>/dev/null)"
+
+  try9() { local lbl="$1"; shift
+    if out="$("$@" 2>&1)"; then fnd C9 "$lbl" "OK — MPI_Init succeeds"
+    else fnd C9 "$lbl" "FAIL [$(why "$out")] $(one_line "$out" | cut -c1-140)"; fi; }
+
+  # (a1) whole mpi_cray_shasta dir bound read-write (coarse, all steps on this node)
+  try9 rw_spool_dir srun_t -n1 bwrap "${BWRAP_BASE[@]}" --bind "$SHARED" "$SHARED" \
+       --bind "$CRAYDIR" "$CRAYDIR" -- "$SHARED/mpi_hello"
+
+  # (a2) ONLY this step's directory, computed INSIDE the task from SLURM_STEP_ID — the
+  # shape the real guard would use (the broker cannot know the step id at submit time).
+  try9 rw_this_step_only srun_t -n1 sh -c '
+    s="$CRAYDIR/$SLURM_JOB_ID.$SLURM_STEP_ID"
+    exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /dev/shm \
+         --bind "$SHARED" "$SHARED" --bind "$s" "$s" -- "$SHARED/mpi_hello"'
+
+  # (b) a PMI that may not need to write — each with its own uncaged control.
+  for m in pmi2 pmix; do
+    try9 "uncaged_mpi_$m" ${TMO[@]+"${TMO[@]}"} srun "--mpi=$m" -n1 "$SHARED/mpi_hello"
+    try9 "caged_mpi_$m"   ${TMO[@]+"${TMO[@]}"} srun "--mpi=$m" -n1 \
+         bwrap "${BWRAP_BASE[@]}" --bind "$SHARED" "$SHARED" -- "$SHARED/mpi_hello"
+  done
+
+  # If a fix works at -n1, confirm it still works at -n2 across nodes (the real target).
+  try9 rw_this_step_2rank ${TMO[@]+"${TMO[@]}"} srun -n2 sh -c '
+    s="$CRAYDIR/$SLURM_JOB_ID.$SLURM_STEP_ID"
+    exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /dev/shm \
+         --unshare-net --bind "$SHARED" "$SHARED" --bind "$s" "$s" -- "$SHARED/mpi_hello"'
+else
+  fnd C9 fixes "SKIP — needs a working uncaged MPI baseline in a SLURM allocation"
+fi
+
+# ============================================================================
+head2 "C10 — netns x geometry matrix for the PMI control plane"
+# Run 6 fixed the apinfo EROFS (per-step rw bind, or --mpi=pmi2/pmix which need no bind)
+# — but its 2-rank arm changed TWO things at once (rank count AND --unshare-net) and
+# failed with `_pmi_set_af_in_use: Unable to obtain IP address information`. The task env
+# explains why: cray_shasta PMI is TCP (PMI_CONTROL_PORT=29468, SLURM_STEP_RESV_PORTS,
+# SLURM_STEP_LAUNCHER_PORT). So the open question is exactly where --unshare-net stops
+# being affordable. Vary ONE thing at a time: PMI type x geometry x netns.
+# NOTE: needs >=2 tasks per node in the allocation — submit with -N2 --ntasks-per-node=2.
+# Run 7 corrections, all of them probe bugs in this helper:
+#   * every pmix/pmi2 arm died on `bwrap: Can't find source path .../mpi_cray_shasta/<id>`
+#     — those PMIs never create the cray_shasta step dir, and `--bind` is fatal on a
+#     missing source. Use `--bind-try`.
+#   * no arm bound /dev/cxi*, so the 2-node arms had no NIC at all (one segfaulted). The
+#     rank cage binds the fabric; the matrix must too, or it tests a cage nobody proposes.
+#   * a hung step was reported as an ordinary FAIL. A timeout is a distinct outcome.
+# Plus a new axis worth one column: /dev/shm private-per-task (today) vs shared, because
+# same-node ranks talk over shared memory and per-task `--tmpfs /dev/shm` cuts that.
+if [ -n "${CCX:-}" ] && have srun && [ -n "${SLURM_JOB_ID:-}" ] && [ "${BASE_OK:-0}" = 1 ]; then
+  CXI_ARGS="$(cxi_binds)"
+  c10() { # $1 label  $2 mpi ("" = site default)  $3 geometry  $4 netns yes/no
+          # $5 shm private|shared|jobdir   $6 expected rank count
+    local lbl="$1" m="$2" sel="$3" ns="$4" shm="${5:-private}" nr="${6:-1}" mflag=() body rc
+    [ -n "$m" ] && mflag=(--mpi="$m")
+    body='s="$CRAYDIR/$SLURM_JOB_ID.$SLURM_STEP_ID"; exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp'
+    case "$shm" in
+      shared) body="$body --bind /dev/shm /dev/shm" ;;
+      # The proposed design: a per-JOB subdirectory of the node's real /dev/shm, bound
+      # onto /dev/shm inside each rank's cage. Ranks of this job share segments; other
+      # users' segments stay invisible — unlike a plain --bind of the whole /dev/shm.
+      jobdir) body='mkdir -p "/dev/shm/husk-$SLURM_JOB_ID" 2>/dev/null; '"$body"' --bind "/dev/shm/husk-$SLURM_JOB_ID" /dev/shm' ;;
+      *)      body="$body --tmpfs /dev/shm" ;;
+    esac
+    body="$body $CXI_ARGS"
+    [ "$ns" = yes ] && body="$body --unshare-net"
+    body="$body"' --bind "$SHARED" "$SHARED" --bind-try "$s" "$s" -- "$SHARED/mpi_hello"'
+    out="$(${TMO[@]+"${TMO[@]}"} srun ${mflag[@]+"${mflag[@]}"} $sel sh -c "$body" 2>&1)"; rc=$?
+    if   [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+      fnd C10 "$lbl" "HANG (killed at the ${WALL}s wall) — no wire-up: $(one_line "$out" | cut -c1-90)"
+    elif [ "$rc" != 0 ]; then
+      fnd C10 "$lbl" "FAIL rc=$rc [$(why "$out")] $(one_line "$out" | cut -c1-120)"
+    elif ranks_ok "$out" "$nr"; then
+      fnd C10 "$lbl" "OK — real $nr-rank communicator: $(one_line "$out" | cut -c1-70)"
+    else
+      fnd C10 "$lbl" "WRONG SIZE (exit 0 but not one $nr-rank job — singleton fallback?): $(one_line "$out" | cut -c1-90)"
+    fi
+  }
+  #    label                    mpi    geometry                       netns  shm      ranks
+  c10 cs_1rank_netns            ""     "-N1 -n1"                       yes    private  1
+  c10 cs_1node2rank_netns       ""     "-N1 -n2"                       yes    private  2
+  c10 cs_1node2rank_netns_shm   ""     "-N1 -n2"                       yes    shared   2
+  c10 cs_1node2rank_netns_jobdir ""    "-N1 -n2"                       yes    jobdir   2
+  c10 cs_1node2rank_nonet_jobdir ""    "-N1 -n2"                       no     jobdir   2
+  c10 cs_2node2rank_nonet       ""     "-N2 -n2 --ntasks-per-node=1"   no     jobdir   2
+  c10 cs_2node2rank_netns       ""     "-N2 -n2 --ntasks-per-node=1"   yes    jobdir   2
+  # Re-run with the rank assertion: run 8 scored these OK on exit status alone, but they
+  # were pairs of singletons. If they stay WRONG SIZE, the pmix/pmi2 route is dead.
+  c10 pmix_1node2rank_netns_shm pmix   "-N1 -n2"                       yes    shared   2
+  c10 pmix_2node2rank_netns     pmix   "-N2 -n2 --ntasks-per-node=1"   yes    jobdir   2
+  c10 pmix_2node2rank_nonet     pmix   "-N2 -n2 --ntasks-per-node=1"   no     jobdir   2
+  c10 pmi2_2node2rank_nonet     pmi2   "-N2 -n2 --ntasks-per-node=1"   no     jobdir   2
+  # UNCAGED 2-rank pmix control: run 9 showed caged pmix produces singletons with AND
+  # without the netns, so the cage is not implicated — but that was never shown directly.
+  # Irrelevant on Alps (cray_shasta is the site default and works); it matters at a site
+  # where pmix is the only option, so keep the control.
+  if out="$(${TMO[@]+"${TMO[@]}"} srun --mpi=pmix -N1 -n2 "$SHARED/mpi_hello" 2>&1)"; then
+    ranks_ok "$out" 2 \
+      && fnd C10 pmix_2rank_UNCAGED "OK — real 2-rank uncaged, so caged singletons ARE the cage" \
+      || fnd C10 pmix_2rank_UNCAGED "WRONG SIZE uncaged too — this MPICH does not speak Slurm pmix; not a cage problem"
+  else
+    fnd C10 pmix_2rank_UNCAGED "FAIL rc=$? [$(why "$out")] — pmix unusable here regardless of the cage"
+  fi
+else
+  fnd C10 matrix "SKIP — needs a working uncaged MPI baseline in a SLURM allocation"
+fi
+
+# ============================================================================
+head2 "C11 — is the CAGED job actually on CXI, or silently degraded to TCP?"
+# libfabric lists cxi AND tcp providers here. If the cage gets the device binds wrong,
+# MPI does not fail — it falls back to the tcp provider and merely runs SLOW. That is a
+# containment bug disguised as a working job, so assert the provider rather than assume
+# it. (TCP is fine for the PMI bootstrap; it is not fine for the data plane.)
+if [ -n "${CCX:-}" ] && have srun && [ -n "${SLURM_JOB_ID:-}" ] && [ "${BASE_OK:-0}" = 1 ]; then
+  # Run 7's version was useless twice over: its caged arms lacked the apinfo fix, so they
+  # failed for the already-known reason and printed nothing; and the regex guessed at an
+  # output format ("provider ofi_rxd" is a provider LIST, not a selection). Fix the cage,
+  # then DUMP the verbose lines rather than guessing what shape they take.
+  export MPICH_OFI_VERBOSE=1 MPICH_VERSION_DISPLAY=1
+  CXI_ARGS="${CXI_ARGS:-$(cxi_binds)}"
+  prov() { # $1 label, $2 = cxi bind args ("" = none)
+    local lbl="$1" cxi="$2" body rc
+    body='s="$CRAYDIR/$SLURM_JOB_ID.$SLURM_STEP_ID"; exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --tmpfs /dev/shm '"$cxi"' --bind "$SHARED" "$SHARED" --bind-try "$s" "$s" -- "$SHARED/mpi_hello"'
+    out="$(${TMO[@]+"${TMO[@]}"} srun -N2 -n2 --ntasks-per-node=1 sh -c "$body" 2>&1)"; rc=$?
+    printf '%s\n' "$out" | grep -iE 'provider|cxi|tcp|ofi' | head -6 \
+      | while IFS= read -r l; do note "$lbl: $l"; done
+    if   [ "$rc" != 0 ]; then fnd C11 "$lbl" "run FAILED rc=$rc — provider question unanswered"
+    elif ! ranks_ok "$out" 2; then fnd C11 "$lbl" "exit 0 but NOT a real 2-rank job — provider question unanswered"
+    elif printf '%s' "$out" | grep -qi 'cxi'; then fnd C11 "$lbl" "OK — real 2-rank job, and it names CXI"
+    else fnd C11 "$lbl" "real 2-rank job but NO mention of cxi — see the '$lbl:' lines for a tcp fallback"
+    fi
+  }
+  prov with_cxi "$CXI_ARGS"
+  prov no_cxi   ""
+  note "read as: if 'no_cxi' RUNS FINE, the tcp fallback is real and silent -> the rank"
+  note "         cage needs a positive CXI assertion, not merely a device bind."
+else
+  fnd C11 provider "SKIP — needs a working uncaged MPI baseline in a SLURM allocation"
+fi
+
+# ============================================================================
+head2 "C12 — does a caged MPI job use AF_UNIX at all, and to reach what?"
+# CAGE-PROFILES.md: the single-node profile should carry the login cage's AF_UNIX
+# restriction unless the workload genuinely needs unix sockets. Rather than implement the
+# filter and then discover what breaks, OBSERVE the known-good caged 2-rank run: every
+# AF_UNIX socket() and the sun_path it connects to. Zero hits ⇒ the profile can block
+# AF_UNIX for free. Hits ⇒ we get the destination list, and each one is judged on whether
+# it is escape surface (MUNGE) or not (nsswitch).
+if [ -n "${CCX:-}" ] && have srun && [ -n "${SLURM_JOB_ID:-}" ] && [ "${BASE_OK:-0}" = 1 ]; then
+  if have strace; then
+    body='s="$CRAYDIR/$SLURM_JOB_ID.$SLURM_STEP_ID"; mkdir -p "/dev/shm/husk-$SLURM_JOB_ID" 2>/dev/null
+      exec bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+           --bind "/dev/shm/husk-$SLURM_JOB_ID" /dev/shm '"$CXI_ARGS"' --unshare-net \
+           --bind "$SHARED" "$SHARED" --bind-try "$s" "$s" -- \
+           strace -f -e trace=socket,connect "$SHARED/mpi_hello"'
+    out="$(${TMO[@]+"${TMO[@]}"} srun -N1 -n2 sh -c "$body" 2>&1)"
+    au="$(printf '%s\n' "$out" | grep -c 'AF_UNIX' || true)"
+    fnd C12 af_unix_calls "$au socket()/connect() call(s) mentioning AF_UNIX in a caged 2-rank run"
+    printf '%s\n' "$out" | grep -oE 'sun_path="[^"]*"' | sort -u \
+      | while IFS= read -r l; do note "af_unix dest: $l"; done
+    if [ "$au" = 0 ]; then
+      fnd C12 verdict "NONE — the single-node profile can block AF_UNIX at no functional cost"
+    else
+      fnd C12 verdict "USED — judge each 'af_unix dest' above: escape surface (munge) or not (nsswitch/sssd)"
+    fi
+    # Did the run still form a real communicator under strace? If not, the list above is
+    # from a broken run and proves nothing.
+    ranks_ok "$out" 2 && fnd C12 traced_run "OK — the traced run was a real 2-rank job" \
+                      || fnd C12 traced_run "NOT a real 2-rank job — treat the dest list as unreliable"
+  else
+    fnd C12 af_unix "SKIP — strace not on PATH"
+  fi
+else
+  fnd C12 af_unix "SKIP — needs a working uncaged MPI baseline in a SLURM allocation"
+fi
+
+# ============================================================================
+head2 "C7 — can the step-broker keep several srun steps in flight?"
+# Chapter 1 mediates every srun through ONE step-broker. If concurrent steps serialize,
+# the broker must queue them (and a long-running step would block every other request) —
+# that is a design constraint on the step-broker's concurrency, so measure it.
+if have srun && [ -n "${SLURM_JOB_ID:-}" ]; then
+  fnd C7 srun_version "$(srun --version 2>&1 | head -1)"
+  for mode in overlap default; do
+    case "$mode" in overlap) opt=(--overlap);; *) opt=();; esac
+    t0=$SECONDS
+    srun ${opt[@]+"${opt[@]}"} -n1 sleep 5 >/dev/null 2>&1 &  p1=$!
+    srun ${opt[@]+"${opt[@]}"} -n1 sleep 5 >/dev/null 2>&1 &  p2=$!
+    wait "$p1" "$p2"
+    el=$(( SECONDS - t0 ))
+    if [ "$el" -lt 8 ]; then
+      fnd C7 "steps_$mode" "CONCURRENT (${el}s for 2x 5s steps)"
+    else
+      fnd C7 "steps_$mode" "SERIALIZED (${el}s for 2x 5s steps) — step-broker must queue"
+    fi
+  done
+else
+  fnd C7 concurrent_steps "SKIP — not in a SLURM allocation"
 fi
 
 # ============================================================================

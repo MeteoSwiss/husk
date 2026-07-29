@@ -217,12 +217,52 @@ fn wrap_script(body: &str, bwrap_args: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     // Great A'Tuin.
+    //
+    // Deliberately NOT `exec`: the guard shell stays alive as the parent so it can
+    // TRANSLATE a seccomp kill. seccomp-wrapper blocks with SCMP_ACT_KILL_PROCESS, so a
+    // blocked syscall kills the job with SIGSYS -> status 159 and a bare "Bad system
+    // call". Interactively that is fine (the agent reads the failure and adapts); in a
+    // batch job nobody is reading, and a run that dies hours in would give the scientist
+    // no way to connect 159 to husk. One idle shell for the job's duration buys a
+    // message that names the layer. The status is re-emitted unchanged so sacct still
+    // records what really happened.
+    //
+    // The message points at strace, NOT at SECCOMP_WRAPPER_DEBUG. That variable swaps
+    // KILL for ENOSYS, so blocked syscalls return and the program continues — an
+    // off-switch, not a diagnostic. A diagnostic may change what we OBSERVE, never what
+    // we ENFORCE (the same reason the broker has --dry-run and not a debug mode). Under
+    // strace the filter still kills; strace just shows the call it died attempting, right
+    // before `+++ killed by SIGSYS +++`. The broker also strips the variable from the
+    // submission env (STRIPPED_SUBMIT_ENV), so no brokered job can run weakened.
+    // Credential-socket masks are resolved HERE, on the compute node, not baked into the
+    // static args: `--tmpfs DEST` dies if DEST is absent under a read-only root, and
+    // dies again if two entries resolve to the same directory (/var/run -> /run). Only
+    // the compute node knows which exist — same reason the GPU binds use --dev-bind-try.
+    // Appended AFTER {bwrap} so it still wins over any config-driven allowRead.
+    let mask_paths = settings::CREDENTIAL_SOCKET_DIRS.join(" ");
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
 if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   export _HUSK_RESANDBOXED=1\n\
-  exec seccomp-wrapper bwrap {bwrap} -- /bin/bash \"$0\" \"$@\"\n\
+  _husk_mask= ; _husk_seen=\n\
+  for _d in {mask_paths}; do\n\
+    [ -d \"$_d\" ] || continue\n\
+    _r=$(readlink -f \"$_d\" 2>/dev/null || echo \"$_d\")\n\
+    case \" $_husk_seen \" in *\" $_r \"*) continue ;; esac\n\
+    _husk_seen=\"$_husk_seen $_r\"\n\
+    _husk_mask=\"$_husk_mask --tmpfs $_r\"\n\
+  done\n\
+  seccomp-wrapper bwrap {bwrap} $_husk_mask -- /bin/bash \"$0\" \"$@\"\n\
+  _husk_rc=$?\n\
+  if [ \"$_husk_rc\" = 159 ]; then\n\
+    echo \"husk: job killed by SIGSYS - a syscall blocked by husk's seccomp-wrapper.\" >&2\n\
+    echo \"husk: to identify which one, re-run the job with your command wrapped in\" >&2\n\
+    echo \"husk:   strace -f -o trace.log <your command>\" >&2\n\
+    echo \"husk: the cage stays fully enforcing; the last call before the SIGSYS kill in\" >&2\n\
+    echo \"husk: trace.log is the blocked one. Send it to us if it should be allowed.\" >&2\n\
+  fi\n\
+  exit \"$_husk_rc\"\n\
 fi\n\
 # --- original agent script ---\n"
     );
@@ -382,6 +422,118 @@ mod tests {
         assert!(!o.iter().any(|x| x.contains("SNEAKYVAR"))); // agent's --export value stripped
         assert!(!has(&o, "--chdir=/evil")); // agent's stripped
         assert!(has(&o, "--nodes=2")); // benign passthrough kept
+    }
+
+    /// Run a generated script with a stubbed `seccomp-wrapper` on PATH and return
+    /// (exit status, stderr). Executes the real thing rather than asserting on the
+    /// script text: what matters is the behaviour a dying job produces.
+    fn run_guard_with_stub(tag: &str, stub_body: &str) -> (i32, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        // `tag` keeps concurrently-running tests off each other's stub (cargo runs them
+        // in threads of ONE process, so the pid alone is not unique).
+        let dir = std::env::temp_dir().join(format!("husk-guard-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stub = dir.join("seccomp-wrapper");
+        std::fs::write(&stub, stub_body).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let script = wrap_script("#!/bin/bash\necho AGENT_BODY_RAN\n", &[]);
+        let path = dir.join("job.sh");
+        std::fs::write(&path, script).unwrap();
+
+        let out = std::process::Command::new("/bin/bash")
+            .arg(&path)
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    #[test]
+    fn guard_translates_a_seccomp_kill_and_preserves_the_status() {
+        // A blocked syscall dies by SIGSYS (SCMP_ACT_KILL_PROCESS) -> 159 and a bare
+        // "Bad system call". In a batch job nobody is reading, so the guard must name
+        // the layer that killed it — while re-emitting the status unchanged so sacct
+        // still records the truth.
+        let (code, _out, err) = run_guard_with_stub("sigsys", "#!/bin/bash\nkill -SYS $$\n");
+        assert_eq!(code, 159, "the real exit status must survive the translation");
+        assert!(err.contains("killed by SIGSYS"), "must name the cause: {err}");
+        assert!(err.contains("husk"), "must name the layer: {err}");
+        assert!(
+            !err.contains("SECCOMP_WRAPPER_DEBUG"),
+            "must NOT advertise the enforcement off-switch: {err}"
+        );
+        assert!(
+            err.contains("strace"),
+            "must point at an OBSERVING diagnostic, not a weakening one: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_stays_quiet_and_transparent_for_an_ordinary_failure() {
+        // Only a seccomp kill gets the message; an ordinary non-zero exit must pass
+        // through untouched, or every failing job would blame the sandbox.
+        let (code, _out, err) = run_guard_with_stub("plain", "#!/bin/bash\nexit 3\n");
+        assert_eq!(code, 3);
+        assert!(!err.contains("husk:"), "no husk noise on a normal failure: {err}");
+    }
+
+    #[test]
+    fn credential_mask_is_applied_only_for_paths_that_exist() {
+        // `--tmpfs DEST` kills bwrap when DEST is absent under a read-only root, and
+        // again when two entries resolve to the same dir (/var/run -> /run). Both bugs
+        // shipped and both took the whole cage down, so pin the conditional: the mask
+        // must appear for a directory that exists here and never for one that does not.
+        let (code, out, _err) =
+            run_guard_with_stub("mask", "#!/bin/bash\necho \"ARGS: $*\"\n");
+        assert_eq!(code, 0, "guard must run: {out}");
+
+        let mut expected = 0;
+        for d in settings::CREDENTIAL_SOCKET_DIRS {
+            let real = std::fs::canonicalize(d);
+            let present = real.is_ok();
+            if !present {
+                assert!(
+                    !out.contains(&format!("--tmpfs {d}")),
+                    "must not mask absent {d}: {out}"
+                );
+            } else {
+                expected += 1;
+            }
+        }
+        // De-duplication: /run/munge and /var/run/munge are the SAME directory, so at
+        // most one --tmpfs may be emitted however many list entries resolve to it.
+        let emitted = out.matches("--tmpfs ").count();
+        assert!(
+            emitted <= 1,
+            "resolved duplicates must collapse to one mount (saw {emitted}): {out}"
+        );
+        if expected == 0 {
+            assert_eq!(emitted, 0, "nothing exists here, so nothing to mask: {out}");
+        }
+    }
+
+    #[test]
+    fn credential_mask_is_applied_after_the_config_driven_binds() {
+        // Ordering is the security property: bwrap applies binds in order and the last
+        // one wins, so an allowRead that re-exposes a parent directory must not be able
+        // to resurrect MUNGE. The mask therefore has to come AFTER the policy args.
+        let script = wrap_script("#!/bin/bash\ntrue\n", &["--ro-bind".into(), "/run".into(), "/run".into()]);
+        let line = script
+            .lines()
+            .find(|l| l.contains("seccomp-wrapper bwrap"))
+            .expect("guard line");
+        // args are sh_quote'd, so they appear as '--ro-bind' '/run' '/run'
+        let policy_arg = line.find("'--ro-bind'").expect("policy arg on the line");
+        let mask = line.find("$_husk_mask").expect("mask on the line");
+        assert!(mask > policy_arg, "mask must follow the config binds: {line}");
     }
 
     #[test]
