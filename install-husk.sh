@@ -82,7 +82,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   echo "  - delete  $PREFIX/bin/{husk,seccomp-wrapper,seccomp-wrapper.sha256}"
   echo "            $PREFIX/bin/{husk-slurm-wrapper,husk-slurm-broker} (if installed)"
   echo "            $PREFIX/bin/husk-slurm (legacy, if left by an older install)"
-  echo "            $PREFIX/lib/husk/{apply-seccomp,sbatch-stub.py,slurm-partition}"
+  echo "            $PREFIX/lib/husk/{apply-seccomp,sbatch-stub.py,srun-stub.py,slurm-partition}"
   echo "  - revert the enableAllProjectMcpServers / sandbox / permissions blocks in"
   echo "    $CLAUDE_SETTINGS to their pre-install state (all other settings kept)"
   echo "  - socat at $PREFIX/bin/socat is LEFT in place (a shared dependency);"
@@ -110,6 +110,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
            "$PREFIX/bin/seccomp-wrapper.sha256" \
            "$PREFIX/lib/husk/apply-seccomp" \
            "$PREFIX/lib/husk/sbatch-stub.py" \
+           "$PREFIX/lib/husk/srun-stub.py" \
            "$PREFIX/lib/husk/slurm-partition" \
            "$MANIFEST"; do
     if [[ -e "$f" ]]; then rm -f "$f"; printf '  [ok]   removed %s\n' "$f"; fi
@@ -403,6 +404,12 @@ if [[ -x "$SLURM_BROKER_SRC" && -x "$SLURM_WRAPPER_SRC" ]]; then
   install -m 0755 "$SLURM_WRAPPER_SRC" "$PREFIX/bin/husk-slurm-wrapper"
   install -m 0755 "$SCRIPT_DIR/slurm-broker/sbatch-stub.py" \
                   "$PREFIX/lib/husk/sbatch-stub.py"
+  # The srun stub is bound over srun INSIDE a brokered job by the job guard, which
+  # derives this path from the broker's own location (<prefix>/bin -> <prefix>/lib/husk).
+  # Both must be deployed together: the guard checks it exists before binding, so a
+  # missing stub costs srun brokering, not the cage.
+  install -m 0755 "$SCRIPT_DIR/slurm-broker/srun-stub.py" \
+                  "$PREFIX/lib/husk/srun-stub.py"
   # husk-slurm is retired — `husk` now brokers SLURM itself. Remove any stale copy
   # left by an older install so users don't keep invoking the dead launcher.
   rm -f "$PREFIX/bin/husk-slurm"

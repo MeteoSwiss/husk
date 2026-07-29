@@ -207,6 +207,26 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
 /// TODO(hardware/MPI): the network/fabric policy is still single-node only —
 /// `--unshare-net` breaks multi-node/MPI (no fabric); revisit for the MPI phase.
 /// Confirm the uenv /user-environment mount inherits through `--ro-bind / /`.
+/// Where this broker and the srun stub live, derived from our own path
+/// (`<prefix>/bin/husk-slurm-broker` -> `<prefix>/lib/husk/srun-stub.py`, the layout
+/// install-husk.sh creates). Self-configuring: no new knob to set, and no agent input.
+///
+/// Both are only ever USED behind a runtime existence test in the guard, because the
+/// broker resolves them on the LOGIN node while the guard runs on a compute node — the
+/// same submit-side/run-side split that made the GPU binds `--dev-bind-try`.
+fn husk_paths() -> (String, String) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    let broker = exe.to_string_lossy().to_string();
+    let stub = exe
+        .parent()
+        .and_then(|bin| bin.parent())
+        .map(|prefix| prefix.join("lib").join("husk").join("srun-stub.py"))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    (broker, stub)
+}
+
 fn wrap_script(body: &str, bwrap_args: &[String], profile: profile::Profile) -> String {
     let mut head = String::new();
     let mut tail = String::new();
@@ -258,6 +278,9 @@ fn wrap_script(body: &str, bwrap_args: &[String], profile: profile::Profile) -> 
     // Appended AFTER {bwrap} so it still wins over any config-driven allowRead.
     let mask_paths = settings::CREDENTIAL_SOCKET_DIRS.join(" ");
     let sec = profile.seccomp_profile();
+    let (broker_path, stub_path) = husk_paths();
+    let broker_q = settings::sh_quote(&broker_path);
+    let stub_q = settings::sh_quote(&stub_path);
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
@@ -271,8 +294,30 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
     _husk_seen=\"$_husk_seen $_r\"\n\
     _husk_mask=\"$_husk_mask --tmpfs $_r\"\n\
   done\n\
-  seccomp-wrapper --profile={sec} bwrap {bwrap} $_husk_mask -- /bin/bash \"$0\" \"$@\"\n\
+  # Bootstrap the step pair: an UN-CAGED step-broker (it needs MUNGE and the daemon\n\
+  # route, which is exactly what the cage removes) plus the in-cage srun stub bound over\n\
+  # the real srun. Everything is conditional on the pieces existing HERE, on this node:\n\
+  # the broker resolved these paths on the login node, and a bwrap bind whose source is\n\
+  # missing kills the cage outright. If any of it is absent the job still runs - srun\n\
+  # simply is not brokered, and fails in the cage for want of a route, which is the\n\
+  # status quo. The stub is convenience, not containment.\n\
+  _husk_srun= ; _husk_step_pid=\n\
+  _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
+  if [ -r {stub_q} ] && [ -x {broker_q} ] && [ -n \"$_husk_real_srun\" ]; then\n\
+    _husk_spool=\"$PWD/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
+    if mkdir -p \"$_husk_spool\" 2>/dev/null; then\n\
+      export HUSK_STEP_SPOOL=\"$_husk_spool\"\n\
+      {broker_q} --step-broker --spool \"$_husk_spool\" --workdir \"$PWD\" \\\n\
+        >\"$_husk_spool/step-broker.log\" 2>&1 &\n\
+      _husk_step_pid=$!\n\
+      _husk_srun=\"--ro-bind {stub_q} $_husk_real_srun\"\n\
+    fi\n\
+  fi\n\
+  seccomp-wrapper --profile={sec} bwrap {bwrap} $_husk_mask $_husk_srun -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
+  # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
+  # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
+  [ -n \"$_husk_step_pid\" ] && kill \"$_husk_step_pid\" 2>/dev/null\n\
   if [ \"$_husk_rc\" = 159 ]; then\n\
     echo \"husk: job killed by SIGSYS - a syscall blocked by husk's seccomp-wrapper.\" >&2\n\
     echo \"husk: to identify which one, re-run the job with your command wrapped in\" >&2\n\
@@ -537,6 +582,42 @@ mod tests {
         if expected == 0 {
             assert_eq!(emitted, 0, "nothing exists here, so nothing to mask: {out}");
         }
+    }
+
+    #[test]
+    fn guard_bootstraps_the_step_pair() {
+        let script = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode);
+        // An UN-CAGED step-broker: it needs exactly the MUNGE + daemon route the cage
+        // removes, which is why it starts before the re-exec and not inside it.
+        assert!(script.contains("--step-broker --spool"), "{script}");
+        assert!(script.contains("export HUSK_STEP_SPOOL="), "the stub finds the spool by env: {script}");
+        // The in-cage stub shadows the real srun, resolved on THIS node.
+        assert!(script.contains("_husk_real_srun=$(command -v srun"), "{script}");
+        assert!(script.contains("--ro-bind"), "{script}");
+        // It holds credentials the job must not have, so it dies with the job.
+        assert!(script.contains("kill \"$_husk_step_pid\""), "{script}");
+        // ...and every piece is conditional on existing here, because the paths were
+        // resolved on the login node and a bind with a missing source kills the cage.
+        assert!(script.contains("if [ -r "), "{script}");
+    }
+
+    #[test]
+    fn a_missing_step_pair_does_not_break_the_job() {
+        // The stub is convenience, not containment: if it is absent, srun simply is not
+        // brokered (and fails in the cage for want of a route, the status quo). What must
+        // NOT happen is the cage failing to launch - a bwrap bind whose source is missing
+        // is fatal, which is how the MUNGE mask took every job down.
+        //
+        // In the test environment the derived paths genuinely do not exist, so this
+        // exercises the skip path for real rather than by simulation.
+        let (code, out, _err) =
+            run_guard_with_stub("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n");
+        assert_eq!(code, 0, "the job must still run: {out}");
+        assert!(
+            !out.contains("srun-stub.py"),
+            "no stub bind may be emitted when the stub is absent: {out}"
+        );
+        assert!(out.contains("ARGS:"), "the cage command still ran: {out}");
     }
 
     #[test]
