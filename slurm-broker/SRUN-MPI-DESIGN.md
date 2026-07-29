@@ -1,8 +1,10 @@
 # husk — srun / MPI phase design (experimental)
 
-**Status: design, pre-implementation.** Branch `experimental`, off the frozen v0.4
-`main`. Nothing here ships until the hardware gates below are answered on Balfrin/
-Santis. See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
+**Status: hardware gates ANSWERED (nine probe runs on Balfrin); Chapter 1 in
+implementation.** Branch `experimental`, off the frozen v0.4 `main`. Landed so far: the
+cage profiles (topology forced, multi-node rejected), the seccomp `--profile` flag, and
+the step allowlist. Still to build: the in-cage `srun` stub, the step-broker, and the
+rank-cage args. See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
 (AV1–AV8 + the two design principles), [ROADMAP.md](../ROADMAP.md).
 
 ## Scope & premise
@@ -99,11 +101,12 @@ never supplied by the stub — the untrusted side cannot opt out of the cage.
 - ~~Step-broker concurrency~~ **ANSWERED (C7, Balfrin)**: steps run concurrently, with and
   without `--overlap` — the step-broker need not serialise and a long step will not wedge
   it. (Not yet shown for steps contending for the same node's CPUs.)
-- **The per-task cage must preserve the PMI bootstrap.** Uncaged `srun` MPI works at
-  `-n1` and `-n2`; caged it fails at `pals_init2()=ENOENT` with *and* without
-  `--unshare-net`, so a masked path — not the netns — is the cause (gate **C8** bisects
-  it). This blocks Chapter 1 before any fabric question. `--mpi` stays a modelled,
-  value-validated option, but need not be forced: `MpiDefault=cray_shasta` works.
+- ~~The per-task cage must preserve the PMI bootstrap~~ **ANSWERED (C8/C9)**: the cause
+  was neither a mask nor the netns but the READ-ONLY ROOT — Cray MPICH opens the
+  per-step `apinfo` file `O_RDWR` and got `EROFS`. The rank cage therefore binds that one
+  per-step directory read-write, and a per-job `/dev/shm` so same-node ranks can share
+  segments. `--mpi` is dropped rather than forced: `MpiDefault=cray_shasta` works, and an
+  agent-chosen `pmix` silently produced independent single-rank jobs (run 8).
 
 ---
 
