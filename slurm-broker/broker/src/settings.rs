@@ -37,6 +37,38 @@ const GPU_DEVICES: &[&str] = &[
     "/dev/nvidia-nvswitch2", "/dev/nvidia-nvswitch3",
 ];
 
+/// Fabric NIC device nodes exposed into a RANK cage (never into a plain job cage).
+///
+/// `/dev/cxi[0-9]*` on Alps — Balfrin has four. Measured (gate C4/C1): the device is
+/// REQUIRED for the CXI provider to enumerate (0 endpoints without it, 8 with) and needs
+/// no capability beyond the node itself, and enumeration is unaffected by
+/// `--unshare-net` — so the rank cage keeps full IP isolation AND the fabric.
+///
+/// `/dev/cxi_sbl` is deliberately absent: Balfrin shows it 0600 root:root (Slingshot
+/// base-link, an admin device). A user job cannot open it, so binding it would widen the
+/// cage's surface by exactly the amount it cannot use.
+///
+/// Like the GPU nodes these are `--dev-bind-try`, so a node without a fabric simply skips
+/// them — the same mechanism that makes CPU-vs-GPU not worth a separate profile.
+const FABRIC_DEVICES: &[&str] = &[
+    "/dev/cxi0", "/dev/cxi1", "/dev/cxi2", "/dev/cxi3",
+    "/dev/cxi4", "/dev/cxi5", "/dev/cxi6", "/dev/cxi7",
+];
+
+/// Which cage is being built. They differ in exactly two places, both measured:
+/// the fabric devices, and who owns `/dev/shm`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CageKind {
+    /// The batch job itself: a fresh private `/dev/shm`, no fabric.
+    Job,
+    /// One MPI rank launched by the step-broker. Gets the fabric, and does NOT get a
+    /// private `/dev/shm`: a per-task tmpfs gives every rank its own shared-memory
+    /// segment namespace, which HANGS same-node multi-rank MPI (probe runs 8-9 — with
+    /// and without the netns, so it is not a network problem). The per-JOB `/dev/shm`
+    /// subdirectory is bound by the per-task wrapper instead, where the job id is known.
+    Rank,
+}
+
 /// Credential-daemon socket directories to mask, so a caged job cannot AUTHENTICATE to
 /// the cluster services even where it can reach them.
 ///
@@ -418,15 +450,41 @@ impl FsPolicy {
     /// hides/allows applied shallowest-path-first so the most specific rule wins,
     /// then the writable workdir, then `--unshare-net`.
     pub fn compute_bwrap_args(&self, workdir: &str) -> Vec<String> {
+        self.bwrap_args(workdir, CageKind::Job)
+    }
+
+    /// The RANK cage: as the job cage, plus the fabric devices, minus the private
+    /// `/dev/shm`. See `CageKind`.
+    ///
+    /// Not yet called from the binary — the step-broker that launches ranks does not
+    /// exist yet. Landed with the step allowlist so the cage is defined and tested
+    /// before the process plumbing arrives, not during it.
+    #[allow(dead_code)]
+    pub fn rank_bwrap_args(&self, workdir: &str) -> Vec<String> {
+        self.bwrap_args(workdir, CageKind::Rank)
+    }
+
+    fn bwrap_args(&self, workdir: &str, kind: CageKind) -> Vec<String> {
         let mut a: Vec<String> = vec![
             "--ro-bind".into(), "/".into(), "/".into(),
             "--dev".into(), "/dev".into(),
             "--proc".into(), "/proc".into(),
             "--tmpfs".into(), "/tmp".into(),
-            // Shared memory: --dev gives a bare /dev, but CUDA IPC and framework
-            // dataloaders need /dev/shm.
-            "--tmpfs".into(), "/dev/shm".into(),
         ];
+        // Shared memory: --dev gives a bare /dev, but CUDA IPC and framework
+        // dataloaders need /dev/shm. A RANK gets the job's shared one instead, bound by
+        // the per-task wrapper — a private tmpfs per rank hangs same-node MPI.
+        if kind == CageKind::Job {
+            a.push("--tmpfs".into());
+            a.push("/dev/shm".into());
+        }
+        if kind == CageKind::Rank {
+            for dev in FABRIC_DEVICES {
+                a.push("--dev-bind-try".into());
+                a.push((*dev).to_string());
+                a.push((*dev).to_string());
+            }
+        }
 
         // Expose GPUs + NVLink into the cage when present (see GPU_DEVICES). Safe
         // unconditionally: --dev-bind-try skips absent nodes, and these are device
@@ -870,6 +928,42 @@ mod tests {
         assert!(cmd.contains("--dev-bind-try /dev/nvidiactl /dev/nvidiactl"));
         assert!(cmd.contains("--dev-bind-try /dev/nvidia0 /dev/nvidia0"));
         assert!(cmd.contains("--dev-bind-try /dev/nvidia-uvm /dev/nvidia-uvm"));
+    }
+
+    #[test]
+    fn rank_cage_gets_the_fabric_and_no_private_shm() {
+        // The two measured differences from the job cage, and the only two.
+        let job = joined(&FsPolicy::default(), "/work");
+        let rank = FsPolicy::default().rank_bwrap_args("/work").join(" ");
+
+        assert!(job.contains("--tmpfs /dev/shm"), "job cage keeps its own /dev/shm");
+        assert!(
+            !rank.contains("--tmpfs /dev/shm"),
+            "a per-rank tmpfs /dev/shm HANGS same-node MPI - the per-job dir is bound by \
+             the per-task wrapper instead: {rank}"
+        );
+        assert!(!job.contains("/dev/cxi"), "a plain job has no business on the fabric");
+        assert!(rank.contains("--dev-bind-try /dev/cxi0 /dev/cxi0"), "{rank}");
+        assert!(rank.contains("--dev-bind-try /dev/cxi3 /dev/cxi3"), "{rank}");
+        assert!(
+            !rank.contains("cxi_sbl"),
+            "the admin base-link device is 0600 root and must never be bound: {rank}"
+        );
+    }
+
+    #[test]
+    fn rank_cage_keeps_every_containment_property_of_the_job_cage() {
+        // The fabric is a RESOURCE delta, not a containment one: a rank must still get
+        // the read-only root, hidden homes, and no network.
+        let p = FsPolicy {
+            allow_read: vec![],
+            deny_read: vec!["/users".into()],
+            ..Default::default()
+        };
+        let rank = p.rank_bwrap_args("/work").join(" ");
+        assert!(rank.contains("--ro-bind / /"), "{rank}");
+        assert!(rank.contains("--tmpfs /users"), "{rank}");
+        assert!(rank.contains("--unshare-net"), "single node needs no IP - measured: {rank}");
     }
 
     #[test]
