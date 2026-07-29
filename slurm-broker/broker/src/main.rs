@@ -4,6 +4,7 @@
 
 mod policy;
 mod profile;
+mod rank;
 mod protocol;
 mod sbatch;
 mod srun;
