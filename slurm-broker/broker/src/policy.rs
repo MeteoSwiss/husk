@@ -286,13 +286,17 @@ fn wrap_script(body: &str, bwrap_args: &[String], profile: profile::Profile) -> 
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
 if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   export _HUSK_RESANDBOXED=1\n\
-  _husk_mask= ; _husk_seen=\n\
+  # An ARRAY, not a string. A string of pre-quoted arguments expanded unquoted gets\n\
+  # word-split but NOT quote-removed, so bwrap would receive a path with literal quotes\n\
+  # in it - which is exactly how the srun bind below took every job down once.\n\
+  _husk_extra=()\n\
+  _husk_seen=\n\
   for _d in {mask_paths}; do\n\
     [ -d \"$_d\" ] || continue\n\
     _r=$(readlink -f \"$_d\" 2>/dev/null || echo \"$_d\")\n\
     case \" $_husk_seen \" in *\" $_r \"*) continue ;; esac\n\
     _husk_seen=\"$_husk_seen $_r\"\n\
-    _husk_mask=\"$_husk_mask --tmpfs $_r\"\n\
+    _husk_extra+=(--tmpfs \"$_r\")\n\
   done\n\
   # Bootstrap the step pair: an UN-CAGED step-broker (it needs MUNGE and the daemon\n\
   # route, which is exactly what the cage removes) plus the in-cage srun stub bound over\n\
@@ -301,19 +305,21 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   # missing kills the cage outright. If any of it is absent the job still runs - srun\n\
   # simply is not brokered, and fails in the cage for want of a route, which is the\n\
   # status quo. The stub is convenience, not containment.\n\
-  _husk_srun= ; _husk_step_pid=\n\
+  _husk_step_pid=\n\
+  _husk_stub={stub_q}\n\
+  _husk_broker={broker_q}\n\
   _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
-  if [ -r {stub_q} ] && [ -x {broker_q} ] && [ -n \"$_husk_real_srun\" ]; then\n\
+  if [ -r \"$_husk_stub\" ] && [ -x \"$_husk_broker\" ] && [ -n \"$_husk_real_srun\" ]; then\n\
     _husk_spool=\"$PWD/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
     if mkdir -p \"$_husk_spool\" 2>/dev/null; then\n\
       export HUSK_STEP_SPOOL=\"$_husk_spool\"\n\
-      {broker_q} --step-broker --spool \"$_husk_spool\" --workdir \"$PWD\" \\\n\
+      \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir \"$PWD\" \\\n\
         >\"$_husk_spool/step-broker.log\" 2>&1 &\n\
       _husk_step_pid=$!\n\
-      _husk_srun=\"--ro-bind {stub_q} $_husk_real_srun\"\n\
+      _husk_extra+=(--ro-bind \"$_husk_stub\" \"$_husk_real_srun\")\n\
     fi\n\
   fi\n\
-  seccomp-wrapper --profile={sec} bwrap {bwrap} $_husk_mask $_husk_srun -- /bin/bash \"$0\" \"$@\"\n\
+  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
   # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
@@ -488,6 +494,21 @@ mod tests {
         assert!(has(&o, "--nodes=1")); // cage profile forces the topology
     }
 
+    /// Both step-pair tests manipulate the SAME derived stub path
+    /// (`<target>/lib/husk/srun-stub.py`), one creating it and one requiring its absence.
+    /// cargo runs tests as threads in one process, so they must not interleave.
+    static STUB_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn derived_stub_path() -> std::path::PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        exe.parent()
+            .and_then(|b| b.parent())
+            .unwrap()
+            .join("lib")
+            .join("husk")
+            .join("srun-stub.py")
+    }
+
     /// Run a generated script with a stubbed `seccomp-wrapper` on PATH and return
     /// (exit status, stderr). Executes the real thing rather than asserting on the
     /// script text: what matters is the behaviour a dying job produces.
@@ -502,6 +523,11 @@ mod tests {
         let stub = dir.join("seccomp-wrapper");
         std::fs::write(&stub, stub_body).unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The guard only binds the srun stub if a real srun exists on this node. Provide
+        // one so the bind path is exercised rather than silently skipped.
+        let fake_srun = dir.join("srun");
+        std::fs::write(&fake_srun, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_srun, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let script = wrap_script("#!/bin/bash\necho AGENT_BODY_RAN\n", &[], profile::Profile::SingleNode);
         let path = dir.join("job.sh");
@@ -602,14 +628,53 @@ mod tests {
     }
 
     #[test]
+    fn emitted_bwrap_arguments_never_carry_literal_quotes() {
+        // The bug this pins took every job down on Balfrin: the guard built a STRING of
+        // pre-quoted arguments and expanded it unquoted. Unquoted expansion word-splits
+        // but does NOT remove quotes, so bwrap received a path with literal ' characters
+        // and refused to bind it — cage dead, exit 1, no output to explain it.
+        //
+        // Inspecting the generated text cannot catch that (the text looks right); only
+        // running it and reading the ARGUMENTS can. So: make the derived stub path exist,
+        // run the guard, and check what actually arrives.
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = derived_stub_path();
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+        std::fs::write(&stub, "#!/usr/bin/env python3\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (code, out, _err) =
+            run_guard_with_stub("quoting", "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n");
+        let _ = std::fs::remove_file(&stub);
+
+        assert_eq!(code, 0, "guard must run: {out}");
+        for line in out.lines().filter_map(|l| l.strip_prefix("ARG:")) {
+            assert!(
+                !line.contains('\''),
+                "bwrap argument carries a literal quote, so the path will not resolve: {line:?}"
+            );
+        }
+        // ...and the bind really was emitted, or this test would prove nothing.
+        assert!(
+            out.contains("ARG:--ro-bind"),
+            "the stub bind must be present when the stub exists: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("ARG:") && l.ends_with("srun-stub.py")),
+            "the stub path must arrive as its own bare argument: {out}"
+        );
+    }
+
+    #[test]
     fn a_missing_step_pair_does_not_break_the_job() {
         // The stub is convenience, not containment: if it is absent, srun simply is not
         // brokered (and fails in the cage for want of a route, the status quo). What must
         // NOT happen is the cage failing to launch - a bwrap bind whose source is missing
         // is fatal, which is how the MUNGE mask took every job down.
         //
-        // In the test environment the derived paths genuinely do not exist, so this
-        // exercises the skip path for real rather than by simulation.
+        let _guard = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_file(derived_stub_path());
         let (code, out, _err) =
             run_guard_with_stub("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n");
         assert_eq!(code, 0, "the job must still run: {out}");
@@ -641,7 +706,7 @@ mod tests {
         );
         // args are sh_quote'd, so they appear as '--ro-bind' '/run' '/run'
         let policy_arg = line.find("'--ro-bind'").expect("policy arg on the line");
-        let mask = line.find("$_husk_mask").expect("mask on the line");
+        let mask = line.find("_husk_extra").expect("extra args on the line");
         assert!(mask > policy_arg, "mask must follow the config binds: {line}");
     }
 
