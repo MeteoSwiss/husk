@@ -6,6 +6,7 @@ mod policy;
 mod profile;
 mod protocol;
 mod sbatch;
+mod srun;
 mod session;
 mod settings;
 mod spool;

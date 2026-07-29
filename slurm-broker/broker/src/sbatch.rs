@@ -25,6 +25,12 @@ pub enum Class {
     /// Recognised but irrelevant/undesirable (mail, `--parsable`, verbosity):
     /// accepted so it isn't a hard error, and dropped (never re-emitted).
     Ignored,
+    /// Recognised and REFUSED, carrying the reason. Distinct from `Forced` (silently
+    /// dropped) because dropping an option the user meant — an `srun --task-prolog`
+    /// that never runs — changes what their job does without telling them. And
+    /// distinct from being absent from the registry, which yields only a generic
+    /// "unsupported option": these have a specific reason worth stating.
+    Rejected(&'static str),
 }
 
 /// One option's spelling(s), arity, class, and value grammar.
@@ -164,24 +170,51 @@ pub const REGISTRY: &[OptSpec] = &[
     spec!("--mail-user", "", true, Class::Ignored, always_true),
 ];
 
+/// A tool's complete option registry. The parsing machinery below is parameterised by
+/// one of these so that `sbatch` and `srun` share a SINGLE parser: two copies would be
+/// two things to keep in sync, and a gate that drifts from its twin is the same failure
+/// mode the allowlist redesign existed to remove. Only the option TABLE differs per tool.
+pub type Registry = &'static [OptSpec];
+
 /// Look up an option by any of its spellings (long / short / alias).
-pub fn lookup(name: &str) -> Option<&'static OptSpec> {
-    REGISTRY
-        .iter()
+pub fn lookup_in(reg: Registry, name: &str) -> Option<&'static OptSpec> {
+    reg.iter()
         .find(|s| s.long == name || (!s.short.is_empty() && s.short == name) || s.aliases.contains(&name))
 }
 
+/// `lookup_in` against the sbatch registry.
+pub fn lookup(name: &str) -> Option<&'static OptSpec> {
+    lookup_in(REGISTRY, name)
+}
+
+fn takes_value_in(reg: Registry, tok: &str) -> bool {
+    lookup_in(reg, tok).map(|s| s.takes_value).unwrap_or(false)
+}
+
 fn takes_value(tok: &str) -> bool {
-    lookup(tok).map(|s| s.takes_value).unwrap_or(false)
+    takes_value_in(REGISTRY, tok)
 }
 
 /// Option tokens that appear before the first positional (the script path).
 pub fn option_tokens(argv: &[String]) -> Vec<String> {
+    option_tokens_in(REGISTRY, argv)
+}
+
+/// `option_tokens` against an explicit registry.
+pub fn option_tokens_in(reg: Registry, argv: &[String]) -> Vec<String> {
+    split_options_and_rest_in(reg, argv).0
+}
+
+/// Split argv into (option region, everything after it). For sbatch the remainder is
+/// the script path + its args; for srun it is the command to run. A `--` separator ends
+/// the options and is not part of either half.
+pub fn split_options_and_rest_in(reg: Registry, argv: &[String]) -> (Vec<String>, Vec<String>) {
     let mut out = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
         if a == "--" {
+            i += 1; // consume the separator itself
             break;
         }
         if a.starts_with("--") && a.contains('=') {
@@ -189,7 +222,7 @@ pub fn option_tokens(argv: &[String]) -> Vec<String> {
             i += 1;
         } else if a.starts_with('-') && a != "-" {
             out.push(argv[i].clone());
-            if takes_value(a) && i + 1 < argv.len() {
+            if takes_value_in(reg, a) && i + 1 < argv.len() {
                 out.push(argv[i + 1].clone());
                 i += 2;
             } else {
@@ -199,7 +232,7 @@ pub fn option_tokens(argv: &[String]) -> Vec<String> {
             break; // first positional
         }
     }
-    out
+    (out, argv[i.min(argv.len())..].to_vec())
 }
 
 /// Split getopt-glued short options into (flag, value) token pairs BEFORE parsing, so
@@ -210,12 +243,17 @@ pub fn option_tokens(argv: &[String]) -> Vec<String> {
 /// through unchanged. Fixes F13 (glued `-o` defeating the forced `--output`) and F14
 /// (glued `-p` slipping past the partition gate).
 pub fn split_glued_short_opts(argv: &[String]) -> Vec<String> {
+    split_glued_short_opts_in(REGISTRY, argv)
+}
+
+/// `split_glued_short_opts` against an explicit registry.
+pub fn split_glued_short_opts_in(reg: Registry, argv: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(argv.len());
     for tok in argv {
         if tok.len() > 2 {
             if let Some(short) = tok.get(..2) {
                 let sb = short.as_bytes();
-                if sb[0] == b'-' && sb[1] != b'-' && takes_value(short) {
+                if sb[0] == b'-' && sb[1] != b'-' && takes_value_in(reg, short) {
                     out.push(short.to_string());
                     out.push(tok[2..].to_string());
                     continue;
@@ -256,6 +294,12 @@ pub fn option_value(tokens: &[String], names: &[&str]) -> Option<String> {
 /// with an invalid value is rejected. The returned tokens are the ONLY agent-influenced
 /// options that reach the real sbatch, and none of them is a raw agent token.
 pub fn interpret_cli(cli: &[String]) -> Result<Vec<String>, String> {
+    interpret_cli_in(REGISTRY, "sbatch", cli)
+}
+
+/// `interpret_cli` against an explicit registry. `tool` only names the command in the
+/// rejection message, so an srun rejection does not talk about sbatch.
+pub fn interpret_cli_in(reg: Registry, tool: &str, cli: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < cli.len() {
@@ -267,11 +311,11 @@ pub fn interpret_cli(cli: &[String]) -> Result<Vec<String>, String> {
             Some((n, v)) => (n.to_string(), Some(v.to_string())),
             None => (tok.clone(), None),
         };
-        let spec = match lookup(&name) {
+        let spec = match lookup_in(reg, &name) {
             Some(s) => s,
             None => {
                 return Err(format!(
-                    "unsupported sbatch option '{name}'. husk submits a restricted, explicit set \
+                    "unsupported {tool} option '{name}'. husk submits a restricted, explicit set \
                      of options; remove it (or ask your operator to add it to the allowlist)."
                 ))
             }
@@ -296,6 +340,12 @@ pub fn interpret_cli(cli: &[String]) -> Result<Vec<String>, String> {
             None
         };
         match spec.class {
+            Class::Rejected(why) => {
+                return Err(format!(
+                    "{tool} option '{}' is not permitted here: {why}",
+                    spec.long
+                ))
+            }
             Class::Forced | Class::Ignored => {} // dropped
             Class::Allowed => {
                 if spec.takes_value {

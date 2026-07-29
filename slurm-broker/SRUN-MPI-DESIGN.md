@@ -62,6 +62,13 @@ This mirrors the login-node sbatch pair, recursed onto the compute node:
   as with sbatch.
 
 ### What the step-broker validates (the step allowlist)
+
+> **Implemented** in `broker/src/srun.rs` (registry + `interpret`), not yet reachable from
+> the binary: `policy::decide` still rejects `tool="srun"` until the step-broker exists.
+> The parser itself is shared with `sbatch.rs` rather than copied — two option parsers
+> would be two things to keep in sync, and a gate that drifts from its twin is exactly
+> what the allowlist redesign removed.
+
 Same discipline as the sbatch `REGISTRY` — **build the srun invocation, don't forward
 agent bytes**. srun's own options are allowlisted (resource opts validated + re-emitted;
 output/error/chdir forced; unknown rejected). The genuinely dangerous srun options that
