@@ -11,6 +11,7 @@ mod srun;
 mod session;
 mod settings;
 mod spool;
+mod step;
 
 use session::Session;
 use spool::Broker;
@@ -56,11 +57,17 @@ fn main() {
     let mut once = false;
     let mut spool_arg: Option<String> = None;
     let mut poll_ms: u64 = 200;
+    // --step-broker: the compute-node half. Same binary, so one artifact to install and
+    // one thing to keep in sync; the modes share the spool protocol and nothing else.
+    let mut step_broker = false;
+    let mut workdir_arg: Option<String> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--dry-run" => dry_run = true,
+            "--step-broker" => step_broker = true,
+            "--workdir" => workdir_arg = args.next(),
             "--once" => once = true,
             "--spool" => spool_arg = args.next(),
             "--poll-ms" => {
@@ -89,6 +96,36 @@ fn main() {
     if let Err(e) = std::fs::create_dir_all(&spool) {
         eprintln!("broker: cannot create spool {spool:?}: {e}");
         std::process::exit(1);
+    }
+
+    // ---- step-broker mode: brokers srun for an ALREADY RUNNING job ----------------
+    // It needs no Session (no uenv to inherit, no partition to force — the allocation
+    // already exists) and does not submit anything; it launches steps within the job it
+    // was started by.
+    if step_broker {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let workdir = workdir_arg.unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
+        });
+        let fs_policy = settings::FsPolicy::resolve(&home, &PathBuf::from(&workdir));
+        let mut sb = step::StepBroker::new(
+            spool.clone(),
+            fs_policy,
+            profile::Profile::SingleNode,
+            workdir,
+            dry_run,
+        );
+        eprintln!("step-broker: watching {spool:?}{}", if dry_run { " (dry-run)" } else { "" });
+        loop {
+            if let Err(e) = sb.tick() {
+                eprintln!("step-broker: scan error: {e}");
+            }
+            if once {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(poll_ms));
+        }
+        return;
     }
 
     let session = Session::from_env();

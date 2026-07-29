@@ -320,14 +320,14 @@ fn run_sbatch(argv: &[String]) -> Result<u64, String> {
 /// i.e. a path component chosen by the untrusted agent. Restrict it to characters that
 /// cannot traverse or escape the spool directory: ASCII alphanumerics, '-', '_'. The
 /// stub sends a UUID, which satisfies this; anything with '/', '.', NUL, etc. is rejected.
-fn is_valid_id(id: &str) -> bool {
+pub(crate) fn is_valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// Read a spool file without following a symlink at the final component (F5).
-fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     let mut f = fs::OpenOptions::new()
         .read(true)
@@ -338,7 +338,7 @@ fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
