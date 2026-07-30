@@ -565,6 +565,28 @@ path.
 
 ---
 
+## TODO — read-only shim for the apinfo file (Christoph, 2026-07-30)
+
+The rank cage currently binds `<SlurmdSpoolDir>/mpi_cray_shasta/<job>.<step>` **read-write**,
+because Cray MPICH opens `apinfo` `O_RDWR` although it only ever reads it (gate C8/C9).
+That hands a caged rank write access to a directory inside the scheduler's own spool —
+narrow (the per-step dir is user-owned, 0700, and belongs to this job) but not nothing,
+and it is write access we never actually needed.
+
+**The shim:** copy `apinfo` to a location husk owns, bind the copy over the original path,
+and let MPICH open *that* read-write. The scheduler's spool stays read-only from inside
+every cage. This is the same move as the broker itself — don't grant the capability,
+grant a mediated stand-in — applied to a file instead of a command.
+
+The wrapper already runs before `bwrap`, so it has the right moment to do the copy.
+Two things to verify when building it:
+- that `apinfo` exists by the time the task starts (stepd writes it at step launch —
+  plausible, and C9 saw the file present, but that is not the same as guaranteed);
+- that a file-level bind over the original path satisfies MPICH's `O_RDWR` open.
+
+Not urgent: the current bind works and is bounded. Worth doing before anything relaxes
+who can reach that spool.
+
 ## Threat-model deltas (vs the current single-node cage)
 
 - **AV8 (broker bypass) recurses, not disappears.** The step-broker now runs on the
