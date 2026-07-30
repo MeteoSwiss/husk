@@ -66,8 +66,18 @@ fn v_gres(s: &str) -> bool {
 fn v_bind(s: &str) -> bool {
     bounded(s, 64, |c| c.is_ascii_alphanumeric() || "_,:.-".contains(c))
 }
+/// `--distribution` covers `block`, `cyclic`, `arbitrary`, `*`, colon-separated
+/// second/third levels, an optional `,Pack|NoPack`, and `plane=<size>` — which is why
+/// `=` is in the charset. ICON submits `--distribution=plane=4` (Balfrin 2026-07-30) and
+/// the first attempt rejected it.
+///
+/// Charset-bounded rather than an exact grammar: the value is re-emitted as
+/// `--distribution=<value>` into an ARGV element and never reaches a shell, so the job
+/// of this check is to keep whitespace and shell syntax out, not to re-implement SLURM's
+/// parser. An invalid-but-safe value is srun's to reject, with a better message than we
+/// would write.
 fn v_dist(s: &str) -> bool {
-    bounded(s, 32, |c| c.is_ascii_alphanumeric() || ",:*".contains(c))
+    bounded(s, 40, |c| c.is_ascii_alphanumeric() || ",:*=".contains(c))
 }
 /// `--hint` is a closed set of four keywords; an exact enum beats any charset.
 fn v_hint(s: &str) -> bool {
@@ -285,6 +295,26 @@ mod tests {
         ] {
             let err = interpret(&argv).expect_err("must be rejected");
             assert!(err.contains("unsupported srun option"), "{argv:?} -> {err}");
+        }
+    }
+
+    #[test]
+    fn accepts_icons_real_distribution_value() {
+        // The first option ICON's runscript tripped on (Balfrin 2026-07-30):
+        //   srun -n 4 --ntasks-per-node 4 --threads-per-core=1 --distribution=plane=4 ...
+        let st = interpret(&v(&[
+            "-n", "4", "--ntasks-per-node", "4", "--threads-per-core=1",
+            "--distribution=plane=4", "/path/wrapper.sh", "/path/icon",
+        ]))
+        .expect("ICON's real srun line must be accepted");
+        assert!(st.options.contains(&"--distribution=plane=4".to_string()), "{:?}", st.options);
+        assert_eq!(st.command, v(&["/path/wrapper.sh", "/path/icon"]));
+    }
+
+    #[test]
+    fn distribution_still_refuses_shell_syntax() {
+        for bad in ["plane=4;id", "block cyclic", "plane=$(id)"] {
+            assert!(interpret(&v(&[&format!("--distribution={bad}"), "./a"])).is_err(), "{bad}");
         }
     }
 

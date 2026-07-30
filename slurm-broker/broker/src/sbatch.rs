@@ -66,7 +66,17 @@ fn v_array(s: &str) -> bool { bounded(s, 64, |c| c.is_ascii_digit() || "-,:%".co
 fn v_dep(s: &str) -> bool { bounded(s, 128, |c| c.is_ascii_alphanumeric() || "_,:.+?-".contains(c)) }
 fn v_expr(s: &str) -> bool { bounded(s, 256, |c| c.is_ascii_alphanumeric() || "_,&|()!*.-".contains(c)) }
 fn v_signal(s: &str) -> bool { bounded(s, 24, |c| c.is_ascii_alphanumeric() || ":@".contains(c)) }
-fn v_dist(s: &str) -> bool { bounded(s, 32, |c| c.is_ascii_alphanumeric() || ",:*".contains(c)) }
+/// `--distribution` covers `block`, `cyclic`, `arbitrary`, `*`, colon-separated
+/// second/third levels, an optional `,Pack|NoPack`, and `plane=<size>` — which is why
+/// `=` is in the charset. ICON submits `--distribution=plane=4` (Balfrin 2026-07-30) and
+/// the first attempt rejected it.
+///
+/// Charset-bounded rather than an exact grammar: the value is re-emitted as
+/// `--distribution=<value>` into an ARGV element and never reaches a shell, so the job
+/// of this check is to keep whitespace and shell syntax out, not to re-implement SLURM's
+/// parser. An invalid-but-safe value is srun's to reject, with a better message than we
+/// would write.
+fn v_dist(s: &str) -> bool { bounded(s, 40, |c| c.is_ascii_alphanumeric() || ",:*=".contains(c)) }
 fn v_comment(s: &str) -> bool { bounded(s, 256, |c| c.is_ascii_alphanumeric() || " _.,:@/+-".contains(c)) }
 fn v_switches(s: &str) -> bool { bounded(s, 24, |c| c.is_ascii_digit() || "@:-".contains(c)) }
 /// `--hint` takes one of four fixed keywords — an exact enum is tighter than any charset,
