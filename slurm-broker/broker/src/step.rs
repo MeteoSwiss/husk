@@ -60,6 +60,9 @@ pub struct StepBroker {
     /// from a request.
     pub workdir: String,
     slurmd_spool: String,
+    /// Our own environment, captured at startup. The ranks inherit it via srun, so it is
+    /// the baseline against which a job script's changes are measured.
+    base_env: std::collections::BTreeMap<String, String>,
     in_flight: Vec<Running>,
 }
 
@@ -80,6 +83,7 @@ impl StepBroker {
             dry_run,
             workdir,
             slurmd_spool,
+            base_env: std::env::vars().collect(),
             in_flight: Vec::new(),
         }
     }
@@ -206,9 +210,20 @@ impl StepBroker {
         argv.push(self.workdir.clone());
         argv.extend(step.options);
         argv.push("--".to_string());
+        // The rank cage, plus the job script's own environment as `--setenv` pairs.
+        // A brokered srun otherwise breaks the chain by which a run script's `export`
+        // reaches its ranks — the script runs inside the cage, the real srun outside it —
+        // and `export OMP_NUM_THREADS=4; srun ./icon` would silently run with different
+        // settings than it asked for. See rank::setenv_args for why these go through
+        // bwrap rather than into srun's own environment.
+        let mut cage = self.fs_policy.rank_bwrap_args(&self.workdir);
+        // Only the DELTA against our own environment: srun propagates that to the tasks
+        // already, so forwarding everything would re-set hundreds of identical values and
+        // bury the handful the run script actually changed.
+        cage.extend(rank::env_args(&req.env, &self.base_env, &self.fs_policy.unset_env));
         argv.extend(rank::wrap_command(
             self.profile,
-            &self.fs_policy.rank_bwrap_args(&self.workdir),
+            &cage,
             &self.slurmd_spool,
             &step.command,
         ));

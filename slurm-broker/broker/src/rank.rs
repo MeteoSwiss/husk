@@ -24,6 +24,102 @@
 use crate::profile::Profile;
 use crate::settings::sh_quote;
 
+/// Scheduler- and PMI-owned name prefixes. These are INPUTS TO srun's own option
+/// handling and to the MPI bootstrap, so letting the caged side set them is the same
+/// mistake as forwarding raw option bytes into a second parser: `SLURM_NTASKS` would
+/// contradict the validated `--ntasks`, `SLURM_EXPORT_ENV` would redirect propagation,
+/// and `PMI_*`/`PALS_*` steer the wire-up whose apinfo path the cage binds.
+/// `HUSK_` is ours for the same reason: `HUSK_STEP_SPOOL` tells a stub where to send
+/// requests, so letting the caged side set it would let a rank redirect its own
+/// brokering. Our control plane is no more forwardable than the scheduler's.
+const RESERVED_ENV_PREFIXES: &[&str] =
+    &["SLURM_", "SBATCH_", "PMI_", "PMIX_", "PALS_", "HUSK_"];
+
+/// Upper bound on forwarded variables. The spool is agent-writable, so an enormous
+/// environment would otherwise become an enormous command line in the trusted process.
+const MAX_FORWARDED_ENV: usize = 512;
+
+/// A POSIX environment variable name. Enforced rather than assumed because these names
+/// become ARGUMENTS to bwrap: a name like `--bind` or `-i` would be read as an option by
+/// whatever parses them next. Restricting to the portable charset makes an option-shaped
+/// name unrepresentable instead of merely unlikely.
+fn is_valid_env_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 128
+        && n.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Turn the job script's environment into cage arguments — but only the DELTA against
+/// the environment the ranks already inherit.
+///
+/// **Why a delta.** `srun` propagates its own environment to the tasks, and the
+/// step-broker's environment is the job's, so the ranks already have almost everything.
+/// Forwarding the lot re-sets hundreds of identical values, buries the meaningful ones,
+/// and puts an enormous command line through the trusted process. What a run script
+/// actually needs carried across is what it CHANGED:
+/// ```text
+/// export OMP_NUM_THREADS=4
+/// srun ./solver          # <- this, and nothing else
+/// ```
+/// So: added or modified names become `--setenv`, and names the script removed become
+/// `--unsetenv`. Both directions, because a half-carried environment differs silently
+/// from what the script asked for, which is the failure mode this exists to remove.
+///
+/// **Why through bwrap rather than srun's environment.** A brokered `srun` breaks the
+/// chain by which a run script's `export` reaches its ranks: the script runs inside the
+/// cage, the real `srun` outside it. Handing these to `srun` would fix that and open an
+/// escape — the rank wrapper's first process is a dynamically linked `/bin/sh` running as
+/// the user BEFORE any cage exists, so an `LD_PRELOAD` in that environment would execute
+/// arbitrary code with `/users` fully visible. (`seccomp-wrapper` is statically linked and
+/// immune; `sh` and `bwrap` are not.) bwrap applies `--setenv` to the process it launches
+/// INSIDE the sandbox, so the pre-cage chain never sees these values. `LD_PRELOAD` then
+/// reaches only the caged command, where it buys nothing — a rank can already run whatever
+/// it likes in its own cage. Structural, not a denylist of loader names.
+///
+/// `deny` is the configured credential list (`sandbox.credentials.envVars`), which the
+/// cage masks with `--unsetenv`. bwrap applies arguments IN ORDER, so re-setting one of
+/// those here would silently undo the masking — hence they are dropped outright.
+pub fn env_args(
+    job_env: &std::collections::BTreeMap<String, String>,
+    base_env: &std::collections::BTreeMap<String, String>,
+    deny: &[String],
+) -> Vec<String> {
+    let forwardable = |k: &String| {
+        is_valid_env_name(k)
+            && !RESERVED_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+            && !deny.iter().any(|d| d == k)
+    };
+
+    let mut out = Vec::new();
+    let mut n = 0;
+    // Added or changed by the job script.
+    for (k, v) in job_env {
+        if !forwardable(k) || base_env.get(k) == Some(v) {
+            continue;
+        }
+        if n >= MAX_FORWARDED_ENV {
+            eprintln!(
+                "step-broker: job changed more than {MAX_FORWARDED_ENV} environment \
+                 variables; the rest are not carried into the step"
+            );
+            break;
+        }
+        out.push("--setenv".to_string());
+        out.push(k.clone());
+        out.push(v.clone());
+        n += 1;
+    }
+    // Removed by the job script. `unset FOO; srun ...` must not leave FOO set.
+    for k in base_env.keys() {
+        if forwardable(k) && !job_env.contains_key(k) {
+            out.push("--unsetenv".to_string());
+            out.push(k.clone());
+        }
+    }
+    out
+}
+
 /// Build the argv that follows srun's options: `sh -c <script> husk-rank <command...>`.
 ///
 /// `spool_dir` is Slurm's `SlurmdSpoolDir` as resolved by the step-broker (trusted);
@@ -84,6 +180,105 @@ mod tests {
     fn built(command: &[&str]) -> Vec<String> {
         let rank = FsPolicy::default().rank_bwrap_args("/work");
         wrap_command(Profile::SingleNode, &rank, "/var/spool/slurmd", &v(command))
+    }
+
+    fn envmap(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn forwards_the_job_scripts_variables_into_the_cage() {
+        let base = envmap(&[("PATH", "/bin"), ("HOME", "/home/u")]);
+        let job = envmap(&[("PATH", "/bin"), ("HOME", "/home/u"),
+                           ("OMP_NUM_THREADS", "4"), ("MPICH_GPU_SUPPORT_ENABLED", "1")]);
+        let args = env_args(&job, &base, &[]);
+        assert!(!args.contains(&"PATH".to_string()), "unchanged vars must not be re-set: {args:?}");
+        assert!(args.windows(3).any(|w| w == ["--setenv", "OMP_NUM_THREADS", "4"]), "{args:?}");
+        assert!(args.windows(3).any(|w| w == ["--setenv", "MPICH_GPU_SUPPORT_ENABLED", "1"]), "{args:?}");
+    }
+
+    #[test]
+    fn a_variable_the_script_removed_is_unset_in_the_step() {
+        // `unset MPICH_FOO; srun ...` must not leave it set: a half-carried environment
+        // differs silently from what the script asked for.
+        let base = envmap(&[("MPICH_FOO", "1"), ("PATH", "/bin")]);
+        let job = envmap(&[("PATH", "/bin")]);
+        let args = env_args(&job, &base, &[]);
+        assert_eq!(args, vec!["--unsetenv", "MPICH_FOO"], "{args:?}");
+    }
+
+    #[test]
+    fn scheduler_owned_names_are_never_forwarded() {
+        // These steer srun's own option handling and the PMI bootstrap. Letting the
+        // caged side set them is the same mistake as forwarding raw option bytes into a
+        // second parser: SLURM_NTASKS would contradict the validated --ntasks.
+        let args = env_args(
+            &envmap(&[
+                ("SLURM_NTASKS", "99"),
+                ("SLURM_EXPORT_ENV", "ALL"),
+                ("SBATCH_PARTITION", "other"),
+                ("PMI_RANK", "7"),
+                ("PMIX_NAMESPACE", "x"),
+                ("PALS_APINFO", "/tmp/evil"),
+                ("HUSK_STEP_SPOOL", "/tmp/evil-spool"),
+                ("KEEPME", "yes"),
+            ]),
+            &envmap(&[]),
+            &[],
+        );
+        assert!(!args.iter().any(|a| a.starts_with("SLURM_")), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("SBATCH_")), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("PMI")), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("PALS_")), "{args:?}");
+        assert!(!args.iter().any(|a| a.starts_with("HUSK_")),
+                "a rank must not be able to redirect its own brokering: {args:?}");
+        assert!(args.contains(&"KEEPME".to_string()), "benign vars still pass: {args:?}");
+    }
+
+    #[test]
+    fn a_forwarded_variable_cannot_undo_credential_masking() {
+        // The cage masks configured credentials with --unsetenv, and bwrap applies
+        // arguments IN ORDER — so re-setting one here would silently re-expose it.
+        let args = env_args(&envmap(&[("AWS_SECRET_ACCESS_KEY", "sk-leaked"), ("PATH", "/bin")]),
+                            &envmap(&[]), &["AWS_SECRET_ACCESS_KEY".to_string()]);
+        assert!(!args.iter().any(|a| a.contains("sk-leaked")), "{args:?}");
+        assert!(args.contains(&"PATH".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn option_shaped_and_malformed_names_are_dropped() {
+        // Names become ARGUMENTS to bwrap, so one that looks like an option would be
+        // read as one by whatever parses them next.
+        let args = env_args(
+            &envmap(&[("--bind", "/etc"), ("-i", "x"), ("a b", "x"), ("1FIRST", "x"),
+                      ("HAS=EQUALS", "x"), ("", "x"), ("GOOD_1", "ok")]),
+            &envmap(&[]),
+            &[],
+        );
+        assert_eq!(args, vec!["--setenv", "GOOD_1", "ok"], "only a portable name survives: {args:?}");
+    }
+
+    #[test]
+    fn ld_preload_reaches_only_the_caged_command() {
+        // THE POINT OF THE DESIGN. The rank wrapper's first process is a dynamically
+        // linked /bin/sh running BEFORE any cage exists; an LD_PRELOAD in ITS environment
+        // would run arbitrary code as the user with /users visible. Via bwrap --setenv the
+        // value is applied to the sandboxed process instead, where it buys nothing.
+        let cage = {
+            let mut c = FsPolicy::default().rank_bwrap_args("/work");
+            c.extend(env_args(&envmap(&[("LD_PRELOAD", "/tmp/evil.so")]), &envmap(&[]), &[]));
+            c
+        };
+        let argv = wrap_command(Profile::SingleNode, &cage, "/var/spool/slurmd", &v(&["./a.out"]));
+        let script = &argv[2];
+        // It must arrive as a --setenv pair, i.e. consumed by bwrap...
+        assert!(script.contains("'--setenv' 'LD_PRELOAD' '/tmp/evil.so'"), "{script}");
+        // ...and the pre-cage part of the script must not export it.
+        let before_bwrap = script.split("exec seccomp-wrapper").next().unwrap();
+        assert!(
+            !before_bwrap.contains("LD_PRELOAD"),
+            "nothing may set LD_PRELOAD before the cage: {before_bwrap}"
+        );
     }
 
     #[test]

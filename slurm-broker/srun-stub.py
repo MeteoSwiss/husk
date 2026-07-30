@@ -99,9 +99,20 @@ def main():
         # wraps it rather than inspecting it.
         "script": {"source": "none", "name": None, "body": ""},
         "job_args": [],
-        # The step-broker runs srun in the JOB's environment, which it already has;
-        # sending ours would let the caged side influence it.
-        "env": {},
+        # The job script's environment. A run script that does
+        #     export OMP_NUM_THREADS=4
+        #     srun ./solver
+        # expects its ranks to see that, and uncaged srun would propagate it — but here
+        # the script runs inside the cage while the real srun runs outside it, so the
+        # chain is broken unless we carry it across explicitly.
+        #
+        # This is NOT handed to srun. The broker filters it (scheduler-owned names,
+        # configured credentials, anything that is not a portable variable name) and
+        # applies the rest with bwrap's --setenv, i.e. INSIDE the rank cage. That
+        # matters: the rank wrapper's first process is a dynamically linked /bin/sh
+        # running before any cage exists, so an LD_PRELOAD reaching it would be an
+        # escape. Via --setenv it can only ever affect the caged command.
+        "env": dict(os.environ),
     }
 
     req_path = os.path.join(spool, f"req-{req_id}.json")
