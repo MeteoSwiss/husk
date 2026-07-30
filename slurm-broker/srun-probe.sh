@@ -52,10 +52,18 @@ fi
 # 3) An option that runs code outside the per-task wrap must be REFUSED, with a
 # reason. This is the step allowlist doing its job; a silent success here would
 # mean a job can escape the rank cage.
-if srun --task-prolog=/tmp/nope -n1 true 2>/dev/null; then
+# Check the MESSAGE, not just the exit status. The real srun ACCEPTS --task-prolog and
+# then fails because the prolog does not exist — a status-only check reports "refused"
+# for that too, so it would pass with no husk in the path at all. (Balfrin 2026-07-30:
+# an uncaged control run printed [expect] here, which is what caught it.) Husk's
+# rejection is identifiable: the step allowlist says "not permitted here".
+if deny_out=$(srun --task-prolog=/tmp/nope -n1 true 2>&1); then
   echo "deny : --task-prolog ACCEPTED — the step allowlist is not being applied!"
+elif printf '%s' "$deny_out" | grep -q "not permitted here"; then
+  echo "deny : --task-prolog refused by the step allowlist [expect]"
 else
-  echo "deny : --task-prolog refused [expect]"
+  echo "deny : --task-prolog failed, but NOT via husk — so this is the real srun and the"
+  echo "       stub is not bound. First line: $(printf '%s' "$deny_out" | head -1)"
 fi
 
 # 4) Concurrency. CAREFUL WHAT THIS MEASURES. Two plain `srun` steps serialise even

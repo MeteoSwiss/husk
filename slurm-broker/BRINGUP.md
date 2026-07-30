@@ -148,8 +148,12 @@ sbatch --partition=<site partition> srun-probe.sh
 **Pass** — four lines in the job output:
 - `step : OK` — the pair worked end to end;
 - `cage : homes hidden inside the step` — the rank is sandboxed too, not merely launched;
-- `deny : --task-prolog refused` — the step allowlist is being applied (that option runs
-  code *outside* the per-task wrap, which is the one thing the wrap exists to prevent);
+- `deny : --task-prolog refused by the step allowlist` — the allowlist is being applied
+  (that option runs code *outside* the per-task wrap, which is the one thing the wrap
+  exists to prevent). The check matches husk's *message*, not merely a non-zero exit:
+  the real `srun` accepts `--task-prolog` and then fails because the prolog is missing,
+  so a status-only check passes with no husk in the path at all. A third branch says
+  "real srun detected — stub NOT bound" when that happens;
 - `conc : ~3s for 2x 3s overlapping steps` — the broker runs steps concurrently.
   **Read this one carefully**: two *plain* `srun` steps serialise even with no husk in
   the path, because without `--overlap` a step claims the allocation's CPUs exclusively
