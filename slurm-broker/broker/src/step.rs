@@ -30,7 +30,7 @@
 use crate::profile::Profile;
 use crate::protocol::{Request, Response};
 use crate::rank;
-use crate::settings::FsPolicy;
+use crate::settings::{self, FsPolicy};
 use crate::spool::{is_valid_id, read_nofollow, write_atomic};
 use crate::srun;
 use std::fs;
@@ -205,9 +205,32 @@ impl StepBroker {
 
         // Build the real invocation: forced options, then the validated ones, then the
         // per-task wrapper that cages whatever the command turns out to be.
+        // Run the ranks where the CALLER was, not where the job started. A run script
+        // almost always `cd`s into its case directory before launching:
+        //     cd $RUNDIR && srun ./icon
+        // and ICON then opens `icon_master.namelist` relative to that. Forcing the
+        // job's start directory instead sent the ranks somewhere else entirely
+        // (Balfrin 2026-07-31: `open_nml: Could not open icon_master.namelist`).
+        //
+        // `req.cwd` is agent-controlled, so it gets the same check the sbatch path
+        // applies to its workdir: absolute, no traversal, not `/`, not under a hidden
+        // home. The cage's WRITABLE root is unchanged — this only decides where the
+        // ranks start, so honouring it cannot widen what they may write.
+        let cwd = if settings::is_workdir_allowed(&req.cwd) {
+            req.cwd.clone()
+        } else {
+            let msg = format!(
+                "the step's working directory {:?} is not allowed (it must be an absolute \
+                 path, not '/', and not under a hidden home like /users)",
+                req.cwd
+            );
+            write_response(&self.spool, &id, &Response::rejected(&id, msg));
+            return;
+        };
+
         let mut argv = vec!["srun".to_string()];
         argv.push("--chdir".to_string());
-        argv.push(self.workdir.clone());
+        argv.push(cwd);
         argv.extend(step.options);
         argv.push("--".to_string());
         // The rank cage, plus the job script's own environment as `--setenv` pairs.
@@ -304,4 +327,23 @@ fn resolve_slurmd_spool() -> String {
          assuming {DEFAULT_SLURMD_SPOOL}"
     );
     DEFAULT_SLURMD_SPOOL.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::settings;
+
+    #[test]
+    fn a_steps_working_directory_gets_the_same_check_as_a_jobs() {
+        // The step runs where the CALLER was — a run script cds into its case directory
+        // before launching — so req.cwd is honoured rather than overridden. It is
+        // agent-controlled, so it passes the same gate the sbatch path uses.
+        assert!(settings::is_workdir_allowed("/scratch/proj/run"));
+        for bad in ["/", "relative/path", "/users/victim", "/scratch/../users/x", ""] {
+            assert!(
+                !settings::is_workdir_allowed(bad),
+                "{bad:?} must not be accepted as a step working directory"
+            );
+        }
+    }
 }
