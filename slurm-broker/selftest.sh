@@ -452,10 +452,22 @@ run_live_probe() {
   if ! grep -q 'HUSK-PROBE-END' "$out"; then
     check FAIL containment "$reqid.output" "job output has no probe end-marker (cage may have failed to launch)$hint — see $out"
     # Carry the actual error into the report. When the cage fails to launch, the reason
-    # (e.g. `bwrap: Can't mkdir ...`) is in the job output and NOWHERE else — a report
-    # that only names a path on a remote machine costs a round-trip to diagnose.
-    echo "  --- first 15 lines of $out ---"
-    sed -n '1,15p' "$out" 2>/dev/null | sed 's/^/  | /'
+    # is in the job's output and NOWHERE else — a report that only names a path on a
+    # remote machine costs a round-trip to diagnose.
+    #
+    # BOTH streams. The broker forces --output AND --error, so a guard failure (a stale
+    # seccomp-wrapper, a bwrap bind error) lands in .err while .out stays empty — which
+    # made two consecutive bring-up runs report "no output" and explain nothing.
+    # Existence and size are printed too: `sed` on a missing file prints nothing, which
+    # is indistinguishable from an empty one.
+    for stream in "$out" "${out%.out}.err"; do
+      if [ -f "$stream" ]; then
+        echo "  --- $stream ($(wc -c <"$stream" 2>/dev/null) bytes) ---"
+        sed -n '1,15p' "$stream" 2>/dev/null | sed 's/^/  | /'
+      else
+        echo "  --- $stream: NO SUCH FILE (the job never started, or wrote elsewhere) ---"
+      fi
+    done
     echo "  --- end ---"
   fi
 }
