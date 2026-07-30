@@ -14,7 +14,7 @@
 # No #SBATCH --partition (site-specific, and the broker forces it) and no #SBATCH
 # --nodes (the cage profile forces --nodes=1; asking for more is rejected by design).
 #
-#SBATCH --ntasks=1
+#SBATCH --ntasks=2
 #SBATCH --time=00:05:00
 #SBATCH --job-name=husk-srun-probe
 set -u
@@ -58,17 +58,34 @@ else
   echo "deny : --task-prolog refused [expect]"
 fi
 
-# 4) Concurrency: steps must overlap, or a job that launches several at once
-# deadlocks. Two 3s steps started together should finish in ~3s, not ~6s.
+# 4) Concurrency. CAREFUL WHAT THIS MEASURES. Two plain `srun` steps serialise even
+# with NO husk in the path: without --overlap a step takes exclusive claim on the
+# allocation's CPUs, so the second waits for resources. That is SLURM's accounting, not
+# the broker's. (Balfrin 2026-07-30: an UNCAGED run of this probe serialised too, which
+# is what caught the earlier version of this check blaming the broker.)
+#
+# So ask the question that is actually about husk: with --overlap and enough tasks
+# allocated, do steps run at the same time? If THAT serialises, the step-broker is the
+# suspect. The job requests --ntasks=2 so there is room for two.
 t0=$SECONDS
-srun -n1 sleep 3 & p1=$!
-srun -n1 sleep 3 & p2=$!
+srun --overlap -n1 sleep 3 & p1=$!
+srun --overlap -n1 sleep 3 & p2=$!
 wait "$p1" "$p2" 2>/dev/null
 el=$(( SECONDS - t0 ))
 if [ "$el" -lt 5 ]; then
-  echo "conc : ${el}s for 2x 3s steps — steps overlap [expect]"
+  echo "conc : ${el}s for 2x 3s overlapping steps — the broker runs steps concurrently [expect]"
 else
-  echo "conc : ${el}s for 2x 3s steps — steps SERIALISED (a long step will block others)"
+  echo "conc : ${el}s for 2x 3s OVERLAPPING steps — steps serialised even with --overlap."
+  echo "       That points at the step-broker (it spawns and polls, so it should not"
+  echo "       block); see .husk-step-spool-*/step-broker.log."
 fi
+
+# 4b) For contrast, the same thing WITHOUT --overlap. Serialising here is normal and
+# expected — it is recorded so the two numbers are never confused again.
+t0=$SECONDS
+srun -n1 sleep 3 & p3=$!
+srun -n1 sleep 3 & p4=$!
+wait "$p3" "$p4" 2>/dev/null
+echo "conc-: $(( SECONDS - t0 ))s for the same steps WITHOUT --overlap (serialising here is SLURM, not husk)"
 
 echo "done."

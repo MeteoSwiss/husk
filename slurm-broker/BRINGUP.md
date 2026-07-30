@@ -150,7 +150,12 @@ sbatch --partition=<site partition> srun-probe.sh
 - `cage : homes hidden inside the step` — the rank is sandboxed too, not merely launched;
 - `deny : --task-prolog refused` — the step allowlist is being applied (that option runs
   code *outside* the per-task wrap, which is the one thing the wrap exists to prevent);
-- `conc : ~3s for 2x 3s steps` — steps overlap rather than serialising.
+- `conc : ~3s for 2x 3s overlapping steps` — the broker runs steps concurrently.
+  **Read this one carefully**: two *plain* `srun` steps serialise even with no husk in
+  the path, because without `--overlap` a step claims the allocation's CPUs exclusively
+  and the second waits. That is SLURM's accounting. The check therefore uses `--overlap`
+  with `--ntasks=2`, and prints the non-overlap timing on a separate `conc-:` line for
+  contrast. Only serialisation *with* `--overlap` implicates the step-broker.
 
 **On failure**, in order of what to read:
 1. the job's `.err` file, not just `.out` — a guard-level failure (a stale
