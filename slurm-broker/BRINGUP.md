@@ -154,6 +154,11 @@ sbatch --partition=<site partition> srun-probe.sh
   the real `srun` accepts `--task-prolog` and then fails because the prolog is missing,
   so a status-only check passes with no husk in the path at all. A third branch says
   "real srun detected — stub NOT bound" when that happens;
+- `rank2 : OK — 2 ranks in ONE step` — the actual MPI shape, not merely several
+  separate steps: slurmstepd launches N tasks and each lands in its own rank cage;
+- `shm : rank 1 read what rank 0 wrote` — the ranks SHARE `/dev/shm`. This is the one
+  thing the rank cage does specially; a per-task tmpfs would give each rank an empty
+  shared-memory namespace and hang same-node MPI;
 - `conc : ~3s for 2x 3s overlapping steps` — the broker runs steps concurrently.
   **Read this one carefully**: two *plain* `srun` steps serialise even with no husk in
   the path, because without `--overlap` a step claims the allocation's CPUs exclusively

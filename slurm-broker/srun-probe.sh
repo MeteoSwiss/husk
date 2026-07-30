@@ -66,6 +66,36 @@ else
   echo "       stub is not bound. First line: $(printf '%s' "$deny_out" | head -1)"
 fi
 
+# 3b) MULTI-RANK IN ONE STEP — the actual MPI shape, as opposed to several separate
+# steps. slurmstepd launches N tasks, each of which must land inside its own rank cage.
+if multi=$(srun -n2 hostname 2>&1); then
+  n=$(printf '%s\n' "$multi" | grep -c .)
+  if [ "$n" -eq 2 ]; then
+    echo "rank2: OK — 2 ranks in ONE step, both launched ($(printf '%s' "$multi" | tr '\n' ' '))"
+  else
+    echo "rank2: got $n line(s) from srun -n2, expected 2: $(printf '%s' "$multi" | tr '\n' ' ')"
+  fi
+else
+  echo "rank2: FAILED — srun -n2 did not run: $(printf '%s' "$multi" | head -2 | tr '\n' ' ')"
+fi
+
+# 3c) ...and those ranks must SHARE memory. This is the one thing the rank cage does
+# specially: a per-task `--tmpfs /dev/shm` would give every rank its own empty shared
+# memory namespace, which HANGS same-node MPI (probe runs 8-9, with and without the
+# netns). So rank 0 writes into /dev/shm and rank 1 must be able to read it.
+SHM_SCRIPT='f=/dev/shm/husk-shm-probe-$SLURM_JOB_ID
+if [ "${SLURM_PROCID:-0}" = 0 ]; then echo SHARED > "$f"; sleep 3
+else sleep 1; cat "$f" 2>&1 || echo MISSING; fi'
+if shm=$(srun -n2 sh -c "$SHM_SCRIPT" 2>&1); then
+  if printf '%s' "$shm" | grep -q SHARED; then
+    echo "shm  : OK — rank 1 read what rank 0 wrote to /dev/shm [expect]"
+  else
+    echo "shm  : ranks do NOT share /dev/shm — same-node MPI will hang. Saw: $(printf '%s' "$shm" | tr '\n' ' ' | head -c 120)"
+  fi
+else
+  echo "shm  : could not run the shared-memory check: $(printf '%s' "$shm" | head -2 | tr '\n' ' ')"
+fi
+
 # 4) Concurrency. CAREFUL WHAT THIS MEASURES. Two plain `srun` steps serialise even
 # with NO husk in the path: without --overlap a step takes exclusive claim on the
 # allocation's CPUs, so the second waits for resources. That is SLURM's accounting, not
