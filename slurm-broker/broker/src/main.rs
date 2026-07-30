@@ -23,6 +23,27 @@ use std::time::Duration;
 // never linger as an orphan watching a dead spool. (Zero-dep: one libc symbol.)
 const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
 const SIGTERM: std::os::raw::c_ulong = 15;
+
+/// `prctl(PR_SET_DUMPABLE, 0)` — refuse to be a ptrace/CMA target.
+///
+/// The broker is the one process in reach of a caged job that deliberately holds what the
+/// cage removes: MUNGE, the daemon route, the real sbatch/srun. Everything on a compute
+/// node runs as the SAME UID, and the kernel gates `process_vm_readv`/`process_vm_writev`
+/// with the ptrace-attach check — so same-uid is normally enough to read another
+/// process's memory. Yama's `ptrace_scope` would narrow that to descendants, but Balfrin
+/// has no Yama at all (verified 2026-07-31), leaving credentials as the only gate.
+///
+/// Clearing the dumpable flag makes the kernel demand CAP_SYS_PTRACE instead, which an
+/// unprivileged caged rank cannot have. So the broker stops being addressable even if
+/// CMA is later allowed for MPI — which is exactly the concession being considered, since
+/// Cray MPICH needs `process_vm_readv` for intra-node transfers.
+///
+/// Consistent rather than new policy: `ptrace` is already in seccomp-wrapper's deny-list.
+/// This closes the same door from the other side, for the process that matters most.
+///
+/// Costs: no core dumps from the broker, and its `/proc/<pid>` entries become root-owned,
+/// so `ls /proc/<pid>/fd` on it stops working for the user. Both acceptable for a daemon.
+const PR_SET_DUMPABLE: std::os::raw::c_int = 4;
 extern "C" {
     fn prctl(
         option: std::os::raw::c_int,
@@ -31,6 +52,17 @@ extern "C" {
         arg4: std::os::raw::c_ulong,
         arg5: std::os::raw::c_ulong,
     ) -> std::os::raw::c_int;
+}
+
+/// Make this process unreadable to same-uid processes (see PR_SET_DUMPABLE).
+fn refuse_to_be_read() {
+    // SAFETY: PR_SET_DUMPABLE with a constant; the remaining args are ignored.
+    if unsafe { prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        // Not fatal: it is a hardening measure, not the boundary. Say so rather than
+        // failing a submission over it — but say it, so a kernel that refuses is visible.
+        eprintln!("broker: warning: could not clear the dumpable flag; this process is \
+                   readable by same-uid processes (process_vm_readv/ptrace)");
+    }
 }
 
 fn die_with_parent() {
@@ -52,6 +84,7 @@ extern "C" {
 
 fn main() {
     die_with_parent();
+    refuse_to_be_read();
 
     let mut dry_run = false;
     let mut once = false;
