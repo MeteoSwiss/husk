@@ -6,10 +6,15 @@
 # poor record, so this runs the same tiny cuInit program through each layer separately
 # and reports which one it stops working in.
 #
-# HOW TO RUN — in your OWN allocation on a GPU node, OUTSIDE husk:
+# HOW TO RUN — ON A COMPUTE NODE, in your own allocation, OUTSIDE husk:
 #     salloc -N1 -n1 -p <partition> [-A <acct>] --gres=gpu:1
 #     <activate the ICON uenv, so a CUDA toolchain is on PATH>
-#     slurm-broker/cuda-probe.sh
+#     srun -n1 slurm-broker/cuda-probe.sh        # <- note the srun
+#
+# `salloc` on Alps HOLDS the nodes but leaves your shell on the LOGIN node, which has no
+# GPU. Running the probe straight from that shell reports CUDA_ERROR_NO_DEVICE for
+# everything and looks like husk broke CUDA. Use `srun` (or `srun --pty bash` first, or
+# sbatch) so it actually executes where the GPUs are.
 #
 # SAFE: compiles one throwaway binary in a tempdir and calls cuInit. Touches nothing else.
 set -uo pipefail
@@ -28,11 +33,15 @@ trap 'rm -rf "$WORK"' EXIT
 # lines of noise. Refuse instead.
 if ! ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
   printf '%s\n' \
-    "cuda-probe: no /dev/nvidia* on $(hostname) — this is not a GPU node." \
+    "cuda-probe: no /dev/nvidia* on $(hostname) — this shell is not on a GPU node." \
     "  Every check would fail with CUDA_ERROR_NO_DEVICE and tell you nothing about husk." \
-    "  Get an allocation first, e.g.:" \
-    "    salloc -N1 -n1 -p <partition> [-A <acct>] --gres=gpu:1" \
-    "  then run this from the compute node (srun --pty bash, or via sbatch)." >&2
+    "" \
+    "  NOTE: holding an allocation is not the same as running on it. \`salloc\` on Alps" \
+    "  leaves your shell on the LOGIN node; the compute nodes are reserved but idle." \
+    "  From inside your existing allocation, either of these works:" \
+    "    srun -n1 $0" \
+    "    srun --pty bash    # then re-run this" \
+    "  or submit it: sbatch -n1 --gres=gpu:1 -p <partition> $0" >&2
   exit 2
 fi
 
