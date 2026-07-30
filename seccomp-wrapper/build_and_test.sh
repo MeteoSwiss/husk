@@ -226,7 +226,7 @@ fi
 
 # ── install binary ────────────────────────────────────────────────────────────
 
-log "Installing seccomp-wrapper"
+log "Staging seccomp-wrapper into the source tree (NOT deployed yet)"
 cp "${BUILD_DIR}/seccomp-wrapper" "${SCRIPT_DIR}/seccomp-wrapper"
 ok "seccomp-wrapper → ${SCRIPT_DIR}/seccomp-wrapper"
 
@@ -234,5 +234,14 @@ ok "seccomp-wrapper → ${SCRIPT_DIR}/seccomp-wrapper"
 ARCH="$(uname -m)"
 cp "${SCRIPT_DIR}/seccomp-wrapper" "${SCRIPT_DIR}/seccomp-wrapper-${ARCH}"
 ok "seccomp-wrapper-${ARCH} → ${SCRIPT_DIR}/seccomp-wrapper-${ARCH}"
+
+printf '\n'
+printf '%s\n' \
+  "NOT YET DEPLOYED. This only refreshed the binaries in the source tree." \
+  "To put them where husk actually runs from:" \
+  "    ./install-husk.sh" \
+  "which copies the wrapper to ~/.local/bin and checks it understands --profile." \
+  "Skipping that step leaves the cluster running the PREVIOUS build, which is" \
+  "indistinguishable from a code change having no effect (Balfrin, 2026-07-30)."
 
 # trap EXIT fires here — cleanup() removes .build/ and test binaries
