@@ -2,10 +2,10 @@
 
 **Status: CHAPTER 1 COMPLETE — ICON ran to completion inside husk on Balfrin
 (2026-07-31): single node, 4 MPI ranks, GPU, brokered end to end.** One item outstanding:
-CMA (see "The last blocker" below). Branch `experimental`, off the frozen v0.4 `main`. Landed so far: the
-cage profiles (topology forced, multi-node rejected), the seccomp `--profile` flag, and
-the step allowlist. Still to build: the in-cage `srun` stub, the step-broker, and the
-rank-cage args. See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
+CMA (see "The last blocker" below). Branch `experimental`, off the frozen v0.4 `main`.
+All of Chapter 1 is built and on hardware: cage profiles (topology forced, multi-node
+rejected), the seccomp `--profile` flag, the step allowlist, the rank cage, the in-cage
+`srun` stub, the step-broker and the guard bootstrap. See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
 (AV1–AV8 + the two design principles), [ROADMAP.md](../ROADMAP.md).
 
 ## Scope & premise
@@ -66,11 +66,12 @@ This mirrors the login-node sbatch pair, recursed onto the compute node:
 
 ### What the step-broker validates (the step allowlist)
 
-> **Implemented** in `broker/src/srun.rs` (registry + `interpret`), not yet reachable from
-> the binary: `policy::decide` still rejects `tool="srun"` until the step-broker exists.
-> The parser itself is shared with `sbatch.rs` rather than copied — two option parsers
-> would be two things to keep in sync, and a gate that drifts from its twin is exactly
-> what the allowlist redesign removed.
+> **Implemented and live** in `broker/src/srun.rs` (registry + `interpret`), consumed by
+> the step-broker. The login-side `policy::decide` still rejects `tool="srun"` — that is
+> correct and unrelated: interactive srun from a login node stays out of scope. The parser
+> is shared with `sbatch.rs` rather than copied — two option parsers would be two things
+> to keep in sync, and a gate that drifts from its twin is what the allowlist redesign
+> removed.
 
 Same discipline as the sbatch `REGISTRY` — **build the srun invocation, don't forward
 agent bytes**. srun's own options are allowlisted (resource opts validated + re-emitted;
