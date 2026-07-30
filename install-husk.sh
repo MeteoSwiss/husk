@@ -323,6 +323,28 @@ else
   ok "seccomp-wrapper → $SECCOMP_WRAPPER_DEST"
 fi
 
+# CAPABILITY CHECK, not a version string. The broker's job guard emits
+# `seccomp-wrapper --profile=single-node ...`, and a wrapper that predates that flag
+# treats it as the COMMAND NAME: every brokered job then dies with
+# `exec '--profile=single-node' failed` on stderr, while stdout stays empty. That is a
+# silent deployment skew — the Rust side rebuilt, the C side not — and it cost two
+# bring-up runs on Balfrin (2026-07-30) before anyone read the .err file. Catch it here,
+# at the one moment both halves are being deployed, and ASK for the rebuild rather than
+# leaving it to be discovered on a compute node.
+if [[ -x "$SECCOMP_WRAPPER_DEST" ]]; then
+  if "$SECCOMP_WRAPPER_DEST" --profile=login /bin/true >/dev/null 2>&1; then
+    ok "seccomp-wrapper understands --profile (cage profiles available)"
+  else
+    echo "  [error] the installed seccomp-wrapper does not understand --profile."
+    echo "          The broker's job guard passes --profile=single-node, so every"
+    echo "          brokered job would fail to launch with:"
+    echo "            seccomp_wrapper: exec '--profile=single-node' failed"
+    echo "          Rebuild the C wrapper and re-run this installer:"
+    echo "            make -C \"$SCRIPT_DIR/seccomp-wrapper\" && \"$0\" \"\$@\""
+    exit 1
+  fi
+fi
+
 # Always write the launcher — two lines, overwriting is harmless, and ensures
 # it stays in sync if the content ever changes.
 mkdir -p "$PREFIX/bin"
