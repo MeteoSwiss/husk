@@ -173,6 +173,17 @@ ok "seccomp-wrapper (staging in ${BUILD_DIR})"
 # Test binaries do not need libseccomp — delegate to the Makefile so flags
 # stay in one place. They are removed by the cleanup trap regardless of outcome.
 
+# Remove any pre-existing test binaries FIRST. `make` treats a binary newer than its
+# source as up to date, so a stale one is silently reused — and one built on a different
+# machine fails at runtime with `GLIBC_x.yz not found`, which reads as a broken wrapper
+# and is not. (Balfrin 2026-07-31: a compiled test binary had been committed by accident,
+# so make never rebuilt it, the smoke test failed, and the wrapper was NOT INSTALLED —
+# leaving the cluster running the previous build while we debugged the wrong thing.)
+# A release build must not depend on what happens to be lying in the tree.
+log "Removing any stale test binaries"
+make -C "${SCRIPT_DIR}" clean >/dev/null 2>&1 || true
+ok "test binaries will be rebuilt from source"
+
 # Delegate to the Makefile: it owns the list of probe binaries and how smoke is
 # invoked. WRAPPER points at the freshly STAGED binary rather than a source-tree
 # build, which is the only thing this script needs to vary.
