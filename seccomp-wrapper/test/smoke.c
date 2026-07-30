@@ -10,7 +10,7 @@
  * Test 3: personality query allowed      — wraps test_personality_query, expects clean exit.
  * Test 4: personality ABI-switch blocked — wraps test_personality_switch, expects SIGSYS.
  * Test 5: AF_UNIX allowed under login   — the default profile must not change behaviour.
- * Test 6: AF_UNIX refused under single-node, WITHOUT killing the process.
+ * Test 6: AF_UNIX still ALLOWED under single-node — CUDA requires it (see below).
  * Test 7: an unknown --profile is fatal  — never a silent fallback to a weaker cage.
  */
 #include <signal.h>
@@ -121,24 +121,19 @@ int main(int argc, char *argv[])
         printf("PASS\n");
     }
 
-    /* --- test 6: AF_UNIX refused under single-node, process SURVIVES ------
-     * Exit 1 means EPERM was returned and the probe lived to report it. A SIGSYS
-     * death here would also "block" the socket, but would kill any program that
-     * merely probes for nscd/sssd before falling back — hence the explicit
-     * WIFEXITED check rather than just "did it fail". */
-    printf("test 6: AF_UNIX refused (single-node)  ... ");
+    /* --- test 6: AF_UNIX must remain available under single-node too ------
+     * This pins a DECISION, not an accident. The single-node profile used to block
+     * socket(AF_UNIX); Balfrin 2026-07-30 showed CUDA cannot survive that — cuInit
+     * returns 304 under the profile and succeeds without it, with the mount cage
+     * exonerated. If someone re-adds the block, this test fails and points here.
+     * What kept MUNGE unreachable was never this rule: it is the /run/munge mount
+     * mask, which is destination-aware in a way a syscall filter cannot be. */
+    printf("test 6: AF_UNIX allowed (single-node)  ... ");
     fflush(stdout);
     char *cmd6[] = {wrapper, "--profile=single-node", af_unix_bin, NULL};
     st = 0;
-    if (run(cmd6, &st) != 0) {
-        printf("FAIL (could not spawn process)\n");
-        failed++;
-    } else if (WIFSIGNALED(st)) {
-        printf("FAIL (killed by signal %d; the rule must return EPERM, not kill)\n",
-               WTERMSIG(st));
-        failed++;
-    } else if (WEXITSTATUS(st) != 1) {
-        printf("FAIL (exit %d, expected 1 = refused with EPERM)\n", WEXITSTATUS(st));
+    if (run(cmd6, &st) != 0 || !WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        printf("FAIL (AF_UNIX must stay available: CUDA needs it, and blocking it broke ICON)\n");
         failed++;
     } else {
         printf("PASS\n");

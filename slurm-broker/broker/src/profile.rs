@@ -70,9 +70,15 @@ impl Profile {
     /// exactly one home: the broker picks a profile, and every layer of the cage derives
     /// from that name rather than re-deriving it.
     ///
-    /// For `SingleNode` this adds the AF_UNIX block — measured safe for MPI (gate C12:
-    /// zero AF_UNIX calls in a caged 2-rank run), and it gives the compute cage the same
-    /// restriction the agent already has on the login side.
+    /// `SingleNode` currently adds NO syscall rules. It briefly blocked AF_UNIX — gate
+    /// C12 had measured zero such calls in a caged 2-rank MPI run — but that sample had no
+    /// CUDA, and CUDA both needs unix sockets and treats the refusal as fatal
+    /// (`cuInit -> 304`, Balfrin 2026-07-30, with the mount cage exonerated one arm at a
+    /// time). The MUNGE mount mask is what keeps the escape-relevant destination
+    /// unreachable, and it is destination-aware in a way a syscall filter cannot be.
+    ///
+    /// The name is still passed and still validated: an unknown profile is fatal in the
+    /// wrapper, so this is where the next rule lands rather than a knob to remove.
     pub fn seccomp_profile(&self) -> &'static str {
         match self {
             Profile::SingleNode => "single-node",

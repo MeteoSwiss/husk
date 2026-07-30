@@ -9,7 +9,8 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | single-node **forced** via `--nodes=1` | done — `--nodes` is `Class::Forced`, policy.rs validates + the profile emits |
 | multi-node rejected with a teaching message | done |
 | MUNGE mask in the floor | done, verified 33/33 on Balfrin |
-| AF_UNIX block as a `seccomp-wrapper --profile` flag | done — `--profile=login\|single-node`, unknown = fatal; smoke tests 5-7 |
+| `seccomp-wrapper --profile` flag | done — `login\|single-node`, unknown = fatal; smoke tests 5-7 |
+| AF_UNIX block for single-node | **REVERTED** — CUDA needs unix sockets (see Open) |
 | rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | done — `settings::CageKind::Rank` + `rank::wrap_command` |
 | in-cage `srun` stub, step-broker, guard bootstrap | done — **untested on hardware** |
 
@@ -123,27 +124,28 @@ Discovering what each profile needs is the tedious part. Four things bound it:
 
 ## Open
 
-- ~~Does a caged MPI job need AF_UNIX at all?~~ **ANSWERED — no** (gate C12, Balfrin
-  2026-07-29, job 4972255): **zero** `socket()`/`connect()` calls mentioning AF_UNIX in a
-  caged 2-rank run, and the traced run was a verified real 2-rank job. PMI is TCP, shared
-  memory is `mmap`, CXI is `ioctl` — the MPI stack simply does not use unix sockets.
-  So the **single-node profile carries the AF_UNIX block**, giving capability parity with
-  the login cage on that axis rather than only the MUNGE mask.
-  *Scope of the claim:* `socketpair(AF_UNIX)` was not traced and is deliberately not
-  blocked — it yields a pair of the process's own fds with no path, so it cannot reach a
-  daemon; reaching one needs `socket()`+`connect()` to a `sun_path`, which is what was
-  measured (the same line Anthropic's filter draws). *Limitation:* the sample is a tiny
-  MPI program that never resolves a user, so **ICON's first run under the block is the
-  real validation** — `getpwuid` via sssd is exactly the sort of call that would open one.
-  Failure will be loud and diagnosable, which is the point of the SIGSYS message.
-- Implementation note: the block must be a **profile flag on our `seccomp-wrapper`**, not
-  a new default. The login launcher wraps the whole session (`seccomp-wrapper claude`),
-  and the agent runtime plausibly needs unix sockets for its own IPC (MCP, IDE
-  integration) — which is presumably why Anthropic applies their AF_UNIX block per Bash
-  command rather than to the runtime. So: `--profile=login` (current behaviour) stays the
-  default; the compute guard passes the stricter profile explicitly. Verify when
-  implementing that `bwrap` itself survives the block — the wrapper installs the filter
-  and then execs bwrap, so bwrap runs under it.
+- ~~Does a caged MPI job need AF_UNIX at all?~~ **Measured twice, and the second
+  measurement overturned the first.**
+  - Gate C12 (job 4972255): **zero** AF_UNIX `socket()`/`connect()` calls in a caged
+    2-rank MPI run, so the single-node profile took the block. The limitation was recorded
+    at the time: *the sample is a tiny MPI program that never resolves a user, so ICON's
+    first run under the block is the real validation.*
+  - ICON's first run under the block (2026-07-30): every rank died at
+    `cuInit -> 304 CUDA_ERROR_OPERATING_SYSTEM`. `cuda-probe.sh` isolated it one variable
+    at a time — uncaged OK, `--profile=login` OK, `--profile=single-node` **FAILS**, both
+    bwrap cage shapes OK. CUDA needs a unix socket and treats the refusal as fatal; it
+    does not fall back the way glibc's NSS does, which is what the `EPERM`-over-`KILL`
+    choice had assumed.
+  - **The block is reverted.** What it was defending — a caged job authenticating to
+    slurmctld via MUNGE — is enforced by the `/run/munge` **mount mask**, verified on
+    hardware (`cred.munge tmpfs_mounts=1`). That was always the load-bearing control:
+    AF_UNIX has to be judged per *destination* (a socket to sssd is not escape surface,
+    one to MUNGE is), and only the mount layer can do that. The syscall block was defence
+    in depth, and it cost GPU support.
+  - Kept as a lesson: a measurement is only as good as its sample. C12 was correct and
+    its scope was written down; the workload that fell outside that scope found it on the
+    first run.
+
 - Whether SLURM's device cgroup constrains a job to its *allocated* GPUs (it is the same
   exposure uncaged either way, so not a husk regression).
 - The full syscall-set delta between our `seccomp-wrapper` and Anthropic's

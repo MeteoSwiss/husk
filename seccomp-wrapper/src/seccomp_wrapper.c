@@ -50,16 +50,16 @@
  * apply-seccomp, applied per BASH COMMAND rather than to the runtime process. The
  * difference is granularity, not policy: the agent's commands cannot open a unix socket,
  * while the runtime that supervises them can. When ROADMAP step 5 drops their runtime,
- * this profile takes that block over at the same granularity, and PROFILE_LOGIN stops
- * being "base only". Until then, adding it here would restrict the runtime itself, which
- * their filter never did.
+ * this profile takes that block over at the same granularity. Note that it can only ever
+ * apply to the AGENT's commands: a compute job cannot have it, because CUDA needs unix
+ * sockets (measured — see install_filter).
  *
  * An unknown --profile is FATAL rather than a fallback to the default: a typo must not
  * silently produce a weaker cage than the caller asked for.
  */
 enum wrapper_profile {
     PROFILE_LOGIN,        /* default: base deny-list only */
-    PROFILE_SINGLE_NODE,  /* brokered single-node compute job: + AF_UNIX */
+    PROFILE_SINGLE_NODE,  /* brokered compute job; no syscall delta today (see install_filter) */
 };
 
 /* -------------------------------------------------------------------------
@@ -307,39 +307,38 @@ static int install_filter(bool debug_mode, enum wrapper_profile profile)
     }
 
     /*
-     * PROFILE_SINGLE_NODE — block AF_UNIX socket creation.
+     * PROFILE_SINGLE_NODE — currently adds NO syscall rules, deliberately.
      *
-     * Measured on Balfrin (gate C12, job 4972255): a caged 2-rank MPI job makes ZERO
-     * AF_UNIX socket()/connect() calls. PMI bootstraps over TCP, shared memory is mmap,
-     * the CXI fabric is ioctl — the MPI stack has no use for unix sockets. So a compute
-     * job can carry the same AF_UNIX restriction the agent already has on the login side
-     * (via Anthropic's apply-seccomp), closing an accidental divergence rather than a
-     * designed one.
+     * It used to block socket(AF_UNIX). That is reverted: CUDA needs unix sockets, and
+     * it treats the refusal as FATAL rather than falling back. Measured on Balfrin
+     * 2026-07-30 with cuda-probe.sh, one variable at a time:
      *
-     * ERRNO(EPERM), NOT KILL_PROCESS — a deliberate exception to this file's
-     * fail-loud default. The security outcome is IDENTICAL: the socket is never created
-     * either way, so nothing reaches MUNGE or any other daemon. What differs is only
-     * what happens to a caller that PROBES: glibc's NSS tries nscd/sssd over AF_UNIX and
-     * falls back to /etc/passwd when it fails, and that fallback yields a CORRECT answer.
-     * Killing there would destroy a job for a benign, self-healing probe and buy no
-     * containment. Fail-loud exists to stop a silent WRONG ANSWER (the MPI job that
-     * "succeeded" as two independent one-rank jobs); it is not a goal in itself.
-     * Anthropic's filter makes the same call for the same syscall.
+     *     uncaged .................. cuInit OK
+     *     --profile=login .......... cuInit OK
+     *     --profile=single-node .... cuInit FAILED rc=304 (CUDA_ERROR_OPERATING_SYSTEM)
+     *     bwrap job cage ........... cuInit OK
+     *     bwrap rank cage .......... cuInit OK
      *
-     * socketpair(AF_UNIX) is deliberately NOT blocked: it returns a pair of the
-     * process's own fds with no filesystem path, so it cannot reach a daemon. Reaching
-     * one requires socket()+connect() to a sun_path, which is what this rule stops.
+     * so the syscall filter was the whole cause; the mount cage is fine. ICON's ranks
+     * died the same way. (`/var/run/nvidia-persistenced` is a unix socket on these
+     * nodes; whatever the exact call, EPERM is not something CUDA recovers from.)
+     *
+     * Gate C12 had measured ZERO AF_UNIX calls in a caged 2-rank MPI run — true, but the
+     * sample was a tiny MPI hello with no CUDA, a limitation recorded at the time. A real
+     * GPU workload found it immediately.
+     *
+     * WHAT STILL PROTECTS THE THING THAT MATTERED. The point of the block was that a
+     * caged job must not authenticate to slurmctld via MUNGE. That is enforced by MASKING
+     * /run/munge in the cage (CREDENTIAL_SOCKET_DIRS, verified on hardware:
+     * `cred.munge tmpfs_mounts=1`), which is destination-aware in a way a syscall filter
+     * can never be — and AF_UNIX always had to be judged per DESTINATION, since a socket
+     * to sssd is not escape surface while one to MUNGE is. The mount mask was the
+     * load-bearing control; this was defence in depth, and it cost GPU support.
+     *
+     * The profile mechanism stays: it is where the next rule lands, the deployment check
+     * depends on it, and an empty delta is honest about what today's cage does.
      */
-    if (profile == PROFILE_SINGLE_NODE) {
-        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socket), 1,
-                              SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX));
-        if (rc != 0) {
-            fprintf(stderr, "seccomp_wrapper: seccomp_rule_add('socket(AF_UNIX)')"
-                    " failed: %s\n", strerror(-rc));
-            seccomp_release(ctx);
-            return -1;
-        }
-    }
+    (void)profile;
 
     /*
      * personality(2) — argument-filtered rule.
