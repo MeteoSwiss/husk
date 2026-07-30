@@ -96,6 +96,41 @@ else
   echo "shm  : could not run the shared-memory check: $(printf '%s' "$shm" | head -2 | tr '\n' ' ')"
 fi
 
+# 3d) ENVIRONMENT. A brokered srun breaks the chain by which a run script's `export`
+# reaches its ranks — the script runs inside the cage, the real srun outside it — so the
+# broker carries the delta across as bwrap --setenv pairs. Without this, a script like
+#   export OMP_NUM_THREADS=4
+#   srun ./solver
+# runs with different settings than it asked for, and says nothing about it.
+export HUSK_ENV_PROBE=carried
+if envq=$(srun -n1 sh -c 'echo "${HUSK_ENV_PROBE:-MISSING}"' 2>&1); then
+  case "$envq" in
+    *carried*) echo "env  : the script's exported variable reached the rank [expect]" ;;
+    *MISSING*) echo "env  : exported variable did NOT reach the rank — a run script's settings"
+               echo "       are silently dropped (broker env forwarding not working)" ;;
+    *)         echo "env  : unexpected answer from the rank: $(printf '%s' "$envq" | tr '\n' ' ' | head -c 80)" ;;
+  esac
+else
+  echo "env  : could not run the environment check: $(printf '%s' "$envq" | head -2 | tr '\n' ' ')"
+fi
+
+# 3e) ...but scheduler-owned names must NOT be carried. They are inputs to srun's own
+# option handling: a forwarded SLURM_NTASKS would contradict the validated --ntasks, and
+# bwrap applies --setenv last, so it would win. The rank must see SLURM's value, not the
+# one this script set.
+export SLURM_NTASKS=99
+if sq=$(srun -n1 sh -c 'echo "ntasks=${SLURM_NTASKS:-unset}"' 2>&1); then
+  case "$sq" in
+    *ntasks=99*) echo "envx : SLURM_NTASKS=99 LEAKED into the rank — scheduler-owned names are"
+                 echo "       being forwarded, which can contradict the validated options!" ;;
+    *ntasks=*)   echo "envx : SLURM_NTASKS not overridable from the job script [expect]" ;;
+    *)           echo "envx : unexpected answer: $(printf '%s' "$sq" | tr '\n' ' ' | head -c 80)" ;;
+  esac
+else
+  echo "envx : could not run the reserved-name check: $(printf '%s' "$sq" | head -2 | tr '\n' ' ')"
+fi
+unset SLURM_NTASKS
+
 # 4) Concurrency. CAREFUL WHAT THIS MEASURES. Two plain `srun` steps serialise even
 # with NO husk in the path: without --overlap a step takes exclusive claim on the
 # allocation's CPUs, so the second waits for resources. That is SLURM's accounting, not

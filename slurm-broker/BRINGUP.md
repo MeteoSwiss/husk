@@ -159,6 +159,12 @@ sbatch --partition=<site partition> srun-probe.sh
 - `shm : rank 1 read what rank 0 wrote` — the ranks SHARE `/dev/shm`. This is the one
   thing the rank cage does specially; a per-task tmpfs would give each rank an empty
   shared-memory namespace and hang same-node MPI;
+- `env : the script's exported variable reached the rank` — a run script's `export`
+  carries across the broker. Without it, `export OMP_NUM_THREADS=4; srun ./solver` runs
+  with different settings than it asked for and says nothing;
+- `envx : SLURM_NTASKS not overridable from the job script` — scheduler-owned names are
+  NOT carried. They are inputs to srun's own option handling, and bwrap applies
+  `--setenv` last, so a forwarded one would win over the validated option;
 - `conc : ~3s for 2x 3s overlapping steps` — the broker runs steps concurrently.
   **Read this one carefully**: two *plain* `srun` steps serialise even with no husk in
   the path, because without `--overlap` a step claims the allocation's CPUs exclusively
