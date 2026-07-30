@@ -24,7 +24,7 @@ TEST_PERS_QUERY  = test/test_personality_query
 TEST_PERS_SWITCH = test/test_personality_switch
 TEST_AF_UNIX     = test/test_af_unix
 
-.PHONY: all install check clean
+.PHONY: all install check check-tests clean
 
 all: $(TARGET)
 
@@ -49,8 +49,17 @@ $(TEST_PERS_SWITCH): test/test_personality_switch.c
 install: $(TARGET)
 	install -m 0755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
 
-check: $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) $(TEST_AF_UNIX)
-	./$(TEST_SMOKE) ./$(TARGET) ./$(TEST_PTRACE) ./$(TEST_PERS_QUERY) ./$(TEST_PERS_SWITCH) ./$(TEST_AF_UNIX)
+# The smoke suite's argument list lives HERE and nowhere else. build_and_test.sh
+# calls `check-tests WRAPPER=<staged binary>` instead of repeating it — a second copy
+# is a second thing to forget, and forgetting it once already blocked a Balfrin
+# install (test_af_unix added to this file, not to that script).
+WRAPPER ?= ./$(TARGET)
+
+check: $(TARGET) check-tests
+
+check-tests: $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) $(TEST_AF_UNIX)
+	./$(TEST_SMOKE) $(WRAPPER) ./$(TEST_PTRACE) ./$(TEST_PERS_QUERY) ./$(TEST_PERS_SWITCH) ./$(TEST_AF_UNIX)
 
 clean:
-	rm -f $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH)
+	rm -f $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) \
+	      $(TEST_AF_UNIX)

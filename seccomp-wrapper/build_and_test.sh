@@ -105,7 +105,8 @@ cleanup() {
     rm -f "${SCRIPT_DIR}/test/smoke" \
           "${SCRIPT_DIR}/test/test_ptrace" \
           "${SCRIPT_DIR}/test/test_personality_query" \
-          "${SCRIPT_DIR}/test/test_personality_switch"
+          "${SCRIPT_DIR}/test/test_personality_switch" \
+          "${SCRIPT_DIR}/test/test_af_unix"
     ok "removed ${BUILD_DIR} and test binaries"
 }
 
@@ -172,18 +173,11 @@ ok "seccomp-wrapper (staging in ${BUILD_DIR})"
 # Test binaries do not need libseccomp — delegate to the Makefile so flags
 # stay in one place. They are removed by the cleanup trap regardless of outcome.
 
-log "Compiling smoke test binaries"
-make -C "${SCRIPT_DIR}" test/smoke test/test_ptrace test/test_personality_query test/test_personality_switch
-ok "test/smoke, test/test_ptrace, test/test_personality_query, test/test_personality_switch"
-
-# ── run smoke test ────────────────────────────────────────────────────────────
-
-log "Running smoke test"
-if "${SCRIPT_DIR}/test/smoke" \
-       "${BUILD_DIR}/seccomp-wrapper" \
-       "${SCRIPT_DIR}/test/test_ptrace" \
-       "${SCRIPT_DIR}/test/test_personality_query" \
-       "${SCRIPT_DIR}/test/test_personality_switch"; then
+# Delegate to the Makefile: it owns the list of probe binaries and how smoke is
+# invoked. WRAPPER points at the freshly STAGED binary rather than a source-tree
+# build, which is the only thing this script needs to vary.
+log "Running smoke test against the staged binary"
+if make -C "${SCRIPT_DIR}" check-tests WRAPPER="${BUILD_DIR}/seccomp-wrapper"; then
     ok "all tests passed"
 else
     echo "  [error] smoke test failed — binary not installed"
