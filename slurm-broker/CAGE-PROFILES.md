@@ -12,7 +12,9 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | `seccomp-wrapper --profile` flag | done — `login\|single-node`, unknown = fatal; smoke tests 5-7 |
 | AF_UNIX block for single-node | **REVERTED** — CUDA needs unix sockets (see Open) |
 | rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | done — `settings::CageKind::Rank` + `rank::wrap_command` |
-| in-cage `srun` stub, step-broker, guard bootstrap | done — **untested on hardware** |
+| in-cage `srun` stub, step-broker, guard bootstrap | done — **ICON ran to completion, 2026-07-31** |
+| broker refuses ptrace/CMA (`PR_SET_DUMPABLE`) | done — `df414ea` |
+| `process_vm_readv` for single-node (CMA) | **PENDING** — the first real profile delta; see Open |
 
 ## Why profiles exist
 
@@ -123,6 +125,15 @@ Discovering what each profile needs is the tedious part. Four things bound it:
    disagree, the tests win.
 
 ## Open
+
+- **CMA is the first genuine profile delta.** Cray MPICH needs `process_vm_readv` for
+  intra-node transfers; blocked, ICON dies with SIGSYS once ranks exchange data, and
+  `MPICH_SMP_SINGLE_COPY_MODE=NONE` is only a diagnostic (it taxes every message).
+  The proposal: allow `process_vm_readv` for `single-node`, keep `process_vm_writev`
+  blocked. Read = same-uid memory disclosure between caged ranks; write = arbitrary code
+  execution in the un-caged step-broker, i.e. the escape itself. The broker already
+  refuses to be a target (`PR_SET_DUMPABLE`), so the concession is rank-to-rank only.
+  Untested whether read alone suffices — that is the next hardware run.
 
 - ~~Does a caged MPI job need AF_UNIX at all?~~ **Measured twice, and the second
   measurement overturned the first.**

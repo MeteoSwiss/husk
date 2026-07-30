@@ -1,7 +1,8 @@
 # husk — srun / MPI phase design (experimental)
 
-**Status: hardware gates ANSWERED (nine probe runs on Balfrin); Chapter 1 in
-implementation.** Branch `experimental`, off the frozen v0.4 `main`. Landed so far: the
+**Status: CHAPTER 1 COMPLETE — ICON ran to completion inside husk on Balfrin
+(2026-07-31): single node, 4 MPI ranks, GPU, brokered end to end.** One item outstanding:
+CMA (see "The last blocker" below). Branch `experimental`, off the frozen v0.4 `main`. Landed so far: the
 cage profiles (topology forced, multi-node rejected), the seccomp `--profile` flag, and
 the step allowlist. Still to build: the in-cage `srun` stub, the step-broker, and the
 rank-cage args. See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
@@ -529,6 +530,53 @@ Job 4965792. Every run-8 conclusion reproduced, and the two open items closed:
   `cs_2node2rank_netns` failed again. The netns boundary is confirmed twice over.
 
 ---
+
+## Chapter 1 — DONE, demonstrated by a real workload
+
+**ICON ran to completion inside husk, Balfrin 2026-07-31.** Single node, 4 MPI ranks, GPU.
+Every layer exercised by a production model rather than a probe:
+
+`sbatch` brokered from the login cage → job guard → re-exec into the compute cage →
+in-cage `srun` stub → step-spool → step-broker (un-caged, inside the allocation) → step
+allowlist → four ranks each in its own cage (read-only root, homes hidden, CXI bound,
+per-job `/dev/shm`, per-step apinfo bind, `--unshare-net` intact) → PMI bootstrap → CUDA
+init → GPU compute → MPI collectives → model run to completion.
+
+Getting there cost four real fixes, each found by a workload rather than by inspection:
+1. `--distribution=plane=4` — the value grammar had no `=`.
+2. `cuInit -> 304` — the AF_UNIX block. **Reverted**; CUDA needs unix sockets and treats
+   the refusal as fatal. What it was defending (MUNGE) is enforced by the mount mask,
+   which is destination-aware in a way a syscall filter cannot be.
+3. `Could not open icon_master.namelist` — the step-broker forced `--chdir` to the job's
+   start directory instead of the caller's. Run scripts `cd` into their case directory.
+4. `SIGSYS` mid-run — CMA, below.
+
+### The last blocker: CMA
+
+Cray MPICH uses `process_vm_readv`/`process_vm_writev` (Cross Memory Attach) for
+intra-node transfers, and both are in seccomp-wrapper's deny-list, so ranks died with
+exit 159 once they began exchanging grid data. `/dev/xpmem` is not bound, so MPICH has no
+alternative single-copy path. **`export MPICH_SMP_SINGLE_COPY_MODE=NONE` makes ICON
+complete** — that is the diagnostic, not the fix: it forces a copy-through-shared-memory
+path and taxes every intra-node message.
+
+**Read and write are not one concession.** `process_vm_readv` lets a caged rank read
+same-uid memory; `process_vm_writev` lets it *write* into an un-caged process — arbitrary
+code execution in the one process holding MUNGE. Only the read side should move.
+
+Gating is the ptrace-attach check: credentials, Yama `ptrace_scope`, the dumpable flag,
+and PID visibility. **Balfrin has no Yama**, so credentials are the only gate there.
+`--unshare-pid` is not available as a defence: each task gets its own bwrap, so it would
+put every rank in a separate PID namespace and break the rank-to-rank CMA being enabled.
+
+**Mitigation already shipped** (`df414ea`): the broker calls `prctl(PR_SET_DUMPABLE, 0)`,
+so it is not a ptrace/CMA target whatever the filter allows — verified, its
+`/proc/<pid>/maps` is refused while an ordinary same-uid process stays readable. That
+makes the concession rank-to-rank only.
+
+**Next:** unblock `process_vm_readv` for the single-node profile, keep `writev` blocked,
+and run ICON *without* the env var. If it completes, users pay no tax. If it dies at a new
+SIGSYS, MPICH wants the write side too — a real decision, not a registry line.
 
 ## Chapter 1 — the rank cage, as specified by hardware
 
