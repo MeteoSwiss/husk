@@ -102,8 +102,11 @@ fi
 #   export OMP_NUM_THREADS=4
 #   srun ./solver
 # runs with different settings than it asked for, and says nothing about it.
-export HUSK_ENV_PROBE=carried
-if envq=$(srun -n1 sh -c 'echo "${HUSK_ENV_PROBE:-MISSING}"' 2>&1); then
+# NB the name must not start with a RESERVED prefix (SLURM_/SBATCH_/PMI_/PALS_/HUSK_) —
+# those are deliberately never carried, and an earlier version of this check used
+# HUSK_ENV_PROBE and so tested the one name guaranteed to fail.
+export PROBE_ENV_CARRIED=carried
+if envq=$(srun -n1 sh -c 'echo "${PROBE_ENV_CARRIED:-MISSING}"' 2>&1); then
   case "$envq" in
     *carried*) echo "env  : the script's exported variable reached the rank [expect]" ;;
     *MISSING*) echo "env  : exported variable did NOT reach the rank — a run script's settings"
@@ -114,6 +117,9 @@ else
   echo "env  : could not run the environment check: $(printf '%s' "$envq" | head -2 | tr '\n' ' ')"
 fi
 
+# NOTE for 3e/3f: these are NEGATIVE checks, and they also pass when NOTHING is being
+# forwarded at all. They only mean something if `env` above passed — read them together.
+#
 # 3e) ...but scheduler-owned names must NOT be carried. They are inputs to srun's own
 # option handling: a forwarded SLURM_NTASKS would contradict the validated --ntasks, and
 # bwrap applies --setenv last, so it would win. The rank must see SLURM's value, not the
@@ -130,6 +136,22 @@ else
   echo "envx : could not run the reserved-name check: $(printf '%s' "$sq" | head -2 | tr '\n' ' ')"
 fi
 unset SLURM_NTASKS
+
+# 3f) ...and neither is husk's OWN namespace. HUSK_STEP_SPOOL tells a stub where to send
+# its requests, so a rank able to set it could redirect its own brokering. Our control
+# plane is no more forwardable than the scheduler's.
+export HUSK_ENV_PROBE=leaked
+if hq=$(srun -n1 sh -c 'echo "husk=${HUSK_ENV_PROBE:-unset}"' 2>&1); then
+  case "$hq" in
+    *husk=leaked*) echo "envh : HUSK_* LEAKED into the rank — a rank could redirect its own"
+                   echo "       brokering by setting HUSK_STEP_SPOOL!" ;;
+    *husk=*)       echo "envh : husk's own namespace not settable from the job script [expect]" ;;
+    *)             echo "envh : unexpected answer: $(printf '%s' "$hq" | tr '\n' ' ' | head -c 80)" ;;
+  esac
+else
+  echo "envh : could not run the husk-namespace check: $(printf '%s' "$hq" | head -2 | tr '\n' ' ')"
+fi
+unset HUSK_ENV_PROBE
 
 # 4) Concurrency. CAREFUL WHAT THIS MEASURES. Two plain `srun` steps serialise even
 # with NO husk in the path: without --overlap a step takes exclusive claim on the
