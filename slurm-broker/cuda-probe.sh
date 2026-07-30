@@ -22,6 +22,20 @@ have() { command -v "$1" >/dev/null 2>&1; }
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/husk-cuda-probe.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# A GPU must be present or every arm below reports the same meaningless failure
+# (cuInit -> 100 CUDA_ERROR_NO_DEVICE) and the report looks like husk broke something.
+# Balfrin 2026-07-30: run on a login node by accident, and it happily produced five
+# lines of noise. Refuse instead.
+if ! ls /dev/nvidia[0-9]* >/dev/null 2>&1; then
+  printf '%s\n' \
+    "cuda-probe: no /dev/nvidia* on $(hostname) — this is not a GPU node." \
+    "  Every check would fail with CUDA_ERROR_NO_DEVICE and tell you nothing about husk." \
+    "  Get an allocation first, e.g.:" \
+    "    salloc -N1 -n1 -p <partition> [-A <acct>] --gres=gpu:1" \
+    "  then run this from the compute node (srun --pty bash, or via sbatch)." >&2
+  exit 2
+fi
+
 head2 "context"
 say "host : $(hostname)   arch=$(uname -m)"
 say "uenv : ${UENV_VIEW:-<none>}"
@@ -59,6 +73,11 @@ if [ -z "$built" ]; then
 fi
 fnd build "OK ($built)"
 
+# The cage masks /tmp, so the test binary built there is invisible inside it —
+# `bwrap: execvp …/cuinit: No such file or directory`, which looks like a CUDA problem
+# and is not. Re-expose just this directory, after the tmpfs so it wins.
+BINDW="--bind $WORK $WORK"
+
 run() { # label, command...
   local label="$1"; shift
   local out rc
@@ -68,6 +87,11 @@ run() { # label, command...
 }
 
 # ── layer by layer, one variable at a time ────────────────────────────────────
+head2 "0. sanity: the test binary must be visible INSIDE a cage"
+vis=$(bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp $BINDW \
+      -- sh -c "[ -x '$BIN' ] && echo yes || echo NO" 2>&1)
+fnd binary_in_cage "$vis  (NO means the arms below test nothing)"
+
 head2 "1. no husk at all (the control — if this fails, nothing below means anything)"
 run uncaged "$BIN"
 
@@ -92,13 +116,13 @@ for d in /dev/cxi[0-9]*; do [ -e "$d" ] && CXI_BINDS="$CXI_BINDS --dev-bind-try 
 
 head2 "3. the JOB cage shape (private /dev/shm, no fabric)"
 run job_cage bwrap --ro-bind / / --dev /dev $GPU_BINDS --proc /proc \
-    --tmpfs /tmp --tmpfs /dev/shm --unshare-net -- "$BIN"
+    --tmpfs /tmp $BINDW --tmpfs /dev/shm --unshare-net -- "$BIN"
 
 head2 "4. the RANK cage shape (shared per-job /dev/shm, fabric bound)"
 _d="/dev/shm/husk-cudaprobe-$$"
 mkdir -m 700 "$_d" 2>/dev/null || true
 run rank_cage bwrap --ro-bind / / --dev /dev $GPU_BINDS $CXI_BINDS --proc /proc \
-    --tmpfs /tmp --bind "$_d" /dev/shm --unshare-net -- "$BIN"
+    --tmpfs /tmp $BINDW --bind "$_d" /dev/shm --unshare-net -- "$BIN"
 rmdir "$_d" 2>/dev/null || true
 
 head2 "5. both layers together, as a real rank runs"
@@ -106,7 +130,7 @@ if have seccomp-wrapper; then
   _d="/dev/shm/husk-cudaprobe2-$$"
   mkdir -m 700 "$_d" 2>/dev/null || true
   run full_rank seccomp-wrapper --profile=single-node bwrap --ro-bind / / --dev /dev \
-      $GPU_BINDS $CXI_BINDS --proc /proc --tmpfs /tmp --bind "$_d" /dev/shm \
+      $GPU_BINDS $CXI_BINDS --proc /proc --tmpfs /tmp $BINDW --bind "$_d" /dev/shm \
       --unshare-net -- "$BIN"
   rmdir "$_d" 2>/dev/null || true
 fi
@@ -117,7 +141,7 @@ for p in /proc/driver/nvidia /sys/module/nvidia /sys/class/drm /dev/nvidia-caps 
          /var/run/nvidia-persistenced; do
   if [ -e "$p" ]; then
     inside=$(bwrap --ro-bind / / --dev /dev $GPU_BINDS --proc /proc --tmpfs /tmp \
-             -- sh -c "[ -e '$p' ] && echo yes || echo NO" 2>/dev/null)
+             $BINDW -- sh -c "[ -e '$p' ] && echo yes || echo NO" 2>/dev/null)
     fnd "path_$(printf '%s' "$p" | tr '/' '_')" "host=yes cage=${inside:-?}"
   fi
 done
