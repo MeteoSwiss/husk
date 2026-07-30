@@ -131,6 +131,38 @@ the inter-rank fabric (the control plane, at least) and will hang or fail under
 not a broker bug. If a single-rank run itself needs a resource option (GPUs, a
 constraint, a specific `--gres`), that's Probe F step 2, not the MPI limit.
 
+## Probe G — the step pair (`srun` from inside a job)
+
+The first thing that exercises **Chapter 1**: a brokered job that calls `srun`. Inside
+the cage that is husk's stub, not the real srun — it hands the request to the
+step-broker, which runs outside the cage but inside the allocation (so it still holds
+MUNGE and a route to the daemons), validates it against the step allowlist, and launches
+each task wrapped in the rank cage.
+
+From a bounded scratch dir (see the watch-out below), submit it the way the agent would:
+
+```
+sbatch --partition=<site partition> srun-probe.sh
+```
+
+**Pass** — four lines in the job output:
+- `step : OK` — the pair worked end to end;
+- `cage : homes hidden inside the step` — the rank is sandboxed too, not merely launched;
+- `deny : --task-prolog refused` — the step allowlist is being applied (that option runs
+  code *outside* the per-task wrap, which is the one thing the wrap exists to prevent);
+- `conc : ~3s for 2x 3s steps` — steps overlap rather than serialising.
+
+**On failure**, in order of what to read:
+1. the job's `.err` file, not just `.out` — a guard-level failure (a stale
+   `seccomp-wrapper`, a bwrap bind error) never reaches stdout;
+2. `.husk-step-spool-<jobid>/step-broker.log` in the workdir — the step-broker's own
+   audit trail: the request as parsed, the srun it built, any rejection;
+3. `spool: <UNSET>` in the output means the guard did not bootstrap the pair at all —
+   check that `srun-stub.py` is installed (`$PREFIX/lib/husk/`) and that the broker and
+   wrapper were deployed together.
+
+The spool directory is deliberately left behind after the job: that log is the evidence.
+
 ## Watch-outs
 - **Run from a bounded scratch project dir, not `/users` and not the scratch root
   (CSCS):** the broker rejects a job whose workdir is under a hidden home (`/users/...`)
