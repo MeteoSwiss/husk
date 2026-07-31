@@ -64,6 +64,18 @@ pub struct StepBroker {
     /// the baseline against which a job script's changes are measured.
     base_env: std::collections::BTreeMap<String, String>,
     in_flight: Vec<Running>,
+    /// The job's shared user namespace, owned by a child process. See `cage`.
+    holder: Option<CageHolder>,
+}
+
+/// The child that owns the job's shared user namespace.
+///
+/// Holding the `Child` is what keeps the namespace alive, and dropping it closes the
+/// holder's stdin, which is one of its two shutdown paths (`PDEATHSIG` is the other).
+/// Nothing else about the child is used — it is a handle to a namespace, not a worker.
+struct CageHolder {
+    pid: u32,
+    _child: std::process::Child,
 }
 
 impl StepBroker {
@@ -85,6 +97,7 @@ impl StepBroker {
             slurmd_spool,
             base_env: std::env::vars().collect(),
             in_flight: Vec::new(),
+            holder: None,
         }
     }
 
@@ -92,6 +105,41 @@ impl StepBroker {
     pub fn tick(&mut self) -> std::io::Result<()> {
         self.reap();
         self.scan()
+    }
+
+    /// Start the job's cage holder if it is not running yet, and return its pid.
+    ///
+    /// Lazy on purpose: a step-broker that never launches a step should not create a
+    /// namespace. Created once per JOB rather than per step — nothing in it is
+    /// step-specific, and a namespace per step would be a process per step to leak.
+    fn ensure_holder(&mut self) -> Result<u32, String> {
+        if let Some(h) = &self.holder {
+            return Ok(h.pid);
+        }
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot locate the husk broker binary: {e}"))?;
+        let mut child = std::process::Command::new(&exe)
+            .arg("--hold-cage")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot start the cage holder ({}): {e}", exe.display()))?;
+
+        // The holder reports the pid that is actually INSIDE the namespace. Taking
+        // `child.id()` instead would be a guess about process arrangement.
+        let mut line = String::new();
+        let stdout = child.stdout.take().ok_or("cage holder has no stdout")?;
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+            .map_err(|e| format!("cage holder did not report readiness: {e}"))?;
+        let pid: u32 = line
+            .trim()
+            .parse()
+            .map_err(|_| format!("cage holder reported {line:?} instead of a pid"))?;
+
+        // stdin stays OPEN inside `child` for the broker's lifetime: closing it is how
+        // the holder learns to exit.
+        self.holder = Some(CageHolder { pid, _child: child });
+        Ok(pid)
     }
 
     /// Write the response for every step that has exited. `try_wait` does not block, so
@@ -239,6 +287,20 @@ impl StepBroker {
         // and `export OMP_NUM_THREADS=4; srun ./icon` would silently run with different
         // settings than it asked for. See rank::setenv_args for why these go through
         // bwrap rather than into srun's own environment.
+        // The job's shared user namespace must exist before any rank starts. Fail the
+        // step rather than fall back to per-rank namespaces: that fallback would run the
+        // workload in cages that cannot CMA each other, which surfaces as an obscure MPI
+        // error rather than as the containment change it actually is.
+        let holder_pid = match self.ensure_holder() {
+            Ok(pid) => pid,
+            Err(e) => {
+                let msg = format!("husk: cannot create the job's shared user namespace: {e}");
+                eprintln!("step-broker: {msg}");
+                write_response(&self.spool, &id, &Response::rejected(&id, msg));
+                return;
+            }
+        };
+
         let mut cage = self.fs_policy.rank_bwrap_args(&self.workdir);
         // Only the DELTA against our own environment: srun propagates that to the tasks
         // already, so forwarding everything would re-set hundreds of identical values and
@@ -248,6 +310,7 @@ impl StepBroker {
             self.profile,
             &cage,
             &self.slurmd_spool,
+            holder_pid,
             &step.command,
         ));
 

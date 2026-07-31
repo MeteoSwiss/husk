@@ -18,16 +18,24 @@ job are a **single trust domain**: same uid, same allocation, same files, same d
 launched from the same script. There is no boundary between rank 0 and rank 3 to
 defend — the boundary that exists is *job ↔ host*.
 
-So the cage is built **once per node** and every task of the step joins it. A cage per
-*task* does not add a boundary; it makes **N redundant copies of the same one**, and
-the copies are not free — they actively cost containment and function:
+So the job gets **one shared user namespace**, created once per job and used by every
+task of every step. A cage per *task* does not add a boundary; it makes **N redundant
+copies of the same one**, and the copies are not free — they actively cost containment
+and function:
 
 | symptom | root cause |
 |---|---|
 | Cray MPICH dies `process_vm_readv: EPERM` | each task's bwrap makes its own **user namespace**; siblings cannot `ptrace_may_access` each other |
 | `--unshare-pid` unusable as a hardening step | it would put each rank in its own PID namespace and break rank-to-rank CMA |
-| N socat bridges instead of 1 when the network opens | each task has its own netns, so each needs its own gateway |
 | per-job binds (`/dev/shm`, step spool) repeated per task | they were never per-task to begin with |
+
+Only the **user** namespace turned out to be load-bearing among those copies. Mount and
+network namespaces stay per task: they cost nothing, and sharing the network namespace is
+not even available — `bwrap` builds its sandbox through an intermediate user namespace and
+switches to a second one, so the netns it creates is owned by a namespace no rank can
+join. The price is one network *relay* per rank when the network opens; the filtering
+proxy, which is the part that matters, stays one per node behind a bind-mounted unix
+socket.
 
 Measured, 2026-07-31: two sibling bwrap cages cannot CMA-read each other (`EPERM`)
 **even with Yama neutralised**; two cages sharing one identity-mapped user namespace
@@ -38,15 +46,17 @@ visibility, and we had not written it down.
 Two consequences to hold to:
 
 1. **Joining must be fail-closed.** With a cage per task, failing to build it means the
-   task does not run. With a shared cage the task *joins* namespaces, so a bug could
-   let it run **outside** — silently. After `setns`, a task must verify its
-   `/proc/self/ns/{user,mnt,net}` are the expected ones and abort before exec'ing the
-   workload. This is the one genuinely new risk the design introduces, and it is a
-   test, not a comment.
-2. **Sharing is scoped to the job.** One netns per node means ranks share loopback and
-   can reach each other's ports; one userns means they can CMA each other. Both are
-   *within* the trust domain defined above. Neither the broker nor any other job is
-   inside it — the broker stays outside and is non-dumpable regardless.
+   task does not run. When a task *joins* something instead, a bug could let it run
+   **outside** — silently. Two guards, because this is the one genuinely new risk the
+   design introduces: the task refuses to start if the holder's namespace is unreadable,
+   and `bwrap --userns` exits rather than inventing a namespace of its own. Both are
+   tests, not comments.
+2. **Sharing is scoped to the job, and is exactly one namespace.** Only the **user**
+   namespace is shared, because it is the only one that cost a capability; mount and
+   network namespaces stay per task. Ranks can therefore CMA each other, which is within
+   the trust domain defined above. Neither the broker nor any other job is inside it —
+   the broker stays outside and is non-dumpable regardless, which is half the reason the
+   CMA read concession is acceptable.
 
 Generalises beyond MPI: the question to ask of any new cage is *what is the trust
 domain here*, and to put exactly one wall around it.

@@ -15,7 +15,7 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | in-cage `srun` stub, step-broker, guard bootstrap | done — **ICON ran to completion, 2026-07-31** |
 | broker refuses ptrace/CMA (`PR_SET_DUMPABLE`) | done — `df414ea` |
 | `process_vm_readv` for single-node (CMA) | done — `SINGLE_NODE_EXEMPT`, smoke 8-10 + selftest `cma.*`, **37/37 green on Balfrin** |
-| **one cage per node, tasks join it** | **TO BUILD** — the per-task cage is what still blocks CMA (sibling user namespaces); see "the unit of confinement" in THREAT-MODEL.md |
+| **shared user namespace per job** | built — `cage.rs` holder + `bwrap --userns` per rank; laptop-verified (CMA OK shared / EPERM unshared). Hardware run pending |
 
 ## Why profiles exist
 
@@ -72,15 +72,15 @@ network and credential reach the job requires.
 `--dev-bind-try` is already absent-safe: on a node without GPUs the binds silently skip.
 The variant is implicit in the mechanism, so there are three profiles, not six.
 
-**A profile describes ONE cage per node, not one per process.** The profile answers
+**A profile describes what the wall permits; it does not say where the wall goes.** The profile answers
 *what the wall permits*; this answers *where the wall goes*, and the two are independent
 questions we conflated at first. All ranks of a job are one trust domain — same uid,
-allocation, files, data — so the cage is built once per node and every task of the step
-joins it. See "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md); the short
-version is that a cage per task adds no boundary, only N copies of the same one, and the
-copies cost real capability (they are what blocked CMA, `--unshare-pid`, and a single
-network gateway). The join must be **fail-closed**: a task that cannot enter the cage
-must die, never run outside it.
+allocation, files, data — so they **share one user namespace**, created once per job,
+while each rank still builds its own cage. See "the unit of confinement" in
+[THREAT-MODEL.md](THREAT-MODEL.md); the short version is that a cage per task adds no
+boundary, only N copies of the same one, and one of those copies — the user namespace —
+was what blocked CMA. Joining must be **fail-closed**: a rank that cannot enter the
+shared namespace must die, never fall back to a private one.
 
 Each profile is **floor + declared delta**, and every delta entry carries three fields:
 *what it opens*, *why the workload needs it*, *what compensating control bounds it*. A

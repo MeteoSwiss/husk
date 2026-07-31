@@ -128,6 +128,7 @@ pub fn wrap_command(
     profile: Profile,
     rank_args: &[String],
     spool_dir: &str,
+    holder_pid: u32,
     command: &[String],
 ) -> Vec<String> {
     let bwrap = rank_args
@@ -135,6 +136,7 @@ pub fn wrap_command(
         .map(|s| sh_quote(s))
         .collect::<Vec<_>>()
         .join(" ");
+    let userns = crate::cage::userns_path(holder_pid);
 
     // NOTE on the /dev/shm directory: /dev/shm is world-writable and sticky, so another
     // user on the node could PRE-CREATE `husk-<jobid>` (job ids are guessable) and then
@@ -142,8 +144,25 @@ pub fn wrap_command(
     // entries, not creating the directory first. So the script refuses to proceed unless
     // the directory is owned by us — `mkdir -m 700` for the normal case, `[ -O ]` for the
     // adversarial one. Ranks race to create it; all but one get EEXIST, which is fine.
+    // The rank joins the JOB'S SHARED USER NAMESPACE instead of letting bwrap make its
+    // own. That single share is what legalises rank-to-rank CMA: sibling user namespaces
+    // cannot ptrace_may_access each other, so Cray MPICH's intra-node transfers died with
+    // EPERM regardless of the seccomp filter. Mount and network namespaces stay per rank —
+    // identical copies from identical arguments, and they never cost a capability.
+    //
+    // Checked before use so the failure is a sentence rather than a shell diagnostic: if
+    // the holder is gone the rank must DIE, never fall back to a namespace of its own,
+    // which would run the workload in a cage that cannot talk to its peers and would look
+    // like an MPI bug. `bwrap --userns` is itself fail-closed — it exits rather than
+    // inventing a namespace — so this is the readable half of a belt-and-braces pair.
     let script = format!(
         "set -u\n\
+         _u={userns}\n\
+         if [ ! -r \"$_u\" ]; then\n\
+         echo \"husk: the job's cage holder is gone ($_u) - refusing to run this rank\" >&2\n\
+         exit 1\n\
+         fi\n\
+         exec 9<\"$_u\"\n\
          _d=/dev/shm/husk-${{SLURM_JOB_ID}}\n\
          mkdir -m 700 \"$_d\" 2>/dev/null || true\n\
          if [ ! -O \"$_d\" ]; then\n\
@@ -151,8 +170,9 @@ pub fn wrap_command(
          exit 1\n\
          fi\n\
          _s={spool}/mpi_cray_shasta/${{SLURM_JOB_ID}}.${{SLURM_STEP_ID}}\n\
-         exec seccomp-wrapper --profile={sec} bwrap {bwrap} \
+         exec seccomp-wrapper --profile={sec} bwrap --userns 9 {bwrap} \
          --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" -- \"$@\"\n",
+        userns = sh_quote(&userns),
         spool = sh_quote(spool_dir),
         sec = profile.seccomp_profile(),
     );
@@ -177,9 +197,16 @@ mod tests {
         a.iter().map(|s| s.to_string()).collect()
     }
 
+    /// A pid whose `/proc/<pid>/ns/user` really exists, so the script's fail-closed
+    /// holder check passes and the rest of the script gets to run. Our own pid is the
+    /// natural stand-in for a live cage holder.
+    fn live_holder() -> u32 {
+        std::process::id()
+    }
+
     fn built(command: &[&str]) -> Vec<String> {
         let rank = FsPolicy::default().rank_bwrap_args("/work");
-        wrap_command(Profile::SingleNode, &rank, "/var/spool/slurmd", &v(command))
+        wrap_command(Profile::SingleNode, &rank, "/var/spool/slurmd", live_holder(), &v(command))
     }
 
     fn envmap(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
@@ -269,7 +296,8 @@ mod tests {
             c.extend(env_args(&envmap(&[("LD_PRELOAD", "/tmp/evil.so")]), &envmap(&[]), &[]));
             c
         };
-        let argv = wrap_command(Profile::SingleNode, &cage, "/var/spool/slurmd", &v(&["./a.out"]));
+        let argv =
+            wrap_command(Profile::SingleNode, &cage, "/var/spool/slurmd", 4242, &v(&["./a.out"]));
         let script = &argv[2];
         // It must arrive as a --setenv pair, i.e. consumed by bwrap...
         assert!(script.contains("'--setenv' 'LD_PRELOAD' '/tmp/evil.so'"), "{script}");
@@ -332,8 +360,57 @@ mod tests {
     #[test]
     fn broker_supplied_values_are_shell_quoted() {
         let rank = FsPolicy::default().rank_bwrap_args("/work");
-        let argv = wrap_command(Profile::SingleNode, &rank, "/odd path/spool", &v(&["./a"]));
+        let argv = wrap_command(Profile::SingleNode, &rank, "/odd path/spool", 4242, &v(&["./a"]));
         assert!(argv[2].contains("'/odd path/spool'"), "{}", argv[2]);
+    }
+
+    #[test]
+    fn the_rank_joins_the_jobs_shared_user_namespace() {
+        // The single share that legalises rank-to-rank CMA. `--userns` must be present
+        // AND must precede the policy arguments, because bwrap otherwise creates its own
+        // user namespace and the ranks end up siblings again - which is exactly the
+        // configuration that fails with EPERM.
+        let argv = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            4242,
+            &v(&["./a.out"]),
+        );
+        let script = &argv[2];
+        assert!(script.contains("--userns 9"), "rank must join the shared userns: {script}");
+        assert!(
+            script.contains("/proc/4242/ns/user"),
+            "the holder's namespace must be named: {script}"
+        );
+        assert!(
+            !script.contains("--unshare-user"),
+            "a rank must never make its own user namespace: {script}"
+        );
+    }
+
+    #[test]
+    fn a_rank_refuses_to_run_when_the_cage_holder_is_gone() {
+        // Fail CLOSED. Falling back to a private user namespace would run the workload in
+        // a cage that cannot CMA its peers, which surfaces as an obscure MPI abort rather
+        // than as the containment change it actually is. pid 1 is the wrong namespace but
+        // readable; a pid that does not exist must stop the rank outright.
+        let argv = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            4_000_000_000, // above any pid_max: cannot exist
+            &v(&["./a.out"]),
+        );
+        let out = std::process::Command::new("/bin/sh")
+            .args(&argv[1..])
+            .env("SLURM_JOB_ID", "1")
+            .env("SLURM_STEP_ID", "0")
+            .output()
+            .expect("run the wrapper script");
+        assert!(!out.status.success(), "a rank without a cage holder must not run");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("cage holder is gone"), "must say why: {err}");
     }
 
     #[test]

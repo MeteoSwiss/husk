@@ -83,54 +83,70 @@ extern "C" {
     fn libc_getppid() -> std::os::raw::c_int;
 }
 
-/// `--join-cage <PID> -- <command...>` — enter the node cage held by PID, then exec.
+/// `--hold-cage` — own the node cage's namespaces and nothing else.
 ///
-/// Handled before anything else in `main`, and it never returns. Two reasons it is not
-/// folded into the normal argument loop: the trailing command must reach `exec` byte for
-/// byte rather than being parsed, and this mode must NOT run the daemon preamble.
-/// `refuse_to_be_read()` in particular would be actively wrong here — a non-dumpable rank
-/// cannot be a CMA target, which is precisely the capability the node cage exists to
-/// restore for Cray MPICH. What is right for the broker is wrong for a rank.
-fn join_cage_mode(args: &[String]) -> ! {
-    let pid: u32 = match args.first().and_then(|s| s.parse().ok()) {
-        Some(p) => p,
-        None => {
-            eprintln!("husk: --join-cage needs the cage holder's pid");
-            std::process::exit(2);
-        }
-    };
-    let rest = match args.get(1).map(String::as_str) {
-        Some("--") => &args[2..],
-        _ => {
-            eprintln!("husk: --join-cage <PID> must be followed by -- <command>");
-            std::process::exit(2);
-        }
-    };
-    let Some((program, argv)) = rest.split_first() else {
-        eprintln!("husk: --join-cage: no command to run after --");
-        std::process::exit(2);
-    };
+/// Creates one **bare** user namespace, identity-maps this user into it, and does nothing
+/// else for as long as the job needs it. No mounts, no network: every rank still builds
+/// its own cage with `bwrap --userns <this>`, and sharing only the user namespace is what
+/// makes rank-to-rank CMA legal (see the `cage` module).
+///
+/// Deliberately not `unshare(1) -- sleep`: the namespace is created in-process so the map
+/// is ours to guarantee rather than a flag to trust, and so nothing sits between the
+/// step-broker and this process to swallow the shutdown signal.
+///
+/// **The step-broker spawns this; it must never BE this.** The broker is defined by being
+/// outside the cage — it holds MUNGE, the daemon route and the real `srun`, all of which
+/// the cage removes. Sharing the ranks' user namespace would also make the broker a valid
+/// `ptrace_may_access` target, and "the broker is not a target" is half the argument that
+/// made the CMA read concession acceptable at all (`PR_SET_DUMPABLE` is the other half).
+///
+/// Prints its pid, then blocks until stdin reaches EOF. The pid is reported by the holder
+/// itself rather than taken from `Child::id()` so that it is the pid actually inside the
+/// namespace. Two independent shutdown paths, because a namespace leaked per job would
+/// accumulate on a node: EOF on stdin when the step-broker drops the pipe, and `PDEATHSIG`
+/// if the step-broker dies without dropping anything.
+fn hold_cage_mode() -> ! {
+    die_with_parent();
 
-    // Fail CLOSED. A per-task cage that cannot be built means the task does not run; a
-    // join that quietly did nothing would mean the task runs OUTSIDE the cage with
-    // /users visible and nothing in its output saying so. So: no exec unless `enter`
-    // returned Ok.
-    if let Err(e) = cage::enter(&cage::CageSpec::of_pid(pid)) {
-        eprintln!("husk: refusing to run this rank uncaged: {e}");
+    if let Err(e) = cage::create_shared_userns() {
+        eprintln!("husk: {e}");
         std::process::exit(1);
     }
 
-    use std::os::unix::process::CommandExt as _;
-    let err = std::process::Command::new(program).args(argv).exec();
-    eprintln!("husk: could not exec {program} inside the node cage: {err}");
-    std::process::exit(126);
+    // NOTE: the holder deliberately does NOT call refuse_to_be_read().
+    //
+    // `PR_SET_DUMPABLE(0)` is right for the broker and wrong here. Reading
+    // `/proc/<pid>/ns/*` goes through `ptrace_may_access`, and clearing the flag makes
+    // the kernel demand CAP_SYS_PTRACE for it — so a non-dumpable holder risks being a
+    // holder whose namespaces the ranks cannot open. It also makes `/proc/<pid>` root-
+    // owned, which is confusing to anyone debugging a step.
+    //
+    // The exposure is nil in a way the broker's is not: this process holds no
+    // credentials, no daemon route and no memory worth reading. It exists only to keep
+    // two namespaces alive, and every process that could read it is already inside them.
+
+    use std::io::{Read, Write};
+    println!("{}", std::process::id());
+    if std::io::stdout().flush().is_err() {
+        eprintln!("husk: cage holder could not report readiness");
+        std::process::exit(1);
+    }
+
+    let mut buf = [0u8; 64];
+    loop {
+        match std::io::stdin().read(&mut buf) {
+            Ok(0) | Err(_) => break, // broker closed the pipe, or it broke: either way, done
+            Ok(_) => continue,       // nothing is expected on this channel; ignore it
+        }
+    }
+    std::process::exit(0);
 }
 
 fn main() {
-    // Before the daemon preamble — see join_cage_mode.
+    // Before the daemon preamble: the holder must not run it — see hold_cage_mode.
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.first().map(String::as_str) == Some("--join-cage") {
-        join_cage_mode(&argv[1..]);
+    if argv.first().map(String::as_str) == Some("--hold-cage") {
+        hold_cage_mode();
     }
 
     die_with_parent();

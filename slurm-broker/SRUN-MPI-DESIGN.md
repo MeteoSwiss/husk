@@ -3,9 +3,9 @@
 **Status: the brokering works end to end — ICON ran to completion inside husk on Balfrin
 (2026-07-31): single node, 4 MPI ranks, GPU. But it needed
 `MPICH_SMP_SINGLE_COPY_MODE=NONE`, and removing that tax turned out to require a design
-change rather than a filter change: the cage must be built ONCE PER NODE and joined by
-each task, not built per task.** See "The redesign — one cage per node" below; the reason
-is in "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
+change rather than a filter change: all ranks of a job must SHARE ONE USER NAMESPACE,
+instead of each `bwrap` making a private one.** See "The redesign" below; the reason is in
+"the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
 
 Branch `experimental`, off the frozen v0.4 `main`. Built and on hardware: cage profiles
 (topology forced, multi-node rejected), the seccomp `--profile` flag with the CMA
@@ -639,46 +639,70 @@ the workload needs. It has to become a **two-process, two-cage** probe. Same sha
 C12, which measured AF_UNIX on a sample containing no CUDA: *a green probe means the
 probe's scenario passes.*
 
-## The redesign — one cage per node (TO BUILD)
+## The redesign — one shared user namespace per job (built, hardware run pending)
 
 **The border is the job on a node, not the process.** Ranks of one job share uid,
 allocation, files and data; there is no boundary between rank 0 and rank 3 to defend. The
-per-task cage was making N redundant copies of the *job ↔ host* wall, and the copies cost
-capability: CMA (above), `--unshare-pid` (ruled out earlier for the same reason), one socat
-per rank instead of one per node, and per-job binds repeated per task. See "the unit of
+per-task cage was making N redundant copies of the *job ↔ host* wall — and one of those
+copies, the user namespace, was silently costing us a capability. See "the unit of
 confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
 
-**Shape.** The step-broker builds the cage **once per node** and holds it open; each task
-joins it, applies seccomp, and execs the workload. It has to be *joining* rather than
-"run bwrap once", because `srun` launches the tasks — `slurmstepd` execs each one
-independently, so they can never be children of a bwrap we started.
+**Shape — and it is smaller than it first looked.** The step-broker starts a **cage
+holder**: a child process that owns one *bare* user namespace, identity-mapped, and does
+nothing else. Every rank still builds its own cage with `bwrap`, but hands it that
+namespace via `--userns` instead of letting bwrap make a private one.
 
-Mechanism notes, measured (bwrap 0.11.0 on Balfrin, 0.6.1 locally):
-- `bwrap --userns FD` exists and is how a task enters an existing user namespace.
-  **`bwrap` always creates its own userns when unprivileged unless given `--userns`** —
-  so a per-task `bwrap` nested inside a shared namespace still produces siblings, and
-  still fails. This is the trap to avoid when implementing.
-- `bwrap` has `--userns FD` and `--pidns FD` but **no `--netns FD`**, so the network
-  namespace must be entered by `setns` before `bwrap`.
-- `setns` into a netns needs `CAP_SYS_ADMIN` in *both* the target's user namespace and the
-  caller's own — so the **user namespace must be joined first**. Verified: joining the
-  netns from outside the userns fails `EPERM`.
-- The uid map must be **identity**, never a root map — see the userns root-map episode.
+**Only the user namespace is shared, and that is the whole finding.** It is the sole
+namespace that was costing us a capability — sibling user namespaces cannot
+`ptrace_may_access` each other, which is what killed CMA. Mount and network namespaces
+stay per rank: they are identical copies built from identical arguments, they never
+blocked anything, and duplicating them is free.
 
-**Fail-closed joining is the one new risk.** With a per-task cage, failing to build it
-means the task does not run; with joining, a bug means the task runs **outside** the cage,
-silently. After `setns` a task must verify `/proc/self/ns/{user,mnt,net}` are the expected
-namespaces and abort before exec. Write that test first.
+An earlier draft had ranks `setns` into a cage that bwrap had built. **That cannot work**,
+measured rather than reasoned: `bwrap` constructs its sandbox through an intermediate user
+namespace and then switches to a second one, so the mount and network namespaces it
+creates are owned by a user namespace no rank ever joins — `setns` into either fails
+`EPERM` however it is ordered (holder userns `…4687`, initial `…1837`, holder netns owned
+by `…4599`). bwrap is not built to be joined from outside. Hence a *bare* namespace with
+nothing in it to join incorrectly.
 
-**Bonus this unlocks:** one network gateway per node instead of one per rank. `socat`'s
-`fork` option already forks a child per accepted connection, so a single bridge serves 4
-ranks or 128 — the concurrency question is answered before the network phase begins.
+Measured end to end on a laptop, 2026-07-31:
+
+| case | result |
+|---|---|
+| two ranks sharing the holder's userns, CMA read | **OK** |
+| control: same two ranks, each with its own userns | **EPERM** — ICON's exact error |
+| uid inside the cage | `1000` — identity map, not a root map |
+| holder teardown on stdin EOF, and on parent death | both clean, no leaked namespace |
+
+**Fail-closed in two places.** The rank script refuses to run if the holder's namespace is
+not readable, with a sentence rather than a shell diagnostic; and `bwrap --userns` exits
+rather than inventing a namespace. Falling back to a private namespace would be the
+dangerous outcome — the workload would run in a cage that cannot talk to its peers, which
+surfaces as an obscure MPI abort rather than as the containment change it actually is.
+
+**Holder lifetime.** One per JOB, not per step: nothing in it is step-specific, and a
+namespace per step is a process per step to leak. It dies two ways — EOF on stdin when the
+step-broker drops the pipe, and `PDEATHSIG` if the step-broker dies without dropping
+anything. It must stay **dumpable**: reading `/proc/<pid>/ns/user` goes through
+`ptrace_may_access`, so a holder that cleared `PR_SET_DUMPABLE` like the broker does would
+be one whose namespace no rank could open.
+
+**Consequence for the network phase.** Ranks keep separate network namespaces, so the
+*relay* into a cage stays per rank. The filtering proxy — the allowlist, the TLS
+termination, the audit point, the expensive part — is **one per node**, reached through a
+unix socket bind-mounted into every rank's cage. A unix socket crosses a network namespace
+because it is a filesystem object: the same reasoning that makes the MUNGE *mount* mask
+load-bearing rather than a syscall filter. Policy is never duplicated; only a byte-shuffler
+is, at a couple of MB per rank. A single relay per node would need a shared network
+namespace, which needs a sandbox builder we own — roadmap step 5, and exactly the shape of
+Anthropic's `srt-launcher`.
 
 ## Chapter 1 — the rank cage, as specified by hardware
 
-**Superseded in shape by the redesign above, not in content:** every bind below is still required;
-what changes is that they are applied **once per node** rather than per task. Everything
-here is measured on Balfrin, not inferred. Per task, the guard currently runs:
+**Still current.** The redesign above changes only where the *user namespace* comes from;
+every bind below is unchanged and still applied per task. Everything here is measured on
+Balfrin, not inferred. Per task, the guard runs:
 
 ```
 --ro-bind / /                                  # root read-only (unchanged)
@@ -688,7 +712,8 @@ here is measured on Balfrin, not inferred. Per task, the guard currently runs:
 --tmpfs /tmp
 --bind /dev/shm/husk-$SLURM_JOB_ID /dev/shm    # per-JOB shm, created by the guard (0700)
 --bind-try $SlurmdSpoolDir/mpi_cray_shasta/$SLURM_JOB_ID.$SLURM_STEP_ID  <same>
---unshare-net                                  # KEPT — full IP isolation
+--userns <fd of the job's shared user namespace>  # NOT --unshare-user: see the redesign
+--unshare-net                                  # KEPT — full IP isolation, per rank
 + the existing filesystem policy (homes hidden, credentials masked, workdir writable)
 ```
 
