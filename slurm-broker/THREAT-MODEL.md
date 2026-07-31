@@ -9,7 +9,8 @@ compute node (`seccomp-wrapper bwrap …`):
 - `--ro-bind <allowRead carve-outs>` — specific re-exposed reads
 - credential file denies, env masking, symlink guard (features below)
 - `--dev-bind-try /dev/nvidia*` — GPUs
-- `--unshare-net` — no network **(current — treated as TEMPORARY)**
+- `--unshare-net` — no network by default; with an allowlist configured, **one hole**: a
+  unix socket to husk's egress proxy, which runs outside the cage (see below)
 
 ## Design principle (confine, do not merely forbid)
 
@@ -131,6 +132,39 @@ Two consequences to hold to:
 Generalises beyond MPI: the question to ask of any new cage is *what is the trust
 domain here*, and to put exactly one wall around it.
 
+## Design principle (the network hole)
+
+Egress is off by default and, when configured, is **one hole of a shape husk chooses**:
+
+```
+rank/job cage (--unshare-net: no route at all)
+  socat TCP-LISTEN:3128 ──► <spool>/net.sock ──► husk proxy ──► the internet
+        (dumb relay)         (a FILE, not a route)  (outside the cage)
+```
+
+The socket crosses the network namespace because it is a **filesystem** object, not a
+route — the same reasoning that makes the `/run/munge` mount mask load-bearing rather than
+a syscall filter. Nothing is bind-mounted specially for it: it lives in the step spool,
+inside the workdir the cage already binds.
+
+Three properties are asserted rather than assumed, by `selftest.sh`:
+
+1. **The hole is the only hole.** A direct connection from inside the cage must still
+   fail. If it ever succeeds, the allowlist is decoration.
+2. **An unlisted host is refused with a 403**, not a timeout — a refusal that looks like a
+   network fault costs somebody an afternoon.
+3. **SLURM daemon ports are refused**, including under `*`. AV8 as a test rather than a
+   paragraph.
+
+The policy is enforced **outside** the cage, in the broker's trust domain, and read from
+files the agent cannot write. The relay inside the cage carries no policy at all: one
+proxy per node, one relay per rank, and what must never be duplicated is the decision.
+
+What this does NOT give: control over *what* a job says, only *where* it may say it.
+husk tunnels bytes after authorising the destination and never inspects them. Content
+control needs TLS termination — ROADMAP 6b, where it also buys credential injection so an
+agent can use an API key it never sees.
+
 ## Design principle (the cage)
 Layers must be **independent**. `--unshare-net` *will* be relaxed (allowlisted
 socat at best, open internet at worst), so the **filesystem cage must protect
@@ -243,9 +277,9 @@ cooperative gates disappear, and the sentence still reads correctly.
 | **AV3** | tamper the job's own outputs/results you trust | LOW–MED (integrity) | — (user's own writable space) | **accepted / out of scope** |
 | **AV4** | read another user's loose-perm `/capstor` data → exfiltrate | MED–HIGH | **unix permissions** (job runs as you; reads only what you can) + optional `denyRead` | not a cage regression (= login) |
 | **AV5** | symlink from writable workdir to a hidden home | LOW | `/users` tmpfs (link → empty) + F5 | **covered** |
-| **AV6** | general internet abuse — C2, download-and-run, botnet, internal scan | HIGH open / LOW allowlisted | **network policy** (`--unshare-net` today; allowlisted socat target) — *not* an FS control | network-layer decision |
+| **AV6** | general internet abuse — C2, download-and-run, botnet, internal scan | HIGH open / LOW allowlisted | **network policy**: `--unshare-net` plus, when configured, a host+port allowlist enforced by husk's own proxy OUTSIDE the cage — *not* an FS control | **implemented**; `*` remains available for sites that choose open egress |
 | **AV7** | read a secret from the **inherited env** → exfiltrate | HIGH | F4 (`--unsetenv` of declared `credentials.envVars`) + compute-cage `--unshare-net` (no exfil route today) | **partial** — the broker forces `--export=ALL` on BOTH paths (only ALL activates the uenv view), so an un-declared secret env var is residual on every submission |
-| **AV8** | direct `sbatch`/`srun` from the compute node (MUNGE + net) → **bypass the broker** | HIGH | `--unshare-net` today (no route to `slurmctld`); when net opens: re-block SLURM-from-compute (shadow `sbatch`/`srun`, or keep `slurmctld` off the allowlist, or block MUNGE AF_UNIX on compute) | **LANDMINE** — covered only by no-net |
+| **AV8** | direct `sbatch`/`srun` from the compute node (MUNGE + net) → **bypass the broker** | HIGH | THREE independent controls now: `/run/munge` masked so a job cannot authenticate; SLURM daemon ports refused by the proxy even under `*`; and `srun` itself brokered. `--unshare-net` is no longer the only thing holding it | **covered** — was a landmine while no-net was the sole control |
 
 ## Key findings
 1. **`/users` tmpfs is the network-independent backbone** — kills home secrets,
