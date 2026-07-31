@@ -72,10 +72,34 @@ redundant copies of the same wall, and one of those copies silently cost us CMA.
    is per rank. The host-side allowlist must accept **host-or-IP + port**, not just
    domains, because a self-hosted model endpoint is an internal address with no SNI.
 
-3b. **Remaining network work before the review:** egress is wired into the JOB cage only.
-   MPI ranks keep their own netns and have no egress — deliberate, since the job script is
-   where downloads happen and the rank path is the one we just stabilised. Wire the relay
-   into the rank cage if a workload needs it.
+3b. **Rank egress — deferred, pending real demand (Christoph 2026-07-31).** Egress is
+   wired into the JOB cage only: `wget` in the sbatch script works, `srun wget` does not.
+   Ranks keep their own network namespace, so the job cage's `127.0.0.1:3128` reaches
+   nothing there; the proxy variables are dropped rather than forwarded so a rank fails
+   like a machine with no network rather than one with a broken proxy.
+
+   **Who would need it:** not the symmetric case (a climate run splitting one problem over
+   hundreds of patches), but ASYMMETRIC workloads — one rank fetching from the internet,
+   another parsing, a third computing. ICON's IO and prefetch ranks are asymmetric but do
+   *not* need network, so they already work. Christoph is asking inside MeteoSwiss whether
+   anyone relies on it.
+
+   **Cost if wanted: about half a day, ~30 lines.** (i) reorder the guard so the proxy
+   starts before the step-broker, which lets the step-broker inherit `HUSK_NET_SOCK`;
+   (ii) `step.rs` passes the path to `rank::wrap_command` — passed, never reconstructed, so
+   the path logic stays in one place; (iii) `rank.rs` starts a relay inside the cage before
+   exec'ing the workload, which turns the exec target into `/bin/sh -c '<relay>; exec "$@"'`.
+   **(iii) is the risky one**: shell quoting inside a shell script inside a Rust format
+   string is precisely the construction that once shipped literal quote characters into
+   bwrap and killed every job. The test that catches it already exists — the rank script is
+   EXECUTED against a stub and its argv inspected — and needs extending, not inventing.
+   Costs one extra `sh` + `socat` per rank (~256 small processes on a 128-rank node) and
+   depends on `socat` being present, which the guard already checks for and warns about.
+
+   **Do not** try to share one netns across ranks so a single relay serves all: `bwrap`
+   builds its sandbox through an intermediate user namespace, so the netns it creates is
+   owned by a namespace no rank can join, and there is no `--netns` to hand it one. This
+   was measured during the CMA work. Per-rank relay is the available shape.
 
 4. **Security review before release** — a multi-agent adversarial pass over the whole
    surface, as was done for v0.4, where it found four criticals. The submission surface,
