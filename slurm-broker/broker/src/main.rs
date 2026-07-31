@@ -115,11 +115,18 @@ fn hold_cage_mode() -> ! {
 
     // NOTE: the holder deliberately does NOT call refuse_to_be_read().
     //
-    // `PR_SET_DUMPABLE(0)` is right for the broker and wrong here. Reading
-    // `/proc/<pid>/ns/*` goes through `ptrace_may_access`, and clearing the flag makes
-    // the kernel demand CAP_SYS_PTRACE for it — so a non-dumpable holder risks being a
-    // holder whose namespaces the ranks cannot open. It also makes `/proc/<pid>` root-
-    // owned, which is confusing to anyone debugging a step.
+    // NOT because it cannot. Measured 2026-07-31 on kernel 6.8: a holder that clears
+    // PR_SET_DUMPABLE can still be opened and joined with `bwrap --userns` by a sibling
+    // process, so the flag is available here. An earlier comment claimed otherwise and
+    // was never measured.
+    //
+    // It is left off because the trade is bad. The gain is a third layer on something
+    // already protected twice over — a rank cannot read this process (measured), and it
+    // holds no credentials, no daemon route and no memory worth reading. The risk is
+    // kernel-dependent: that measurement is from 6.8, Balfrin runs 5.14 Cray Shasta, and
+    // if joining did break there then EVERY step would die. Measure on the target before
+    // trading a working MPI path for defence in depth on an empty process. It also makes
+    // `/proc/<pid>` root-owned, which already misled one debugging session.
     //
     // It does not need the flag anyway: a rank is MEASURABLY unable to read this process
     // (2026-07-31, `process_vm_readv` -> EPERM with Yama neutralised, against a control

@@ -56,9 +56,20 @@ Two consequences to hold to:
    namespace** — not the holder, not an uncaged process, not even a fully dumpable one.
    So the broker now has *two* independent protections rather than one: the namespace
    boundary and `PR_SET_DUMPABLE`. Keep both; neither should be load-bearing alone. It
-   also means the holder is protected without the dumpable flag, which it cannot use —
-   clearing it would make `/proc/<pid>/ns/user` unopenable and no rank could join.
+   also means the holder is protected without needing the dumpable flag. It *could* use
+   it — measured on kernel 6.8, a non-dumpable holder is still openable and joinable with
+   `bwrap --userns`, correcting an earlier claim here that it could not — but it is left
+   off deliberately: the gain is a third layer on a process that is already unreadable and
+   holds nothing, while the risk is kernel-dependent (Balfrin runs 5.14; if joining broke
+   there, every step would die). Measure on the target before making that trade.
    Belongs in `selftest.sh` as a hardware-verified arm rather than an inference.
+
+   **Scope of the CMA concession, stated exactly.** A rank can read the memory of the
+   other ranks of ITS OWN job, and nothing else: not the broker, not an uncaged process,
+   not another job's ranks (they have their own holder, so they are siblings — the very
+   configuration that returns `EPERM`). The login cage is untouched, since the exemption
+   is `--profile=single-node` only and smoke test 8 pins that it cannot leak into
+   `--profile=login`.
 
 2. **Sharing is scoped to the job, and is exactly one namespace.** Only the **user**
    namespace is shared, because it is the only one that cost a capability; mount and
