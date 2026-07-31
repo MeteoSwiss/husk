@@ -45,6 +45,22 @@ An out-of-subtree request is **rejected with a teaching message**, not silently 
 A job whose logs went somewhere other than where it asked is the failure mode that wastes
 an afternoon.
 
+**Native `sbatch` is the reference.** Where husk behaves differently without a security
+argument, husk is wrong. The old forced `--chdir` was such a divergence — nobody chose it,
+it was just what "force the option to a constant" produced, and it silently ignored the
+`#SBATCH --chdir` that plain `sbatch` honours. Verified 2026-07-31: submitting ICON
+uncaged resolves every path correctly *because* `--chdir` is obeyed. A divergence with no
+threat behind it is a bug, exactly as an undeclared cage-profile divergence is.
+
+**When a constant becomes configurable, audit every place that assumed it.** Making
+`--chdir` settable turned two strings that had always been identical — the job's `$PWD`
+and the broker's validated `req.cwd` — into two different things, and the guard was
+passing `$PWD` to the step-broker. The rank cage's writable region silently narrowed to
+whatever subdirectory the job started in, and the symptom was a Fortran I/O error deep
+inside ICON's initialisation with nothing pointing at husk. Same family as *capture
+values, don't trust references*: the reference was fine until the thing it referred to
+could move.
+
 ## Design principle (the unit of confinement) — one cage per job-on-a-node
 
 **The security border is the job on a node, not the process.** All ranks of one MPI
