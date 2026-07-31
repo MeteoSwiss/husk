@@ -35,19 +35,17 @@ use crate::settings::sh_quote;
 const RESERVED_ENV_PREFIXES: &[&str] =
     &["SLURM_", "SBATCH_", "PMI_", "PMIX_", "PALS_", "HUSK_"];
 
-/// Proxy variables, dropped rather than forwarded — for now.
+/// Proxy variables are never forwarded — they are a property of the namespace you are in.
 ///
-/// The job cage runs an egress relay on `127.0.0.1:3128` and exports these so the job
-/// script can simply use the network. A RANK is in its own network namespace with its own
-/// empty loopback, so the same address reaches nothing. Forwarding them would hand every
-/// rank a proxy setting pointing at a closed port, and a download inside `srun` would fail
-/// with "cannot connect to proxy" — which reads as "husk's proxy is broken" when the truth
-/// is "there is no proxy here". A rank with no egress should fail like a machine with no
-/// network, not like a machine with a broken one.
+/// The job cage exports these pointing at its own relay. A rank has its OWN network
+/// namespace with its own empty loopback, so that address means something different here:
+/// forwarding the job's value would hand a rank a proxy setting for a socket it cannot
+/// reach. The rank script sets them itself, and only after confirming it could start a
+/// relay — so a rank without egress looks like a machine with no network rather than one
+/// with a broken proxy.
 ///
-/// This is a stopgap for an asymmetry, not a design: see the rank-egress note in
-/// ROADMAP.md. When the relay is wired into the rank cage these stop being dropped and
-/// start being true.
+/// The general rule, worth keeping: values that describe a NAMESPACE do not travel across
+/// one. Inherit facts about the job; re-derive facts about where you are.
 const PROXY_ENV: &[&str] = &[
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
     "http_proxy", "https_proxy", "all_proxy", "no_proxy",
@@ -139,6 +137,48 @@ pub fn env_args(
     out
 }
 
+/// The final line of the rank script: enter the cage and run the workload.
+///
+/// Two shapes, chosen by the BROKER rather than branched on at run time, so a job with no
+/// egress produces exactly the script it produced before this feature existed — no extra
+/// process, no extra shell, nothing to regress.
+///
+/// With egress, the workload is preceded inside the cage by a relay: `socat` forwarding
+/// loopback:3128 to the proxy's unix socket. Each rank needs its own because each rank has
+/// its own network namespace — the relay is a per-namespace adapter, not a per-rank policy.
+/// The single proxy outside the cage still makes every decision and writes every log.
+///
+/// **The inner script is a shell VARIABLE, not an interpolated literal.** Nesting a quoted
+/// script inside a quoted script inside a Rust format string is how the srun bind once
+/// shipped literal quote characters into bwrap and killed every job; assigning it once and
+/// passing `"$_husk_inner"` keeps exactly one level of quoting. The socket path travels in
+/// an exported variable for the same reason — `sh_quote` produces single quotes, which
+/// cannot appear inside the single-quoted assignment.
+fn exec_line(profile: Profile, bwrap: &str, net_sock: Option<&str>) -> String {
+    let sec = profile.seccomp_profile();
+    let cage = format!(
+        "seccomp-wrapper --profile={sec} bwrap --userns 9 {bwrap} \
+         --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
+    );
+    match net_sock {
+        None => format!("exec {cage} \"$@\"\n"),
+        Some(sock) => format!(
+            "export _HUSK_NET_SOCK={sock}\n\
+             _husk_inner='if command -v socat >/dev/null 2>&1; then\n\
+             socat TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 \
+             UNIX-CONNECT:\"$_HUSK_NET_SOCK\" >/dev/null 2>&1 &\n\
+             export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128\n\
+             export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128\n\
+             export ALL_PROXY=http://127.0.0.1:3128 all_proxy=http://127.0.0.1:3128\n\
+             export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1\n\
+             fi\n\
+             exec \"$@\"'\n\
+             exec {cage} /bin/sh -c \"$_husk_inner\" husk-rank \"$@\"\n",
+            sock = sh_quote(sock)
+        ),
+    }
+}
+
 /// Build the argv that follows srun's options: `sh -c <script> husk-rank <command...>`.
 ///
 /// `spool_dir` is Slurm's `SlurmdSpoolDir` as resolved by the step-broker (trusted);
@@ -148,6 +188,7 @@ pub fn wrap_command(
     rank_args: &[String],
     spool_dir: &str,
     holder_pid: u32,
+    net_sock: Option<&str>,
     command: &[String],
 ) -> Vec<String> {
     let bwrap = rank_args
@@ -189,11 +230,10 @@ pub fn wrap_command(
          exit 1\n\
          fi\n\
          _s={spool}/mpi_cray_shasta/${{SLURM_JOB_ID}}.${{SLURM_STEP_ID}}\n\
-         exec seccomp-wrapper --profile={sec} bwrap --userns 9 {bwrap} \
-         --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" -- \"$@\"\n",
+         {exec_line}",
         userns = sh_quote(&userns),
         spool = sh_quote(spool_dir),
-        sec = profile.seccomp_profile(),
+        exec_line = exec_line(profile, &bwrap, net_sock),
     );
 
     let mut argv = vec![
@@ -225,7 +265,7 @@ mod tests {
 
     fn built(command: &[&str]) -> Vec<String> {
         let rank = FsPolicy::default().rank_bwrap_args("/work");
-        wrap_command(Profile::SingleNode, &rank, "/var/spool/slurmd", live_holder(), &v(command))
+        wrap_command(Profile::SingleNode, &rank, "/var/spool/slurmd", live_holder(), None, &v(command))
     }
 
     fn envmap(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
@@ -340,7 +380,7 @@ mod tests {
             c
         };
         let argv =
-            wrap_command(Profile::SingleNode, &cage, "/var/spool/slurmd", 4242, &v(&["./a.out"]));
+            wrap_command(Profile::SingleNode, &cage, "/var/spool/slurmd", 4242, None, &v(&["./a.out"]));
         let script = &argv[2];
         // It must arrive as a --setenv pair, i.e. consumed by bwrap...
         assert!(script.contains("'--setenv' 'LD_PRELOAD' '/tmp/evil.so'"), "{script}");
@@ -403,7 +443,7 @@ mod tests {
     #[test]
     fn broker_supplied_values_are_shell_quoted() {
         let rank = FsPolicy::default().rank_bwrap_args("/work");
-        let argv = wrap_command(Profile::SingleNode, &rank, "/odd path/spool", 4242, &v(&["./a"]));
+        let argv = wrap_command(Profile::SingleNode, &rank, "/odd path/spool", 4242, None, &v(&["./a"]));
         assert!(argv[2].contains("'/odd path/spool'"), "{}", argv[2]);
     }
 
@@ -418,6 +458,7 @@ mod tests {
             &FsPolicy::default().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
             4242,
+            None,
             &v(&["./a.out"]),
         );
         let script = &argv[2];
@@ -443,6 +484,7 @@ mod tests {
             &FsPolicy::default().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
             4_000_000_000, // above any pid_max: cannot exist
+            None,
             &v(&["./a.out"]),
         );
         let out = std::process::Command::new("/bin/sh")
@@ -454,6 +496,91 @@ mod tests {
         assert!(!out.status.success(), "a rank without a cage holder must not run");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("cage holder is gone"), "must say why: {err}");
+    }
+
+    #[test]
+    fn a_rank_without_egress_gets_exactly_the_old_script() {
+        // The no-network case must be byte-for-byte what it was before egress existed:
+        // no extra shell, no extra process, nothing to regress for a job that never asked
+        // for a network. That is why the broker chooses the shape instead of the script
+        // branching at run time.
+        let script = &built(&["./a.out"])[2];
+        assert!(!script.contains("socat"), "no relay without a socket: {script}");
+        assert!(!script.contains("_husk_inner"), "no inner shell without a socket: {script}");
+        assert!(script.contains("-- \"$@\""), "the workload is exec'd directly: {script}");
+    }
+
+    #[test]
+    fn a_rank_with_egress_starts_its_own_relay() {
+        // Each rank has its OWN network namespace, so the job cage's relay is unreachable
+        // from here - the per-rank relay is a per-namespace adapter, not a second policy.
+        // The single proxy outside the cage still decides everything.
+        let argv = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            live_holder(),
+            Some("/work/.husk-step-spool-7/net.sock"),
+            &v(&["./a.out"]),
+        );
+        let script = &argv[2];
+        assert!(script.contains("socat TCP-LISTEN:3128"), "{script}");
+        assert!(script.contains("bind=127.0.0.1"), "the relay listens on loopback only: {script}");
+        assert!(script.contains("/work/.husk-step-spool-7/net.sock"), "{script}");
+        assert!(script.contains("HTTPS_PROXY=http://127.0.0.1:3128"), "{script}");
+        // The proxy variables are exported only when socat is actually present: a rank
+        // that cannot start a relay must look like a machine with no network, not one
+        // with a broken proxy.
+        assert!(script.contains("command -v socat"), "{script}");
+    }
+
+    #[test]
+    fn executing_it_with_egress_still_passes_the_command_through_untouched() {
+        // THE QUOTING HAZARD. Adding the relay turns the exec target into a shell, so the
+        // workload's argv now crosses one more quoting boundary - and shipping literal
+        // quote characters into bwrap is precisely how the srun bind once took every job
+        // down. Inspecting the text cannot catch that; running it and reading the
+        // arguments can.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("husk-ranknet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("seccomp-wrapper");
+        std::fs::write(&stub, "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let hostile = "./solver; touch /tmp/husk-pwned-$$";
+        let argv = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            live_holder(),
+            Some("/work/net.sock"),
+            &v(&[hostile, "--x=$(id)"]),
+        );
+        let job_id = format!("t{}", std::process::id());
+        let out = std::process::Command::new("/bin/sh")
+            .args(&argv[1..])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .env("SLURM_JOB_ID", &job_id)
+            .env("SLURM_STEP_ID", "0")
+            .output()
+            .expect("run the wrapper script");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir(format!("/dev/shm/husk-{job_id}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            stdout.contains(&format!("ARG:{hostile}")),
+            "the command must still arrive verbatim as ONE argument:\n{stdout}"
+        );
+        assert!(stdout.contains("ARG:--x=$(id)"), "no command substitution:\n{stdout}");
+        assert!(!stdout.contains("ARG:'"), "no literal quotes may reach the cage:\n{stdout}");
+        assert!(
+            !std::path::Path::new(&format!("/tmp/husk-pwned-{}", std::process::id())).exists(),
+            "the hostile command must not have executed"
+        );
     }
 
     #[test]

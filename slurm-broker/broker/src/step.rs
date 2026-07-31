@@ -66,6 +66,13 @@ pub struct StepBroker {
     in_flight: Vec<Running>,
     /// The job's shared user namespace, owned by a child process. See `cage`.
     holder: Option<CageHolder>,
+    /// The egress proxy's socket, inherited from the guard that started us.
+    ///
+    /// INHERITED rather than reconstructed from the job id: the guard builds this path
+    /// once and exports it, so there is a single origin. Rebuilding it here from
+    /// `SLURM_JOB_ID` would be a second copy of the same construction, and the two would
+    /// eventually disagree — which is the failure this project keeps meeting.
+    net_sock: Option<String>,
 }
 
 /// The child that owns the job's shared user namespace.
@@ -98,6 +105,7 @@ impl StepBroker {
             base_env: std::env::vars().collect(),
             in_flight: Vec::new(),
             holder: None,
+            net_sock: std::env::var("HUSK_NET_SOCK").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -311,6 +319,7 @@ impl StepBroker {
             &cage,
             &self.slurmd_spool,
             holder_pid,
+            self.net_sock.as_deref(),
             &step.command,
         ));
 

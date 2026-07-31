@@ -373,7 +373,11 @@ fn wrap_script(
             r#"  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the
   # policy from the settings files itself rather than being handed it, so what is in
   # force never depends on a string carried on a command line.
-  if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
+  #
+  # Started BEFORE the step-broker on purpose: the step-broker inherits HUSK_NET_SOCK and
+  # passes it to each rank, so the socket path has ONE origin instead of being rebuilt
+  # from the job id in two places that could drift.
+  if [ -n "$_husk_spool" ]; then
     _husk_net_sock="$_husk_spool/net.sock"
     "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD"       >>"$_husk_spool/net-proxy.log" 2>&1 &
     _husk_net_pid=$!
@@ -422,13 +426,18 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   # missing kills the cage outright. If any of it is absent the job still runs - srun\n\
   # simply is not brokered, and fails in the cage for want of a route, which is the\n\
   # status quo. The stub is convenience, not containment.\n\
-  _husk_step_pid=\n\
+  # The job spool. Hoisted OUT of the step-pair block below: it holds the step spool AND\n\
+  # the egress socket, and a job with no srun stub must still be able to have a network.\n\
+  # Coupling egress to the stub would have made an inactive step pair silently mean no\n\
+  # network either.\n\
+  _husk_spool={workdir_q}\"/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
+  mkdir -p \"$_husk_spool\" 2>/dev/null || _husk_spool=\n\
+{net_start}  _husk_step_pid=\n\
   _husk_stub={stub_q}\n\
   _husk_broker={broker_q}\n\
   _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
   if [ -r \"$_husk_stub\" ] && [ -x \"$_husk_broker\" ] && [ -n \"$_husk_real_srun\" ]; then\n\
-    _husk_spool={workdir_q}\"/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
-    if mkdir -p \"$_husk_spool\" 2>/dev/null; then\n\
+    if [ -n \"$_husk_spool\" ]; then\n\
       export HUSK_STEP_SPOOL=\"$_husk_spool\"\n\
       \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir {workdir_q} \\\n\
         >\"$_husk_spool/step-broker.log\" 2>&1 &\n\
@@ -448,7 +457,7 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
     echo \"husk:   a real srun in the cage cannot reach slurmctld; run husk from its\" >&2\n\
     echo \"husk:   installed prefix so <prefix>/lib/husk/srun-stub.py resolves\" >&2\n\
   fi\n\
-{net_start}  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
+  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
   # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
@@ -978,8 +987,10 @@ mod tests {
         // outside of.
         let proxy_at = on.find("--net-proxy").expect("proxy must be started");
         // Anchor on the actual exec line, not the first mention of bwrap: the guard talks
-        // about bwrap in its comments long before it runs it.
-        let cage_at = on.find("  seccomp-wrapper --profile=").expect("cage must be entered");
+        // about bwrap in its comments long before it runs it. No leading spaces - the
+        // `\n\` continuations in the Rust literal strip the indentation, so the emitted
+        // guard is flush left.
+        let cage_at = on.find("\nseccomp-wrapper --profile=").expect("cage must be entered");
         assert!(proxy_at < cage_at, "the proxy must start before the cage is entered");
         // ...and the relay runs INSIDE, after the re-exec guard has finished.
         let relay_at = on.find("socat TCP-LISTEN:3128").expect("relay must be started");

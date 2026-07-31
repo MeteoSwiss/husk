@@ -4,9 +4,12 @@
 //! # Shape, and why this one
 //!
 //! ```text
-//! rank cage (--unshare-net: no route at all)
-//!   socat TCP-LISTEN:3128 ──► /run/husk/<job>.sock ──► THIS PROXY ──► the internet
-//!         (dumb relay)          (bind-mounted in)      (outside the cage)
+//! job cage  ─ socat TCP-LISTEN:3128 ─┐
+//! rank 0    ─ socat TCP-LISTEN:3128 ─┼─► <spool>/net.sock ─► THIS PROXY ─► the internet
+//! rank 1    ─ socat TCP-LISTEN:3128 ─┘      (a FILE)          (outside,      (the only
+//!   (each has its OWN netns, so each                           holds THE      process
+//!    needs its own loopback listener;                          allowlist)     with a route)
+//!    none of them has a route anywhere)
 //! ```
 //!
 //! A unix socket crosses the network-namespace boundary because it is a **filesystem**
@@ -23,13 +26,21 @@
 //! policy in it; the allowlist, and later the TLS termination and audit, live here. What
 //! must never be duplicated is the decision.
 //!
-//! # What it is not, yet
+//! # What it is not
 //!
-//! `CONNECT` only, and no TLS termination: husk tunnels bytes after authorising the
-//! destination and never inspects them. That is honest about the guarantee — we control
-//! WHERE a job may talk, not WHAT it says. Terminating TLS would let husk hold an API key
-//! and inject it so the agent never sees the credential (ROADMAP 6b); the accept loop and
-//! the allowlist gate below do not change when that arrives.
+//! **`CONNECT` only, which means HTTPS works and plain `http://` does not.** A proxied
+//! `http://` request is an absolute-URI `GET http://host/path`, not a tunnel, so serving it
+//! would mean parsing and re-emitting the request — a second HTTP parser, and therefore a
+//! second thing that can disagree with the first about where a request is going. That is
+//! the F13/F14 shape, and the reason it is refused rather than implemented. The refusal
+//! names `https://` so the failure is actionable. In practice everything that matters is
+//! HTTPS: GitHub, PyPI, conda, the CSCS inference API.
+//!
+//! **No TLS termination**: husk tunnels bytes after authorising the destination and never
+//! inspects them. Honest about the guarantee — we control WHERE a job may talk, not WHAT
+//! it says. Terminating TLS would let husk hold an API key and inject it so the agent never
+//! sees the credential (ROADMAP 6b); neither the accept loop nor the allowlist gate below
+//! changes when that arrives.
 //!
 //! # Threat notes
 //!
@@ -80,9 +91,15 @@ fn parse_connect(head: &str) -> Result<(String, u16), String> {
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     if !method.eq_ignore_ascii_case("CONNECT") {
+        // A plain `http://` URL through a proxy is an absolute-URI request like
+        // `GET http://host/path`, NOT a tunnel — so it lands here. husk does not serve it,
+        // and the message has to say that rather than suggest setting the variable the
+        // client already set.
         return Err(format!(
-            "husk's proxy speaks CONNECT only; got {method:?}. Point HTTPS_PROXY/HTTP_PROXY \
-             at it and let your client tunnel."
+            "husk tunnels HTTPS only (CONNECT); this was a {method} request, which is what \
+             a plain http:// URL sends to a proxy. Use https:// . Forwarding plain HTTP \
+             would mean husk parsing and re-emitting your requests, and a second parser is \
+             a second thing that can disagree about where a request is going."
         ));
     }
     // Split on the LAST colon: an IPv6 literal is bracketed, so the final colon is the
@@ -287,7 +304,10 @@ mod tests {
     fn refuses_anything_that_is_not_connect() {
         // husk is a tunnel, not an HTTP implementation. A plain GET carries a URL, and
         // interpreting URLs is a second parser with its own differentials - so it is
-        // refused rather than handled.
+        // refused rather than handled. The practical consequence is that https:// works
+        // and http:// does not, which is why the refusal names https:// explicitly.
+        let why = parse_connect("GET http://example.com/ HTTP/1.1\r\n\r\n").unwrap_err();
+        assert!(why.contains("https://"), "the refusal must be actionable: {why}");
         for bad in [
             "GET http://example.com/ HTTP/1.1\r\n\r\n",
             "POST http://example.com/ HTTP/1.1\r\n\r\n",
