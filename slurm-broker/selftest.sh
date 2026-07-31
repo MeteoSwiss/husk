@@ -172,12 +172,15 @@ PY
 
 # Run the broker once over the spool. $1 = "dry" or "live". stdout -> file arg $2.
 run_broker() { # mode outfile [broker-cwd]
-  # The broker resolves its compute-cage policy (settings + credential auto-scan) from
-  # its OWN cwd. Run it from a BOUNDED dir: the spool by default (small — keeps the
-  # policy tier's scan off a huge $PWD like a $SCRATCH root), and the WORK dir for the
-  # live probe, so the credential scan actually covers the planted secret — as it does
-  # in real use, where husk is launched from the bounded project dir (== the workdir).
-  local m="$1" out="$2" cdir="${3:-$SPOOL}" flag=""
+  # The broker resolves its compute-cage policy AND the cage's writable root from its OWN
+  # cwd — that cwd IS the trusted project dir, the directory a human launched husk in.
+  # So the policy tier runs it from $PWORK, the same directory the requests carry as their
+  # cwd: that is the real-use relationship, where husk is launched in the project and the
+  # agent submits from inside it. Running it from the spool instead made project dir and
+  # request cwd diverge, which is a configuration no real session produces.
+  # Both are small, so the credential auto-scan stays bounded either way; the live probe
+  # passes the WORK dir so the scan covers the planted secret.
+  local m="$1" out="$2" cdir="${3:-$PWORK}" flag=""
   [ "$m" = dry ] && flag="--dry-run"
   ( cd "$cdir" 2>/dev/null && "$BROKER" --once --spool "$SPOOL" $flag ) >"$out" 2>>"$BROKER_LOG"
 }

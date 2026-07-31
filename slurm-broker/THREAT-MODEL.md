@@ -5,7 +5,14 @@ When the broker submits a job, the injected re-exec guard re-sandboxes it on the
 compute node (`seccomp-wrapper bwrap …`):
 - `--ro-bind / /` — whole filesystem read-only
 - `--tmpfs /users` — **all** homes hidden (own + others': `~/.ssh`, `~/.aws`, `~/.claude/settings.json`)
-- `--bind <workdir>` + `allowWrite` roots — the only writable areas
+- `--bind <project dir>` + `allowWrite` roots — the only writable areas. The project dir
+  is where **husk was launched**, captured by the broker before the agent ran — NOT the
+  directory the agent happened to be in when it ran `sbatch`. `req.cwd` is agent-supplied,
+  so deriving the write boundary from it would let the confined side choose its own
+  confinement (see "announce the boundary" below).
+- **Reads outside the cage are unrestricted** (`--ro-bind / /`), deliberately: shared input
+  data and the software stack live outside any project directory. Confidentiality rests on
+  the `/users` mask, the credential denies and env masking, not on read scoping.
 - `--ro-bind <allowRead carve-outs>` — specific re-exposed reads
 - credential file denies, env masking, symlink guard (features below)
 - `--dev-bind-try /dev/nvidia*` — GPUs
@@ -61,6 +68,35 @@ whatever subdirectory the job started in, and the symptom was a Fortran I/O erro
 inside ICON's initialisation with nothing pointing at husk. Same family as *capture
 values, don't trust references*: the reference was fine until the thing it referred to
 could move.
+
+## Design principle (announce the boundary)
+
+A cage whose denials are indistinguishable from filesystem or quota errors sends agents
+down expensive wrong paths. Worse for an LLM specifically: an unattributed error does not
+merely slow it down, it invites *confident wrong remediation* — rewriting a runscript that
+was never broken, or blaming Lustre.
+
+Measured, 2026-07-31, from a caged agent running a production KENDA experiment: the job
+died with 22 `Read-only file system` lines across a 390-line log, **none** of which
+mentioned husk. Seventeen were `rm:` chatter from an `rm`-then-`ln` idiom and read as
+ignorable; the fatal one was 120 lines later and named the *victim* path, not the cause.
+Confinement had worked and failed closed — the gap was purely diagnostic.
+
+So: **the cage states its own boundary inside the job**, as a banner listing every writable
+path and as `HUSK_WRITABLE` in the environment. A list, not a root — `allowWrite` adds
+paths beyond the project dir, and announcing one root would be a new way to mislead.
+
+Two things this deliberately does NOT do, both rejected on principle rather than cost:
+
+* **No `LD_PRELOAD` to attribute `EROFS`.** It fails for static binaries and under MPI
+  launchers, and it means injecting code into the cage to improve an error message.
+* **No preflight scan of the script for write targets.** That is securing our *model* of
+  shell rather than shell itself — the F13/F14 shape, where a false negative reads as
+  approval. Making the boundary predictable removes the need.
+
+The partition guard is the standard to match: it names the constraint, names the fix, and
+fires at submit time before compute is burned. The same agent complied with it in one step,
+with no investigation.
 
 ## Design principle (the unit of confinement) — one cage per job-on-a-node
 
