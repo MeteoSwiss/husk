@@ -535,6 +535,11 @@ mod tests {
 
         let out = std::process::Command::new("/bin/bash")
             .arg(&path)
+            // Run IN the temp dir. The guard resolves the step spool relative to $PWD, so
+            // without this the test drops `.husk-step-spool-nojob/` into the crate
+            // directory on every `cargo test` — repo litter, and litter in a working tree
+            // is how a build artifact once got committed here by `git add -A`.
+            .current_dir(&dir)
             .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
             .output()
             .unwrap();
