@@ -255,11 +255,15 @@ belt-and-suspenders, still keep the job script and its imports read-only to the
 agent (an absolute path outside the project) and pass the agent's choices as
 **validated data**, not as a code path.
 
-> **Scope in this release:** single node, no MPI. Multi-process / multi-node MPI
+> **Scope in this release (v0.4):** single node, no MPI. Multi-process / multi-node MPI
 > (`srun`), a network allowlist for compute jobs (they currently run with the
 > network unshared), interactive `srun`/`salloc`, and read-only
 > `scontrol show`/`sacctmgr list` are on the roadmap — see
 > [`ROADMAP.md`](ROADMAP.md) and [`slurm-broker/BROKER.md`](slurm-broker/BROKER.md).
+>
+> **Already built on the `experimental` branch, shipping in v0.5:** brokered `srun` and
+> single-node multi-rank MPI — ICON runs on Balfrin across 4 GPUs inside the cage. The
+> network allowlist is the last feature before that release.
 
 ## Known limitations
 

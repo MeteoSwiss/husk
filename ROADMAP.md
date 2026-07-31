@@ -37,48 +37,71 @@ submission surface is default-deny by construction (option allowlist: parse → 
 re-emit → reject unknown). Verified on Balfrin hardware, 32/32
 (`slurm-broker/selftest.sh --full`). Still layers on Anthropic's runtime.
 
-**Step 1+2 are now the active phase** — and the trigger is empirical, not theoretical:
-ICON's runscript calls `srun -n1` inside a brokered job and `srun` dies at
-`Unable to establish control machine address`, because the compute cage's
-`--unshare-net` leaves no route to `slurmctld`. That is the control-plane right the cage
-exists to withhold, so `srun` cannot work without the recursive pair. Design (the
-two-rights split, the stub/step-broker mechanism, staging, hardware gates C1–C6) is in
-[`slurm-broker/SRUN-MPI-DESIGN.md`](slurm-broker/SRUN-MPI-DESIGN.md); run
-`slurm-broker/fabric-probe.sh` (gate **C3**: does per-task `bwrap` launch under
-`slurmstepd`?) before writing code — it is the assumption the whole chapter rests on.
+**Steps 1+2 SHIPPED (branch `experimental`, 2026-07-31) — not yet released.** `srun`
+brokering works end to end: the recursive stub/step-broker pair, the step option allowlist,
+per-rank cages, and single-node multi-rank MPI. **ICON ran to completion on Balfrin** —
+one node, 4 MPI ranks, GPU, brokered throughout, with Cross Memory Attach enabled and no
+`MPICH_SMP_SINGLE_COPY_MODE=NONE`, so nobody pays an intra-node message tax. Design and
+the hardware gates are in
+[`slurm-broker/SRUN-MPI-DESIGN.md`](slurm-broker/SRUN-MPI-DESIGN.md).
 
-1. **Architecture decision — FIRST: recursive sandbox-broker pairs** (not a central
-   login broker). A sandbox always has a paired broker *outside* it; crossing a
-   boundary (`sbatch`/`srun`/`ssh`) spawns a new pair, to arbitrary depth. It is the
-   existing wrapper+broker+stub brick stacked, not new architecture. This decision is
-   **forced by srun** (below) and it unifies SLURM + ssh. Cost: recursive lifecycle
-   (the `PDEATHSIG` chain must hold per level) + per-level trust.
+The structural lesson of that phase is now a design principle in
+[`THREAT-MODEL.md`](slurm-broker/THREAT-MODEL.md), **the unit of confinement**: the
+security border is the job on a node, not the process. All ranks of a job are one trust
+domain, so they share one user namespace; a cage per task added no boundary, only N
+redundant copies of the same wall, and one of those copies silently cost us CMA.
 
-2. **`srun` brokering → single-node multi-process MPI.** `srun` launches a *step
-   inside an allocation*, so it must run on the compute node within the allocation →
-   it needs a **compute-node broker = the recursive pair** (hence step 1 first). Each
-   rank is re-sandboxed. Single-node multi-rank likely needs **no compute network**
-   (NVLink + AF_UNIX PMIx). Harder than `sbatch`: it's a live process (proxy
-   stdio/signals/exit), not fire-and-forget.
+1. ~~**Architecture decision — recursive sandbox-broker pairs**~~ **DONE.** A sandbox
+   always has a paired broker outside it; crossing a boundary spawns a new pair. The
+   `PDEATHSIG` chain holds per level.
 
-3. **Network: socat + allowlist on compute nodes → multi-NODE MPI + general egress.**
-   Reimplement Anthropic's network layer in Rust. **Scope it:** an SNI/host allowlist
-   likely suffices; full TLS-MITM only if content-level filtering is actually needed.
-   This reactivates **AV8** (broker bypass) and is safe *only because* srun is already
-   brokered (step 2) and `slurmctld` is kept off the allowlist. Coupled to
-   *multi-node* (single-node didn't need it).
+2. ~~**`srun` brokering → single-node multi-process MPI**~~ **DONE, ICON verified.**
 
-4. **`salloc`: block / defer** (interactive allocation = highest complexity, lowest
-   value for an agent; revisit only on a concrete need).
+3. **Network: socat + allowlist on compute nodes.** *This is the last feature before
+   v0.5.* Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
+   an SNI/host allowlist likely suffices; full TLS-MITM only if content filtering is
+   actually needed. Reactivates **AV8** (broker bypass) and is safe *only because* srun is
+   now brokered and `slurmctld` stays off the allowlist.
+   Shape decided by measurement (see SRUN-MPI-DESIGN.md): the **filtering proxy is one per
+   node**, reached through a unix socket bind-mounted into every rank's cage — a unix
+   socket crosses a network namespace because it is a filesystem object. Only a dumb relay
+   is per rank. The host-side allowlist must accept **host-or-IP + port**, not just
+   domains, because a self-hosted model endpoint is an internal address with no SNI.
 
-5. **Own the sandbox + generalize.** By here fs + network + seccomp are all
-   reimplemented → the marginal cost of dropping Anthropic's runtime is small. Drop
-   it. **Validate:** run Claude *naked* (`sandbox: off`) wrapped in husk's own
-   per-session cage; get it smooth; then swap Claude for any agent (closed big-tech,
-   or self-hosted DeepSeek). **Granularity = per-session base + broker-mediated
-   exceptions**, NOT uniform per-command (which is the Lustre-freeze source *and*
-   agent-coupled — it violates the axiom). The broker (which already exists) buys
-   back per-operation policy where it's actually needed.
+4. **Security review before release** — a multi-agent adversarial pass over the whole
+   surface, as was done for v0.4, where it found four criticals. The submission surface,
+   the step surface and the new network surface all get it. Nothing ships to users until
+   this has run.
+
+**→ RELEASE v0.5.** Worth stating plainly what it buys, because it is already a lot: an
+agent on a CSCS system, externally confined, that can run its own single-node 4-GPU jobs.
+That is a daily-work tool, not a demo.
+
+5. **`salloc`: block / defer** (interactive allocation = highest complexity, lowest value
+   for an agent; revisit only on a concrete need).
+
+6. **Own the sandbox + generalize — v0.6.** By here fs, network and seccomp are all ours,
+   so the marginal cost of dropping Anthropic's runtime is small. **Split in two:**
+   - **6a — provide the login sandbox ourselves, still Claude only.** The deliverable is
+     three agent-NEUTRAL pieces: husk's own policy source (theirs reads
+     `.claude/settings.json`), **credential masking** (our compute cage is ~40% of their
+     fs model — a known gap), and a session-level wrap instead of their per-Bash-command
+     one. What is actually Claude-specific is a three-column table: binary to exec, config
+     dir to allow, API hosts to allowlist. **Acceptance test: the string `claude` appears
+     nowhere except one row of that table** — otherwise 6b is a rewrite, not an extension.
+     Also fixes the Balfrin/Santis lag, whose real cause is an in-process deny-set walk on
+     Lustre metadata, *provided* our policy layer expresses itself as **mounts, not a
+     scanned deny-set**. The compute cage is already built that way.
+   - **6b — open it to other agents**, including self-hosted. Note that self-hosted at
+     CSCS is a *network* case, not a no-network one: the model is served on the H100
+     vcluster while the harness runs on Balfrin, so they talk across vclusters. Two things
+     to pin early: which side dials (our proxy model is egress-only; anything dialling
+     *in* is materially new work) and who starts the model job (if the agent can, it
+     controls an un-caged process — the sbatch/ssh/tmux class again).
+   **Do before their runtime goes away** (laptop task, no allocation): enumerate what it
+   enforces *while it is still there to diff against* — the `seccomp-wrapper` vs
+   `apply-seccomp` syscall delta and the fs-model delta. Afterwards that is archaeology;
+   today it turns 6a from "reimplement a sandbox" into "close a known list".
 
 ## Smaller items (not blocking a phase)
 - **Allow a LIST of partitions, not one forced value.** Today `HUSK_SLURM_PARTITION`
@@ -97,8 +120,14 @@ two-rights split, the stub/step-broker mechanism, staging, hardware gates C1–C
 - Recursive lifecycle robustness (PDEATHSIG chains across nested pairs).
 - Network scope: SNI/host allowlist vs full TLS-MITM.
 - `salloc`: block permanently, or revisit?
-- Step 5 "naked Claude" check: confirm Claude runs correctly wrapped per-session
+- Step 6a "naked Claude" check: confirm Claude runs correctly wrapped per-session
   (its per-command sandbox should be a security layer, not a functional dependency).
+- Whether the cage holder should clear `PR_SET_DUMPABLE`. It *can* — measured on kernel
+  6.8, a non-dumpable holder is still joinable via `bwrap --userns`. Left off because the
+  gain is a third layer on a process that is already unreadable and holds nothing, while
+  the risk is kernel-dependent (Balfrin runs 5.14; if joining broke there, every step
+  would die). Revisit if the holder ever comes to hold something worth reading, or once
+  the behaviour is measured on the target.
 
 See also: `slurm-broker/THREAT-MODEL.md` (the AV1–AV8 threat model, incl. the AV8
 broker-bypass landmine that step 3 must respect) and `slurm-broker/BROKER.md`.

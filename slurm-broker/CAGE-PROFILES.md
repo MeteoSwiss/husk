@@ -191,6 +191,16 @@ Discovering what each profile needs is the tedious part. Four things bound it:
     its scope was written down; the workload that fell outside that scope found it on the
     first run.
 
+- **Whether the cage holder should clear `PR_SET_DUMPABLE`.** It *can*: measured on
+  kernel 6.8, a holder with the flag cleared is still openable and still joinable with
+  `bwrap --userns` by a sibling — which corrects an earlier claim here that it could not.
+  Left off deliberately. The gain is a third layer on a process that a rank measurably
+  cannot read anyway, and which holds no credentials, no daemon route and no memory worth
+  reading; the risk is kernel-dependent, since that measurement is from 6.8 while Balfrin
+  runs 5.14 Cray Shasta, and if joining broke there every step would die. **Revisit if**
+  the holder ever comes to hold something worth reading, or once the behaviour has been
+  measured on the target — it is a two-minute check now that the holder exists.
+
 - Whether SLURM's device cgroup constrains a job to its *allocated* GPUs (it is the same
   exposure uncaged either way, so not a husk regression).
 - The full syscall-set delta between our `seccomp-wrapper` and Anthropic's

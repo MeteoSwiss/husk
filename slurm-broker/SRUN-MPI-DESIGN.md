@@ -12,7 +12,10 @@ the principle is "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md)
 Branch `experimental`, off the frozen v0.4 `main`. Built and on hardware: cage profiles
 (topology forced, multi-node rejected), the seccomp `--profile` flag with the CMA
 exemption, the step allowlist, the per-task rank cage, the in-cage `srun` stub, the
-step-broker and the guard bootstrap — selftest 37/37 on Balfrin at `842f92f`.
+step-broker and the guard bootstrap. The self-test suite is now 39 checks; run it with
+`--broker` pointing at the **installed** binary, because `husk_paths()` derives the srun
+stub from the broker's own location and a repo checkout has no `<prefix>/lib/husk/`, which
+leaves the step pair inactive (the guard now says so out loud).
 See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
 (AV1–AV8 + the design principles), [ROADMAP.md](../ROADMAP.md).
 
