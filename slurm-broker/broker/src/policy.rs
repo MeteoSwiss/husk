@@ -273,17 +273,25 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
 /// Both are only ever USED behind a runtime existence test in the guard, because the
 /// broker resolves them on the LOGIN node while the guard runs on a compute node — the
 /// same submit-side/run-side split that made the GPU binds `--dev-bind-try`.
-fn husk_paths() -> (String, String) {
+fn husk_paths() -> (String, String, String) {
     let exe = std::env::current_exe().unwrap_or_default();
     let broker = exe.to_string_lossy().to_string();
-    let stub = exe
-        .parent()
-        .and_then(|bin| bin.parent())
-        .map(|prefix| prefix.join("lib").join("husk").join("srun-stub.py"))
+    let prefix = exe.parent().and_then(|bin| bin.parent());
+    let stub = prefix
+        .map(|p| p.join("lib").join("husk").join("srun-stub.py"))
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    (broker, stub)
+    // `install-husk.sh` builds socat into <prefix>/bin/socat when the system has none.
+    // That lives under the user's HOME, which the cage tmpfs-masks (HIDDEN_FLOOR), so it
+    // is invisible exactly where the egress relay needs it — the failure that made the
+    // first hardware run of the network feature come up empty. The guard binds it in.
+    let socat = prefix
+        .map(|p| p.join("bin").join("socat"))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    (broker, stub, socat)
 }
 
 fn wrap_script(
@@ -343,9 +351,10 @@ fn wrap_script(
     // Appended AFTER {bwrap} so it still wins over any config-driven allowRead.
     let mask_paths = settings::CREDENTIAL_SOCKET_DIRS.join(" ");
     let sec = profile.seccomp_profile();
-    let (broker_path, stub_path) = husk_paths();
+    let (broker_path, stub_path, socat_path) = husk_paths();
     let broker_q = settings::sh_quote(&broker_path);
     let stub_q = settings::sh_quote(&stub_path);
+    let socat_q = settings::sh_quote(&socat_path);
     // The SESSION workdir, not `$PWD`. The two used to be identical because --chdir was
     // forced to req.cwd; now a run script may start the job in a subdirectory, and using
     // `$PWD` would silently NARROW the rank cage's writable region to that subdirectory.
@@ -370,7 +379,32 @@ fn wrap_script(
     // how the srun bind shipped with literal quotes in it and took every job down.
     let (net_start, net_relay) = if net_enabled {
         (
-            r#"  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the
+            r#"  # The relay needs socat INSIDE the cage, and husk's own socat lives under
+  # <prefix>/bin — i.e. in the user's HOME, which the cage tmpfs-masks. So bind it in,
+  # read-only, over an empty file in the spool. A COPY would also work and would be
+  # simpler, but the spool sits inside the writable workdir, so a copy is something the
+  # job can overwrite; a read-only bind is not. The bind lands in _husk_extra, which is
+  # appended last, so it wins over the workdir bind - the same ordering the MUNGE mask
+  # depends on. A system-wide socat, if the node has one, is used as-is.
+  _husk_socat=
+  if command -v socat >/dev/null 2>&1; then
+    _husk_socat=$(command -v socat)
+  elif [ -x {socat_q} ] && [ -n "$_husk_spool" ]; then
+    if : >"$_husk_spool/socat" 2>/dev/null; then
+      _husk_socat="$_husk_spool/socat"
+      _husk_extra+=(--ro-bind {socat_q} "$_husk_socat")
+    fi
+  fi
+  if [ -n "$_husk_socat" ]; then
+    export HUSK_SOCAT="$_husk_socat"
+  else
+    echo "husk: no socat available, so this job gets no network. husk builds one at" >&2
+    echo "husk:   {socat_q}" >&2
+    echo "husk: but the cage hides /users, so it must be bound in - and the spool was" >&2
+    echo "husk: not usable here. Install socat system-wide on the compute nodes, or" >&2
+    echo "husk: re-run install-husk.sh." >&2
+  fi
+  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the
   # policy from the settings files itself rather than being handed it, so what is in
   # force never depends on a string carried on a command line.
   #
@@ -1007,6 +1041,26 @@ mod tests {
         );
         assert!(on.contains("bind=127.0.0.1"), "the relay must listen on loopback only: {on}");
         assert!(on.contains("HTTPS_PROXY=http://127.0.0.1:3128"), "{on}");
+    }
+
+    #[test]
+    fn the_guard_binds_a_socat_into_the_cage_when_the_system_has_none() {
+        // THE BUG THIS EXISTS FOR. install-husk.sh builds socat into <prefix>/bin, which
+        // is under the user's HOME, and the cage tmpfs-masks /users - so husk's own socat
+        // is invisible exactly where the relay needs it. The first hardware run of the
+        // network feature failed with no proxy env set and a local DNS error, and nothing
+        // in the output said why.
+        let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true);
+        assert!(on.contains("--ro-bind"), "socat must be BOUND, not copied: {on}");
+        assert!(on.contains("/socat"), "{on}");
+        assert!(on.contains("export HUSK_SOCAT="), "the relay learns the path by env: {on}");
+        // Read-only, because the spool is inside the WRITABLE workdir: a copy would be
+        // something the job could overwrite before its own relay starts.
+        let bind = on.find("--ro-bind").expect("bind");
+        let socat_bind = on[bind..].find("socat").expect("socat bind");
+        assert!(socat_bind < 200, "the socat bind must be a ro-bind: {}", &on[bind..bind + 200]);
+        // A system-wide socat is preferred and needs no bind at all.
+        assert!(on.contains("command -v socat"), "prefer a system socat: {on}");
     }
 
     #[test]

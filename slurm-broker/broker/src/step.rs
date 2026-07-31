@@ -73,6 +73,8 @@ pub struct StepBroker {
     /// `SLURM_JOB_ID` would be a second copy of the same construction, and the two would
     /// eventually disagree — which is the failure this project keeps meeting.
     net_sock: Option<String>,
+    /// The socat the guard bound into the cage. Inherited, not derived — see `rank::Egress`.
+    net_socat: Option<String>,
 }
 
 /// The child that owns the job's shared user namespace.
@@ -106,6 +108,7 @@ impl StepBroker {
             in_flight: Vec::new(),
             holder: None,
             net_sock: std::env::var("HUSK_NET_SOCK").ok().filter(|s| !s.is_empty()),
+            net_socat: std::env::var("HUSK_SOCAT").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -319,7 +322,13 @@ impl StepBroker {
             &cage,
             &self.slurmd_spool,
             holder_pid,
-            self.net_sock.as_deref(),
+            match (self.net_sock.as_deref(), self.net_socat.as_deref()) {
+                (Some(sock), Some(socat)) => Some(rank::Egress { sock, socat }),
+                // Egress needs BOTH. With only one, a rank would start a relay that
+                // cannot connect, or none at all while advertising a proxy — either way a
+                // confusing failure in place of an honest "no network".
+                _ => None,
+            },
             &step.command,
         ));
 

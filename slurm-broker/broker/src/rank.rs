@@ -137,6 +137,18 @@ pub fn env_args(
     out
 }
 
+/// Everything a rank needs to reach the egress proxy.
+///
+/// Both values are INHERITED from the guard through the step-broker rather than rebuilt
+/// here. The socat path in particular could be derived from the socket path — they live in
+/// the same directory — but a derivation is a second construction of the same fact, and
+/// two constructions of one fact is how this project keeps getting caught.
+#[derive(Clone, Copy)]
+pub struct Egress<'a> {
+    pub sock: &'a str,
+    pub socat: &'a str,
+}
+
 /// The final line of the rank script: enter the cage and run the workload.
 ///
 /// Two shapes, chosen by the BROKER rather than branched on at run time, so a job with no
@@ -154,18 +166,19 @@ pub fn env_args(
 /// passing `"$_husk_inner"` keeps exactly one level of quoting. The socket path travels in
 /// an exported variable for the same reason — `sh_quote` produces single quotes, which
 /// cannot appear inside the single-quoted assignment.
-fn exec_line(profile: Profile, bwrap: &str, net_sock: Option<&str>) -> String {
+fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     let sec = profile.seccomp_profile();
     let cage = format!(
         "seccomp-wrapper --profile={sec} bwrap --userns 9 {bwrap} \
          --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
     );
-    match net_sock {
+    match net {
         None => format!("exec {cage} \"$@\"\n"),
-        Some(sock) => format!(
+        Some(e) => format!(
             "export _HUSK_NET_SOCK={sock}\n\
-             _husk_inner='if command -v socat >/dev/null 2>&1; then\n\
-             socat TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 \
+             export _HUSK_SOCAT={socat}\n\
+             _husk_inner='if [ -x \"$_HUSK_SOCAT\" ]; then\n\
+             \"$_HUSK_SOCAT\" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 \
              UNIX-CONNECT:\"$_HUSK_NET_SOCK\" >/dev/null 2>&1 &\n\
              export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128\n\
              export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128\n\
@@ -174,7 +187,8 @@ fn exec_line(profile: Profile, bwrap: &str, net_sock: Option<&str>) -> String {
              fi\n\
              exec \"$@\"'\n\
              exec {cage} /bin/sh -c \"$_husk_inner\" husk-rank \"$@\"\n",
-            sock = sh_quote(sock)
+            sock = sh_quote(e.sock),
+            socat = sh_quote(e.socat)
         ),
     }
 }
@@ -188,7 +202,7 @@ pub fn wrap_command(
     rank_args: &[String],
     spool_dir: &str,
     holder_pid: u32,
-    net_sock: Option<&str>,
+    net: Option<Egress<'_>>,
     command: &[String],
 ) -> Vec<String> {
     let bwrap = rank_args
@@ -233,7 +247,7 @@ pub fn wrap_command(
          {exec_line}",
         userns = sh_quote(&userns),
         spool = sh_quote(spool_dir),
-        exec_line = exec_line(profile, &bwrap, net_sock),
+        exec_line = exec_line(profile, &bwrap, net),
     );
 
     let mut argv = vec![
@@ -505,7 +519,7 @@ mod tests {
         // for a network. That is why the broker chooses the shape instead of the script
         // branching at run time.
         let script = &built(&["./a.out"])[2];
-        assert!(!script.contains("socat"), "no relay without a socket: {script}");
+        assert!(!script.contains("SOCAT"), "no relay without egress: {script}");
         assert!(!script.contains("_husk_inner"), "no inner shell without a socket: {script}");
         assert!(script.contains("-- \"$@\""), "the workload is exec'd directly: {script}");
     }
@@ -520,18 +534,19 @@ mod tests {
             &FsPolicy::default().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
             live_holder(),
-            Some("/work/.husk-step-spool-7/net.sock"),
+            Some(Egress { sock: "/work/.husk-step-spool-7/net.sock", socat: "/work/.husk-step-spool-7/socat" }),
             &v(&["./a.out"]),
         );
         let script = &argv[2];
-        assert!(script.contains("socat TCP-LISTEN:3128"), "{script}");
+        assert!(script.contains("TCP-LISTEN:3128"), "{script}");
+        assert!(script.contains("/work/.husk-step-spool-7/socat"), "the bound socat: {script}");
         assert!(script.contains("bind=127.0.0.1"), "the relay listens on loopback only: {script}");
         assert!(script.contains("/work/.husk-step-spool-7/net.sock"), "{script}");
         assert!(script.contains("HTTPS_PROXY=http://127.0.0.1:3128"), "{script}");
-        // The proxy variables are exported only when socat is actually present: a rank
-        // that cannot start a relay must look like a machine with no network, not one
-        // with a broken proxy.
-        assert!(script.contains("command -v socat"), "{script}");
+        // The proxy variables are exported only when the socat husk bound in is actually
+        // executable: a rank that cannot start a relay must look like a machine with no
+        // network, not one with a broken proxy.
+        assert!(script.contains("[ -x \"$_HUSK_SOCAT\" ]"), "{script}");
     }
 
     #[test]
@@ -555,7 +570,7 @@ mod tests {
             &FsPolicy::default().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
             live_holder(),
-            Some("/work/net.sock"),
+            Some(Egress { sock: "/work/net.sock", socat: "/work/socat" }),
             &v(&[hostile, "--x=$(id)"]),
         );
         let job_id = format!("t{}", std::process::id());
