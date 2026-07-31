@@ -35,6 +35,24 @@ use crate::settings::sh_quote;
 const RESERVED_ENV_PREFIXES: &[&str] =
     &["SLURM_", "SBATCH_", "PMI_", "PMIX_", "PALS_", "HUSK_"];
 
+/// Proxy variables, dropped rather than forwarded — for now.
+///
+/// The job cage runs an egress relay on `127.0.0.1:3128` and exports these so the job
+/// script can simply use the network. A RANK is in its own network namespace with its own
+/// empty loopback, so the same address reaches nothing. Forwarding them would hand every
+/// rank a proxy setting pointing at a closed port, and a download inside `srun` would fail
+/// with "cannot connect to proxy" — which reads as "husk's proxy is broken" when the truth
+/// is "there is no proxy here". A rank with no egress should fail like a machine with no
+/// network, not like a machine with a broken one.
+///
+/// This is a stopgap for an asymmetry, not a design: see the rank-egress note in
+/// ROADMAP.md. When the relay is wired into the rank cage these stop being dropped and
+/// start being true.
+const PROXY_ENV: &[&str] = &[
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+];
+
 /// Upper bound on forwarded variables. The spool is agent-writable, so an enormous
 /// environment would otherwise become an enormous command line in the trusted process.
 const MAX_FORWARDED_ENV: usize = 512;
@@ -88,6 +106,7 @@ pub fn env_args(
     let forwardable = |k: &String| {
         is_valid_env_name(k)
             && !RESERVED_ENV_PREFIXES.iter().any(|p| k.starts_with(p))
+            && !PROXY_ENV.contains(&k.as_str())
             && !deny.iter().any(|d| d == k)
     };
 
@@ -232,6 +251,30 @@ mod tests {
         let job = envmap(&[("PATH", "/bin")]);
         let args = env_args(&job, &base, &[]);
         assert_eq!(args, vec!["--unsetenv", "MPICH_FOO"], "{args:?}");
+    }
+
+    #[test]
+    fn proxy_settings_are_not_forwarded_into_a_rank() {
+        // A rank has its own network namespace and its own empty loopback, so the job
+        // cage's 127.0.0.1:3128 reaches nothing there. Forwarding the setting would make
+        // a download inside srun fail with "cannot connect to proxy", which blames husk
+        // for the wrong thing. No egress should look like no network.
+        let base = envmap(&[("PATH", "/bin")]);
+        let job = envmap(&[
+            ("PATH", "/bin"),
+            ("HTTP_PROXY", "http://127.0.0.1:3128"),
+            ("https_proxy", "http://127.0.0.1:3128"),
+            ("NO_PROXY", "localhost"),
+            ("OMP_NUM_THREADS", "4"),
+        ]);
+        let args = env_args(&job, &base, &[]);
+        for bad in ["HTTP_PROXY", "https_proxy", "NO_PROXY"] {
+            assert!(!args.iter().any(|a| a == bad), "{bad} must not reach a rank: {args:?}");
+        }
+        assert!(
+            args.windows(3).any(|w| w == ["--setenv", "OMP_NUM_THREADS", "4"]),
+            "ordinary variables must still be carried: {args:?}"
+        );
     }
 
     #[test]
