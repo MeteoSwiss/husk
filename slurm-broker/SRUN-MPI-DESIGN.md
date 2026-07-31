@@ -1,11 +1,13 @@
 # husk — srun / MPI phase design (experimental)
 
-**Status: the brokering works end to end — ICON ran to completion inside husk on Balfrin
-(2026-07-31): single node, 4 MPI ranks, GPU. But it needed
-`MPICH_SMP_SINGLE_COPY_MODE=NONE`, and removing that tax turned out to require a design
-change rather than a filter change: all ranks of a job must SHARE ONE USER NAMESPACE,
-instead of each `bwrap` making a private one.** See "The redesign" below; the reason is in
-"the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
+**Status: DONE. ICON ran to completion inside husk on Balfrin (2026-07-31) — single node,
+4 MPI ranks, GPU, brokered end to end, with Cross Memory Attach ENABLED and no
+`MPICH_SMP_SINGLE_COPY_MODE=NONE`.** No user pays the intra-node message tax.
+
+Getting the last blocker required a design change rather than a filter change: all ranks
+of a job share ONE USER NAMESPACE instead of each `bwrap` making a private one, because
+sibling user namespaces cannot `ptrace_may_access` each other. See "The redesign" below;
+the principle is "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
 
 Branch `experimental`, off the frozen v0.4 `main`. Built and on hardware: cage profiles
 (topology forced, multi-node rejected), the seccomp `--profile` flag with the CMA
@@ -639,7 +641,7 @@ the workload needs. It has to become a **two-process, two-cage** probe. Same sha
 C12, which measured AF_UNIX on a sample containing no CUDA: *a green probe means the
 probe's scenario passes.*
 
-## The redesign — one shared user namespace per job (built, hardware run pending)
+## The redesign — one shared user namespace per job (DONE, ICON verified)
 
 **The border is the job on a node, not the process.** Ranks of one job share uid,
 allocation, files and data; there is no boundary between rank 0 and rank 3 to defend. The

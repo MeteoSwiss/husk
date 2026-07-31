@@ -15,7 +15,7 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | in-cage `srun` stub, step-broker, guard bootstrap | done — **ICON ran to completion, 2026-07-31** |
 | broker refuses ptrace/CMA (`PR_SET_DUMPABLE`) | done — `df414ea` |
 | `process_vm_readv` for single-node (CMA) | done — `SINGLE_NODE_EXEMPT`, smoke 8-10 + selftest `cma.*`, **37/37 green on Balfrin** |
-| **shared user namespace per job** | built — `cage.rs` holder + `bwrap --userns` per rank; laptop-verified (CMA OK shared / EPERM unshared). Hardware run pending |
+| **shared user namespace per job** | **done** — `cage.rs` holder + `bwrap --userns` per rank; **ICON completed on Balfrin with CMA enabled**, no `MPICH_SMP_SINGLE_COPY_MODE=NONE` |
 
 ## Why profiles exist
 
