@@ -575,9 +575,30 @@ so it is not a ptrace/CMA target whatever the filter allows — verified, its
 `/proc/<pid>/maps` is refused while an ordinary same-uid process stays readable. That
 makes the concession rank-to-rank only.
 
-**Next:** unblock `process_vm_readv` for the single-node profile, keep `writev` blocked,
-and run ICON *without* the env var. If it completes, users pay no tax. If it dies at a new
-SIGSYS, MPICH wants the write side too — a real decision, not a registry line.
+**Implemented** — `process_vm_readv` is now exempt under `--profile=single-node`;
+`process_vm_writev` stays blocked under every profile.
+
+The mechanism is deliberately an **exemption table**, `SINGLE_NODE_EXEMPT`, and not a
+second deny-list. The floor still lists both calls and applies to every profile; a
+profile subtracts from it only by naming a syscall explicitly. Adding an entry to the
+floor therefore blocks it everywhere unless someone also writes it down as an exemption,
+with a justification — default-strict, opt-out-by-name. Splitting the list per profile
+would have made "forgot to add it to the compute list" a silent hole.
+
+Pinned in three places, because build-time and deploy-time are different failure modes:
+
+| check | where | what it catches |
+|---|---|---|
+| smoke 8 — CMA read blocked under `login` | build host | the exemption leaking into the default cage |
+| smoke 9 / 10 — read allowed, **write killed**, under `single-node` | build host | either half of the delta moving |
+| selftest `cma.read` / `cma.write` | inside a real brokered job | a **stale wrapper on the compute node** — the deployment skew that has cost more bring-up rounds than any other bug here |
+
+The selftest probe self-attaches, so the kernel's ptrace-attach check always permits it
+and the only thing under test is the seccomp filter.
+
+**Open on hardware:** whether the read side alone is enough for ICON, i.e. whether it
+completes *without* `MPICH_SMP_SINGLE_COPY_MODE=NONE`. If it dies at a new SIGSYS, MPICH
+wants the write side too — a real decision, not a registry line.
 
 ## Chapter 1 — the rank cage, as specified by hardware
 

@@ -102,11 +102,11 @@ fetch() {
 cleanup() {
     log "Cleaning up build artifacts"
     rm -rf "${BUILD_DIR}"
-    rm -f "${SCRIPT_DIR}/test/smoke" \
-          "${SCRIPT_DIR}/test/test_ptrace" \
-          "${SCRIPT_DIR}/test/test_personality_query" \
-          "${SCRIPT_DIR}/test/test_personality_switch" \
-          "${SCRIPT_DIR}/test/test_af_unix"
+    # Delegate to the Makefile, which owns the list of probe binaries — this script
+    # used to keep its own copy, and a copy that drifts is exactly what blocked a
+    # Balfrin install once already. clean-tests deliberately spares the staged
+    # wrapper binary this script leaves in SCRIPT_DIR.
+    make -C "${SCRIPT_DIR}" clean-tests >/dev/null 2>&1 || true
     ok "removed ${BUILD_DIR} and test binaries"
 }
 

@@ -39,8 +39,14 @@
  * Cage profiles — see slurm-broker/CAGE-PROFILES.md.
  *
  * The profile names the topology the wrapped process runs in, and topology is the
- * threat axis: it decides what network and credential reach the process needs. The
- * base deny-list below applies to every profile; a profile only ever ADDS.
+ * threat axis: it decides what network and credential reach the process needs.
+ *
+ * The base deny-list below is the FLOOR and applies to every profile. A profile may
+ * add rules of its own, or declare a narrow EXEMPTION from the floor (see
+ * SINGLE_NODE_EXEMPT). Exemptions are the dangerous direction, so they are kept as an
+ * explicit, named table rather than a fork of the deny-list: adding a syscall to the
+ * floor blocks it under every profile unless someone deliberately writes it down here
+ * too, with a justification. Default-strict, opt-out-by-name.
  *
  * PROFILE_LOGIN is the default precisely because it must stay today's behaviour: the
  * husk launcher wraps the whole agent SESSION (`seccomp-wrapper claude`), and the agent
@@ -59,7 +65,7 @@
  */
 enum wrapper_profile {
     PROFILE_LOGIN,        /* default: base deny-list only */
-    PROFILE_SINGLE_NODE,  /* brokered compute job; no syscall delta today (see install_filter) */
+    PROFILE_SINGLE_NODE,  /* brokered compute job; delta = SINGLE_NODE_EXEMPT */
 };
 
 /* -------------------------------------------------------------------------
@@ -73,7 +79,11 @@ enum wrapper_profile {
  * `ausyscall --dump` for the full list on your kernel.
  * ---------------------------------------------------------------------- */
 static const char *const BLOCKED_SYSCALLS[] = {
-    /* --- process inspection / memory manipulation --- */
+    /* --- process inspection / memory manipulation ---
+     *
+     * process_vm_readv is EXEMPTED under the single-node profile — Cray MPICH needs
+     * Cross Memory Attach for intra-node transfers. See SINGLE_NODE_EXEMPT below for
+     * the reasoning; process_vm_writev stays blocked under every profile. */
     "ptrace",
     "process_vm_readv",
     "process_vm_writev",
@@ -206,6 +216,58 @@ static const char *const BLOCKED_SYSCALLS[] = {
 };
 
 /* -------------------------------------------------------------------------
+ * PROFILE_SINGLE_NODE — exemptions from the floor.
+ *
+ * Cross Memory Attach. Cray MPICH moves intra-node MPI messages by reading the peer
+ * rank's address space directly instead of bouncing them through a shared-memory
+ * buffer. With process_vm_readv blocked, ICON dies with SIGSYS the moment ranks
+ * exchange data (Balfrin, 2026-07-31). MPICH_SMP_SINGLE_COPY_MODE=NONE avoids it, but
+ * that is a diagnostic, not a fix: it taxes every intra-node message for every user.
+ *
+ * READ AND WRITE ARE NOT ONE CONCESSION, which is why only readv is listed:
+ *   - process_vm_readv  = same-uid memory DISCLOSURE between caged ranks of one job.
+ *     They already share the job's files, the allocation and the uid; a rank reading
+ *     a sibling rank's memory learns nothing the cage was protecting.
+ *   - process_vm_writev = writing into another process's address space. The process
+ *     worth writing into is the UN-CAGED step-broker, and that is not a disclosure
+ *     bug, it is arbitrary code execution outside the cage — the escape itself.
+ *
+ * WHAT BOUNDS THE READ. The kernel gates both calls with the ptrace-attach check:
+ * credentials, Yama ptrace_scope, the target's dumpable flag, and PID visibility.
+ * Balfrin has no Yama, so the load-bearing part here is the dumpable flag: the broker
+ * calls prctl(PR_SET_DUMPABLE, 0) at startup and is therefore not a valid CMA target
+ * whatever this filter allows. --unshare-pid cannot help — each rank gets its own
+ * bwrap, so a shared PID namespace would break the very rank-to-rank CMA being
+ * enabled here.
+ *
+ * A name listed here that is not in BLOCKED_SYSCALLS is harmless but dead; the floor
+ * is the only thing an exemption can subtract from.
+ * ---------------------------------------------------------------------- */
+static const char *const SINGLE_NODE_EXEMPT[] = {
+    "process_vm_readv",
+
+    /* sentinel — do not remove */
+    NULL,
+};
+
+static bool profile_exempts(enum wrapper_profile profile, const char *syscall_name)
+{
+    const char *const *exempt;
+
+    switch (profile) {
+    case PROFILE_SINGLE_NODE: exempt = SINGLE_NODE_EXEMPT; break;
+    case PROFILE_LOGIN:       /* fall through — the login cage takes no exemptions */
+    default:                  return false;
+    }
+
+    for (int i = 0; exempt[i] != NULL; i++) {
+        if (strcmp(exempt[i], syscall_name) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------
  * install_filter()
  *
  * Builds and loads a seccomp filter that:
@@ -285,7 +347,19 @@ static int install_filter(bool debug_mode, enum wrapper_profile profile)
 #endif
 
     for (int i = 0; BLOCKED_SYSCALLS[i] != NULL; i++) {
-        int nr = seccomp_syscall_resolve_name(BLOCKED_SYSCALLS[i]);
+        int nr;
+
+        /*
+         * A profile may exempt a floor entry. Silently, on purpose: the exemption
+         * table is STATIC per profile, so the profile name already on the command
+         * line says everything a printed line would, and this runs once per RANK —
+         * a note here is N identical lines in the job's .err file for no information
+         * (same reason the unresolved-syscall skip below stays quiet).
+         */
+        if (profile_exempts(profile, BLOCKED_SYSCALLS[i]))
+            continue;
+
+        nr = seccomp_syscall_resolve_name(BLOCKED_SYSCALLS[i]);
         if (nr == __NR_SCMP_ERROR) {
             /*
              * Syscall not known to this kernel/libseccomp version — it simply
@@ -307,7 +381,8 @@ static int install_filter(bool debug_mode, enum wrapper_profile profile)
     }
 
     /*
-     * PROFILE_SINGLE_NODE — currently adds NO syscall rules, deliberately.
+     * PROFILE_SINGLE_NODE adds no rules of its own; its whole delta is the
+     * SINGLE_NODE_EXEMPT table applied in the loop above (CMA reads for Cray MPICH).
      *
      * It used to block socket(AF_UNIX). That is reverted: CUDA needs unix sockets, and
      * it treats the refusal as FATAL rather than falling back. Measured on Balfrin
@@ -338,7 +413,6 @@ static int install_filter(bool debug_mode, enum wrapper_profile profile)
      * The profile mechanism stays: it is where the next rule lands, the deployment check
      * depends on it, and an empty delta is honest about what today's cage does.
      */
-    (void)profile;
 
     /*
      * personality(2) — argument-filtered rule.

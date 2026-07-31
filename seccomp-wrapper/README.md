@@ -250,17 +250,22 @@ The `CHECK` list needs empirical profiling — see [Empirical profiling workflow
 | `mount` | Required by bwrap to bind-mount the project directory and pseudo-filesystems (tmpfs, proc) when setting up the tool sandbox. Blocked by earlier versions; removed from CLOSE after confirming that apply-seccomp does not cover it and that bwrap failing silently defeats the filesystem namespace layer entirely. Risk is bounded: inside bwrap's user namespace only bind-mounts of owned paths and pseudo-filesystems are possible — real device mounts require CAP_SYS_ADMIN outside a user namespace. |
 | `umount2` | Same rationale as `mount` — bwrap tears down mounts at exit. |
 | `pivot_root` | Same rationale — bwrap uses pivot_root to switch the root filesystem inside the new mount namespace. `chroot` remains blocked because bwrap does not use it. |
+| `sched_setaffinity` | Required by essentially every performance-oriented HPC workload to pin ranks and threads to cores: `numactl --cpunodebind` (ICON's own launcher), `srun --cpu-bind`, Cray MPICH rank binding, `OMP_PROC_BIND`. Blocked by earlier versions — ICON's `numactl` step died with SIGSYS before the binary started. Removed from CLOSE 2026-07-31. Risk is ~nil for this threat model (filesystem confidentiality + broker escape, *not* microarchitectural side channels): SLURM's cpuset cgroup already confines the job to its allocated cores and the kernel intersects any requested mask with that cpuset, so a job can only reshuffle within cores it already owns. `--membind` uses `set_mempolicy`/`mbind`, which were never on the list. |
 | `capset` | Required by bwrap to drop the capabilities it does not need while setting up its user namespace. Blocked by earlier versions — which silently killed bwrap on aarch64 (Santis, bwrap 0.11.0): every sandboxed command died with SIGSYS on `capset`. Removed from CLOSE 2026-06-03. Risk is bounded: with `NO_NEW_PRIVS` set and an unprivileged UID the permitted capability set is empty, so `capset` cannot grant a capability the process does not already hold; capabilities inside bwrap's user namespace are confined to that namespace. `build_and_test.sh` now gates on `seccomp-wrapper bwrap … true` succeeding, so a wrapper that breaks bwrap is never installed. |
 
-### CLOSE — block unconditionally
+### CLOSE — block by default
 
-These are implemented as `SCMP_ACT_KILL_PROCESS` in `src/seccomp_wrapper.c`.
+These are implemented as `SCMP_ACT_KILL_PROCESS` in `src/seccomp_wrapper.c`. This list
+is the **floor**: it applies under every `--profile`. A profile may declare a narrow,
+justified **exemption** from it (`SINGLE_NODE_EXEMPT` in the same file) — today exactly
+one, noted in the table below. See `slurm-broker/CAGE-PROFILES.md` for how profiles are
+chosen and what bounds them.
 
 | syscall | reason |
 |---|---|
 | `ptrace` | Inspect/modify another process memory — no legitimate coding agent use; classic sandbox escape vector |
-| `process_vm_readv` | Read another process's memory directly — serious escape risk |
-| `process_vm_writev` | Write to another process's memory — same as above |
+| `process_vm_readv` | Read another process's memory directly — serious escape risk. **Exempted under `--profile=single-node`**: Cray MPICH uses Cross Memory Attach for intra-node MPI transfers and dies with SIGSYS without it (ICON on Balfrin, 2026-07-31). The concession is same-uid *disclosure* between ranks of one job, which already share uid, files and allocation; the un-caged step-broker sets `PR_SET_DUMPABLE=0` so it is not a valid target. |
+| `process_vm_writev` | Write to another process's memory — blocked under **every** profile, and not the same concession as the read. Writing reaches into another address space, and the address space worth reaching is the un-caged step-broker: that is code execution outside the cage rather than a disclosure. Pinned by smoke test 10. |
 | `setuid` | Change UID — enables privilege escalation via setuid binaries |
 | `setgid` | Change GID — same |
 | `setresuid` | Set real/effective/saved UID — same |
@@ -269,7 +274,6 @@ These are implemented as `SCMP_ACT_KILL_PROCESS` in `src/seccomp_wrapper.c`.
 | `setregid` | Set real/effective GID — same |
 | `setfsuid` | Set filesystem UID — same |
 | `setfsgid` | Set filesystem GID — same |
-| `sched_setaffinity` | Pin process to CPU — primary use case is cache-timing side-channel attacks |
 | `perf_event_open` | Performance monitoring — known side-channel attack surface |
 | `kexec_load` | Load a new kernel — obviously not needed |
 | `kexec_file_load` | Load kernel from fd — same |

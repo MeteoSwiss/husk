@@ -23,8 +23,12 @@ TEST_PTRACE      = test/test_ptrace
 TEST_PERS_QUERY  = test/test_personality_query
 TEST_PERS_SWITCH = test/test_personality_switch
 TEST_AF_UNIX     = test/test_af_unix
+TEST_CMA         = test/test_cma
 
-.PHONY: all install check check-tests clean
+TEST_BINS = $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) \
+            $(TEST_AF_UNIX) $(TEST_CMA)
+
+.PHONY: all install check check-tests clean clean-tests
 
 all: $(TARGET)
 
@@ -46,6 +50,9 @@ $(TEST_AF_UNIX): test/test_af_unix.c
 $(TEST_PERS_SWITCH): test/test_personality_switch.c
 	$(CC) $(CFLAGS_TEST) -o $@ $<
 
+$(TEST_CMA): test/test_cma.c
+	$(CC) $(CFLAGS_TEST) -o $@ $<
+
 install: $(TARGET)
 	install -m 0755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
 
@@ -57,9 +64,15 @@ WRAPPER ?= ./$(TARGET)
 
 check: $(TARGET) check-tests
 
-check-tests: $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) $(TEST_AF_UNIX)
-	./$(TEST_SMOKE) $(WRAPPER) ./$(TEST_PTRACE) ./$(TEST_PERS_QUERY) ./$(TEST_PERS_SWITCH) ./$(TEST_AF_UNIX)
+check-tests: $(TEST_BINS)
+	./$(TEST_SMOKE) $(WRAPPER) ./$(TEST_PTRACE) ./$(TEST_PERS_QUERY) ./$(TEST_PERS_SWITCH) \
+	    ./$(TEST_AF_UNIX) ./$(TEST_CMA)
 
-clean:
-	rm -f $(TARGET) $(TEST_SMOKE) $(TEST_PTRACE) $(TEST_PERS_QUERY) $(TEST_PERS_SWITCH) \
-	      $(TEST_AF_UNIX)
+# Removes ONLY the probe binaries, never $(TARGET): build_and_test.sh stages the freshly
+# built wrapper into this directory and calls this on exit, so a `clean` there would
+# delete the very thing it just produced.
+clean-tests:
+	rm -f $(TEST_BINS)
+
+clean: clean-tests
+	rm -f $(TARGET)

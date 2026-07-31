@@ -637,6 +637,62 @@ if [ -n "$aff_cmd" ]; then
 else
   echo "RESULT INFO functional cpu.affinity no numactl/taskset in cage - skipped"
 fi
+
+# Cross Memory Attach. The single-node profile EXEMPTS process_vm_readv from the
+# deny-list floor - Cray MPICH reads the peer rank address space directly for
+# intra-node messages, and without it ICON dies with SIGSYS the moment ranks exchange
+# data (Balfrin 2026-07-31). process_vm_writev stays blocked under every profile.
+# BOTH halves are checked because the pair IS the decision: read is same-uid
+# disclosure between ranks of one job, write reaches into the un-caged step-broker and
+# is code execution outside the cage. Checking it HERE, in a real brokered job, is also
+# what catches a stale wrapper on the compute node - the failure mode that has cost
+# more bring-up rounds than any other. Self-attach is used, so the kernel ptrace-attach
+# check always permits it and the only thing under test is the seccomp filter.
+if command -v python3 >/dev/null 2>&1; then
+  husk_cma() {
+    python3 - "$1" <<"PY"
+import ctypes, os, sys
+
+class Iov(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+fn = getattr(libc, "process_vm_" + sys.argv[1] + "v")
+fn.restype = ctypes.c_ssize_t
+fn.argtypes = [ctypes.c_int, ctypes.POINTER(Iov), ctypes.c_ulong,
+               ctypes.POINTER(Iov), ctypes.c_ulong, ctypes.c_ulong]
+src = ctypes.create_string_buffer(b"husk-cma-probe")
+dst = ctypes.create_string_buffer(len(src))
+a = Iov(ctypes.cast(src, ctypes.c_void_p), len(src))
+b = Iov(ctypes.cast(dst, ctypes.c_void_p), len(src))
+local, remote = (b, a) if sys.argv[1] == "read" else (a, b)
+n = fn(os.getpid(), ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+sys.exit(0 if n == len(src) and dst.raw == src.raw else 2)
+PY
+  }
+  # ulimit -c 0: the blocked half dies on SIGSYS, and a core file dropped in the
+  # workdir would be noise in a test whose whole output is what the job left behind.
+  ( ulimit -c 0 2>/dev/null; husk_cma read ) >/dev/null 2>&1
+  cma_r=$?
+  ( ulimit -c 0 2>/dev/null; husk_cma write ) >/dev/null 2>&1
+  cma_w=$?
+  if [ "$cma_r" -eq 0 ]; then
+    echo "RESULT PASS functional cma.read process_vm_readv permitted - MPICH intra-node transfers work"
+  elif [ "$cma_r" -eq 159 ]; then
+    echo "RESULT FAIL functional cma.read process_vm_readv killed by SIGSYS - ICON will die when ranks exchange data; the installed seccomp-wrapper predates the single-node CMA exemption"
+  else
+    echo "RESULT FAIL functional cma.read process_vm_readv failed rc=$cma_r - expected the read to succeed under the single-node profile"
+  fi
+  if [ "$cma_w" -eq 159 ]; then
+    echo "RESULT PASS containment cma.write process_vm_writev killed by SIGSYS - a rank cannot write into the un-caged step-broker"
+  elif [ "$cma_w" -eq 0 ]; then
+    echo "RESULT FAIL containment cma.write process_vm_writev SUCCEEDED - the write half of CMA is open; that is code execution outside the cage"
+  else
+    echo "RESULT INFO containment cma.write process_vm_writev did not succeed but was not SIGSYS (rc=$cma_w) - blocked, cause unclear"
+  fi
+else
+  echo "RESULT INFO functional cma.read no python3 in cage - CMA probe skipped"
+fi
 echo "===HUSK-PROBE-END==="
 '
     # Bake the real workdir into the probe (heredoc is single-quoted to protect the

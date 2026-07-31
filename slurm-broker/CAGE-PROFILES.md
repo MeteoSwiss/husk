@@ -14,7 +14,7 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | done — `settings::CageKind::Rank` + `rank::wrap_command` |
 | in-cage `srun` stub, step-broker, guard bootstrap | done — **ICON ran to completion, 2026-07-31** |
 | broker refuses ptrace/CMA (`PR_SET_DUMPABLE`) | done — `df414ea` |
-| `process_vm_readv` for single-node (CMA) | **PENDING** — the first real profile delta; see Open |
+| `process_vm_readv` for single-node (CMA) | done — the first real profile delta; `SINGLE_NODE_EXEMPT`, smoke 8-10 + selftest `cma.*`. Hardware run pending |
 
 ## Why profiles exist
 
@@ -126,14 +126,25 @@ Discovering what each profile needs is the tedious part. Four things bound it:
 
 ## Open
 
-- **CMA is the first genuine profile delta.** Cray MPICH needs `process_vm_readv` for
-  intra-node transfers; blocked, ICON dies with SIGSYS once ranks exchange data, and
-  `MPICH_SMP_SINGLE_COPY_MODE=NONE` is only a diagnostic (it taxes every message).
-  The proposal: allow `process_vm_readv` for `single-node`, keep `process_vm_writev`
-  blocked. Read = same-uid memory disclosure between caged ranks; write = arbitrary code
+- **CMA is the first genuine profile delta, and it is now implemented.** Cray MPICH needs
+  `process_vm_readv` for intra-node transfers; blocked, ICON dies with SIGSYS once ranks
+  exchange data, and `MPICH_SMP_SINGLE_COPY_MODE=NONE` is only a diagnostic (it taxes
+  every message). `single-node` therefore permits `process_vm_readv` and keeps
+  `process_vm_writev` blocked. Read = same-uid memory disclosure between caged ranks of
+  one job, which already share uid, files and allocation; write = arbitrary code
   execution in the un-caged step-broker, i.e. the escape itself. The broker already
   refuses to be a target (`PR_SET_DUMPABLE`), so the concession is rank-to-rank only.
-  Untested whether read alone suffices — that is the next hardware run.
+
+  **It is expressed as an exemption from the floor, not as a per-profile deny-list.**
+  `BLOCKED_SYSCALLS` still applies to every profile and still lists both calls;
+  `SINGLE_NODE_EXEMPT` names the one syscall that is subtracted. This keeps the safe
+  default: a syscall added to the floor is blocked under every profile unless someone
+  deliberately writes it into an exemption table with a reason. Forking the list per
+  profile would have made *forgetting* an entry the way a hole appears.
+
+  **Still open:** whether the read side alone is enough for ICON — the hardware run is
+  ICON *without* the env var. Failure would be a new SIGSYS, and the write side is a
+  decision to argue rather than a line to add.
 
 - ~~Does a caged MPI job need AF_UNIX at all?~~ **Measured twice, and the second
   measurement overturned the first.**
