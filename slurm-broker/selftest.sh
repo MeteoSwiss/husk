@@ -77,6 +77,24 @@ fi
 # workdir, so the credential auto-scan stays bounded), which would break a relative path.
 BROKER="$(cd "$(dirname "$BROKER")" && pwd)/$(basename "$BROKER")"
 
+# STALENESS GUARD. The search order above prefers a prebuilt binary next to this script
+# over a fresh `cargo build`, which is right on a cluster (that IS the deployed artifact)
+# and a trap on a development machine: a binary from last week silently produces a report
+# about last week's code. That already happened here — two policy checks "failed" against
+# a three-day-old build while the current one passed 20/20 — and it is the same class as
+# the stale seccomp-wrapper that cost two Balfrin bring-up rounds. Say so loudly; do not
+# refuse, because a deployed cluster legitimately has no sources beside the binary.
+if [ -d "$HERE/broker/src" ]; then
+  _stale_src=$(find "$HERE/broker/src" -name '*.rs' -newer "$BROKER" -print -quit 2>/dev/null || true)
+  if [ -n "$_stale_src" ]; then
+    echo "selftest: WARNING - the broker binary is OLDER than the sources"
+    echo "          binary : $BROKER"
+    echo "          newer  : $_stale_src"
+    echo "          You are testing a stale build. Rebuild, or pass --broker PATH."
+    echo
+  fi
+fi
+
 SPOOL="$(mktemp -d "${TMPDIR:-/tmp}/husk-selftest-spool.XXXXXX")"
 BROKER_LOG="$SPOOL/broker.stderr.log"
 CANARY="husk-canary-$$-do-not-leak"
@@ -692,6 +710,129 @@ PY
   fi
 else
   echo "RESULT INFO functional cma.read no python3 in cage - CMA probe skipped"
+fi
+
+# The check the self-attach probe above CANNOT make. cma.read proves the seccomp filter
+# permits the syscall; it says nothing about whether one rank may actually read another,
+# because a process attaching to ITSELF always passes the kernel ptrace check. That gap is
+# exactly what let the CMA work look finished while ICON still died with EPERM. So: launch
+# a real 2-task step through the stub and have rank 1 read rank 0.
+#
+# The same step answers the other half - a rank must NOT reach the un-caged step-broker,
+# which holds MUNGE and the daemon route. The broker is located by scanning /proc, the way
+# an attacker would, rather than being told where it is.
+if command -v srun >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  cat > __WORKDIR__/husk-cma-step.py <<"PY"
+import ctypes, os, sys, time
+
+class Iov(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.process_vm_readv.restype = ctypes.c_ssize_t
+libc.process_vm_readv.argtypes = [ctypes.c_int, ctypes.POINTER(Iov), ctypes.c_ulong,
+                                  ctypes.POINTER(Iov), ctypes.c_ulong, ctypes.c_ulong]
+
+def read_from(pid, addr, n):
+    dst = ctypes.create_string_buffer(n)
+    local = Iov(ctypes.cast(dst, ctypes.c_void_p), n)
+    remote = Iov(ctypes.c_void_p(addr), n)
+    ctypes.set_errno(0)
+    got = libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+    return got, ctypes.get_errno(), dst.raw
+
+def find_step_broker():
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            parts = open("/proc/%s/cmdline" % d, "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if any(b"husk-slurm-broker" in c for c in parts) and b"--step-broker" in parts:
+            return int(d)
+    return 0
+
+def yama_scope():
+    # A ptrace_scope of 1 restricts attachment to DESCENDANTS. Two ranks are siblings
+    # (both children of slurmstepd), so a non-zero scope denies rank-to-rank CMA no matter
+    # what husk does with namespaces. Balfrin has no Yama at all; report the value so a
+    # failure here is attributable instead of being blamed on the cage.
+    try:
+        return open("/proc/sys/kernel/yama/ptrace_scope").read().strip()
+    except OSError:
+        return "none"
+
+work = sys.argv[1]
+rank = int(os.environ.get("SLURM_PROCID", "0"))
+note = os.path.join(work, "husk-cma-rank0")
+CANARY = b"husk-peer-canary"
+
+if rank == 0:
+    buf = ctypes.create_string_buffer(CANARY)
+    tmp = note + ".tmp"
+    fh = open(tmp, "w")
+    fh.write("%d %d %d" % (os.getpid(), ctypes.addressof(buf), len(buf)))
+    fh.close()
+    os.rename(tmp, note)          # appears atomically, so rank 1 never reads half of it
+    time.sleep(25)                # stay alive while rank 1 reads us
+else:
+    print("HUSK-CMA-YAMA %s" % yama_scope())
+    for _ in range(150):
+        if os.path.exists(note):
+            break
+        time.sleep(0.2)
+    if not os.path.exists(note):
+        print("HUSK-CMA-PEERS FAIL rank0 never published")
+    else:
+        pid, addr, n = [int(x) for x in open(note).read().split()]
+        got, err, raw = read_from(pid, addr, n)
+        if got == n and raw.startswith(CANARY):
+            print("HUSK-CMA-PEERS OK")
+        else:
+            print("HUSK-CMA-PEERS FAIL got=%d errno=%d" % (got, err))
+    target = find_step_broker()
+    if target == 0:
+        print("HUSK-CMA-OUTSIDE NOBROKER")
+    else:
+        # Address 0x1000 is deliberately unmapped: EPERM means permission was refused,
+        # any other errno means permission was GRANTED and only the address was bad.
+        got, err, _ = read_from(target, 0x1000, 8)
+        print("HUSK-CMA-OUTSIDE %s errno=%d" % ("DENIED" if err == 1 else "ALLOWED", err))
+PY
+  # --overlap so the step does not queue behind the job step for CPUs, and a timeout so a
+  # step that never starts cannot wedge the whole self-test.
+  rm -f __WORKDIR__/husk-cma-rank0
+  timeout 240 srun -n 2 --overlap python3 __WORKDIR__/husk-cma-step.py __WORKDIR__ \
+      > __WORKDIR__/husk-cma.out 2>&1 || true
+  cma_step=$(cat __WORKDIR__/husk-cma.out 2>/dev/null | tr -d "\r")
+  case "$cma_step" in
+    *"HUSK-CMA-PEERS OK"*)
+      echo "RESULT PASS functional cma.peers one rank read another rank - the job shares a user namespace, MPICH intra-node transfers work" ;;
+    *"HUSK-CMA-PEERS FAIL"*)
+      cma_yama=$(echo "$cma_step" | sed -n "s/^HUSK-CMA-YAMA //p" | head -1)
+      case "${cma_yama:-none}" in
+        0|none)
+          echo "RESULT FAIL functional cma.peers ranks cannot read each other [$(echo "$cma_step" | grep HUSK-CMA-PEERS | head -1)] - ICON will die with EPERM; is the job sharing one user namespace (is the cage holder running)?" ;;
+        *)
+          echo "RESULT INFO functional cma.peers ranks cannot read each other, but yama ptrace_scope=$cma_yama restricts attachment to descendants and ranks are siblings - this node denies rank-to-rank CMA independently of husk" ;;
+      esac ;;
+    *)
+      echo "RESULT FAIL functional cma.peers the 2-task probe step produced no verdict - the brokered srun path is broken [$(echo "$cma_step" | tail -2 | tr "\n" " ")]" ;;
+  esac
+  case "$cma_step" in
+    *"HUSK-CMA-OUTSIDE DENIED"*)
+      echo "RESULT PASS containment cma.outside a rank cannot read the un-caged step-broker - the user namespace boundary holds" ;;
+    *"HUSK-CMA-OUTSIDE ALLOWED"*)
+      echo "RESULT FAIL containment cma.outside a rank CAN read the un-caged step-broker - it holds MUNGE and the daemon route" ;;
+    *"HUSK-CMA-OUTSIDE NOBROKER"*)
+      echo "RESULT INFO containment cma.outside no step-broker found in /proc - nothing to attempt" ;;
+    *)
+      echo "RESULT INFO containment cma.outside no verdict from the probe step" ;;
+  esac
+  rm -f __WORKDIR__/husk-cma-step.py __WORKDIR__/husk-cma.out __WORKDIR__/husk-cma-rank0
+else
+  echo "RESULT INFO functional cma.peers no srun or python3 in cage - two-cage CMA probe skipped"
 fi
 echo "===HUSK-PROBE-END==="
 '
