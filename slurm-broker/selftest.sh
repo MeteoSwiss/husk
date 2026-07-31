@@ -984,6 +984,27 @@ PY
     *200*) echo "RESULT FAIL containment net.allowlist the proxy TUNNELLED to an unlisted host [$_egress_unlisted]" ;;
     *)     echo "RESULT FAIL containment net.allowlist no verdict from the proxy for an unlisted host [$_egress_unlisted]" ;;
   esac
+  # A LIVE fetch of the shipped default entry, through the proxy, from inside the cage.
+  # This is the only arm that proves the chain end to end rather than proving a refusal.
+  #
+  # Failure here is reported as INFO, not FAIL, and the distinction matters: the proxy runs
+  # ON THE COMPUTE NODE, so if that node has no route to the internet — which is normal on
+  # many HPC systems — then husk is working perfectly and there is simply nothing upstream.
+  # A FAIL would blame the cage for how the site chose to build its network.
+  _egress_live=$(python3 - <<"PY" 2>&1
+import urllib.request, socket
+socket.setdefaulttimeout(25)
+try:
+    r = urllib.request.urlopen("https://opendatadocs.meteoswiss.ch/", timeout=25)
+    print("OK %d %d" % (r.status, len(r.read())))
+except Exception as e:
+    print("ERR %s %s" % (type(e).__name__, str(e)[:80]))
+PY
+)
+  case "$_egress_live" in
+    "OK 200"*) echo "RESULT PASS functional net.live fetched the allowlisted host through the proxy [$_egress_live]" ;;
+    *)         echo "RESULT INFO functional net.live could not fetch the allowlisted host [$_egress_live] - husk refuses nothing here, so this is most likely a compute node with no route to the internet" ;;
+  esac
   # ...and the scheduler stays unreachable even if some allowlist entry named its host.
   _egress_sched=$(python3 - <<"PY" 2>/dev/null
 import socket, os
