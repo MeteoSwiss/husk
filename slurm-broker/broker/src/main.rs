@@ -89,6 +89,86 @@ extern "C" {
     fn libc_getppid() -> std::os::raw::c_int;
 }
 
+// ---- orderly shutdown, so the spool does not outlive the session -------------
+//
+// The spool is a directory husk creates in the user's own source tree, so leaving one
+// behind on every launch is not a cosmetic issue: the field report of 2026-07-31 found
+// two of them at different depths and an agent debugging a failed job read the older,
+// dead one and drew conclusions from a stale project root.
+//
+// PDEATHSIG delivers SIGTERM when the session ends, so cleanup hangs off that. The
+// handler only sets a flag; the removal happens on the main loop's next tick, where it
+// is ordinary code rather than something that must be async-signal-safe.
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How idle a pre-v0.5 spool (fixed name, no `owner` file) must be before it is reaped.
+/// It cannot prove it is dead, so age is the only evidence there is, and an hour is
+/// comfortably longer than the gap between two of a live broker's writes.
+const LEGACY_SPOOL_MIN_AGE_SECS: u64 = 3600;
+
+type SigHandler = extern "C" fn(std::os::raw::c_int);
+extern "C" {
+    fn signal(signum: std::os::raw::c_int, handler: SigHandler) -> usize;
+}
+
+extern "C" fn note_shutdown(_sig: std::os::raw::c_int) {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Catch the signals that end a session, so the spool is removed instead of orphaned.
+/// SIGKILL cannot be caught, which is exactly why the reaper on the next startup exists
+/// as a second, independent path.
+fn catch_shutdown_signals() {
+    const SIGINT: std::os::raw::c_int = 2;
+    const SIGTERM_NUM: std::os::raw::c_int = 15;
+    // SAFETY: installing a handler that does nothing but store to an AtomicBool.
+    unsafe {
+        signal(SIGTERM_NUM, note_shutdown);
+        signal(SIGINT, note_shutdown);
+    }
+}
+
+fn shutting_down() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Claim this spool by recording who is using it, and report whether the claim stuck.
+///
+/// Only the claimant removes the directory on exit. If an `owner` file already names a
+/// LIVE process, this broker is a guest in someone else's spool: it still serves (two
+/// brokers on one spool is harmless — each request is consumed once), but it must not
+/// delete the directory out from under the other session.
+fn claim_spool(spool: &std::path::Path, project_dir: &std::path::Path) -> bool {
+    if let Some(other) = husk_slurm_broker::spool_owner_pid(spool) {
+        if other != std::process::id() && husk_slurm_broker::pid_is_alive(other) {
+            eprintln!(
+                "broker: spool {spool:?} is already owned by live pid {other} — sharing it, \
+                 and leaving its cleanup to that session"
+            );
+            return false;
+        }
+    }
+    let owner = format!(
+        "pid={}\nstarted={}\nproject={}\nversion={}\n",
+        std::process::id(),
+        husk_slurm_broker::utc_stamp(now_secs()),
+        project_dir.display(),
+        env!("CARGO_PKG_VERSION"),
+    );
+    if let Err(e) = std::fs::write(spool.join("owner"), owner) {
+        eprintln!("broker: could not record spool ownership ({e}) — this spool will be left behind");
+        return false;
+    }
+    true
+}
+
 /// `--hold-cage` — own the node cage's namespaces and nothing else.
 ///
 /// Creates one **bare** user namespace, identity-maps this user into it, and does nothing
@@ -292,9 +372,10 @@ fn main() {
         .or_else(|| std::env::var("HUSK_SLURM_SPOOL").ok())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(".husk-slurm-spool")
+            husk_slurm_broker::session_spool_dir(
+                &std::env::current_dir().unwrap_or_default(),
+                std::process::id(),
+            )
         });
 
     if let Err(e) = std::fs::create_dir_all(&spool) {
@@ -350,7 +431,32 @@ fn main() {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let project_dir = std::env::current_dir().unwrap_or_default();
     let fs_policy = settings::FsPolicy::resolve(&home, &project_dir);
+
+    // Open the session log by saying what session this is. An append-only log shared by
+    // every launch in a directory gave a reader no way to tell a live session's lines
+    // from a dead one's; one file per session, headed by this, does.
+    eprintln!(
+        "broker: husk {} session pid {} started {} — project dir {project_dir:?}, spool {spool:?}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
+        husk_slurm_broker::utc_stamp(now_secs()),
+    );
     eprintln!("broker: compute-cage policy resolved from project dir {project_dir:?}");
+
+    catch_shutdown_signals();
+    let owns_spool = claim_spool(&spool, &project_dir);
+
+    // Second teardown path: clean up after sessions that were killed rather than
+    // signalled. Scoped to the directory husk was launched in — see reap_stale_spools.
+    if let Some(parent) = spool.parent() {
+        for note in husk_slurm_broker::reap_stale_spools(
+            parent,
+            &spool,
+            Duration::from_secs(LEGACY_SPOOL_MIN_AGE_SECS),
+        ) {
+            eprintln!("broker: {note}");
+        }
+    }
 
     let broker = Broker {
         spool: spool.clone(),
@@ -368,10 +474,25 @@ fn main() {
         if let Err(e) = broker.process_once() {
             eprintln!("broker: scan error: {e}");
         }
+        // `--once` is a single scan for tests and dry runs, not a session — it leaves the
+        // spool (and any staged script it was asked to inspect) exactly as it found it.
         if once {
+            return;
+        }
+        if shutting_down() {
             break;
         }
         std::thread::sleep(Duration::from_millis(poll_ms));
+    }
+
+    if owns_spool {
+        if husk_slurm_broker::remove_spool_dir(&spool) {
+            eprintln!("broker: session ended; removed spool {spool:?}");
+        } else {
+            eprintln!(
+                "broker: session ended; kept spool {spool:?} — it holds files husk did not create"
+            );
+        }
     }
 }
 

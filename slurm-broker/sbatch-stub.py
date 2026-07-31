@@ -36,14 +36,35 @@ def die(msg, code=1):
     sys.exit(code)
 
 
+def where_to_look():
+    """Point at the broker's session log, if this session has one.
+
+    An unattributed husk failure is worse than a slow one: it invites a confident,
+    wrong fix. Every message that gives up should say where the other half of the
+    story is. The log is readable and NOT writable from in here, which is why it is
+    not in the spool.
+    """
+    log = os.environ.get("HUSK_SESSION_LOG")
+    return f" The broker's log for this session is {log}." if log else ""
+
+
 def spool_dir():
-    d = os.environ.get("HUSK_SLURM_SPOOL") or os.path.join(os.getcwd(), ".husk-slurm-spool")
+    # Set by the outer wrapper, which creates the directory. There is deliberately no
+    # guess-the-path fallback: a stale spool from an earlier session in this directory
+    # would look exactly like a live one, and picking it up silently is how a stale
+    # project root gets read as the current one.
+    d = os.environ.get("HUSK_SLURM_SPOOL")
+    if not d:
+        die(
+            "HUSK_SLURM_SPOOL is not set, so there is no broker to talk to. "
+            "This command only works inside a husk session on a SLURM machine."
+        )
     if not os.path.isdir(d):
         # The outer wrapper is expected to create this. Fail closed if absent —
         # do NOT silently bypass the broker.
-        die(f"spool directory not found: {d} (is husk's SLURM broker running?)")
+        die(f"spool directory not found: {d} (is husk's SLURM broker running?){where_to_look()}")
     if not os.access(d, os.W_OK):
-        die(f"spool directory not writable: {d}")
+        die(f"spool directory not writable: {d}{where_to_look()}")
     return d
 
 

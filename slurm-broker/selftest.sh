@@ -603,6 +603,82 @@ run_live_probe() {
   fi
 }
 
+# ============================ LIFECYCLE TIER ===================================
+# The spool is a directory husk creates in someone's source tree, so what happens to
+# it when a session ENDS is part of the contract. It needs a real long-lived broker
+# (the policy tier's --once runs never reach the teardown path), but no scheduler.
+#
+# Why this is worth a test rather than a code read: a spool left behind is not merely
+# untidy. The field report of 2026-07-31 found two of them at different depths, and an
+# agent debugging a failed job opened the older, dead one and reasoned from a stale
+# project root. "Which of these is live?" must have an answer on disk.
+echo
+echo "== lifecycle tier (session spool ownership, teardown, reaping) =="
+LIFE="$PWORK/lifecycle"
+rm -rf "$LIFE"; mkdir -p "$LIFE"
+LIFE_SPOOL="$LIFE/.husk-slurm-spool-$$"
+mkdir -p "$LIFE_SPOOL"
+
+# Beside it: the three cases the reaper must tell apart.
+mkdir -p "$LIFE/.husk-slurm-spool"                  # pre-v0.5 layout, no owner file
+printf 'stale\n' > "$LIFE/.husk-slurm-spool/broker.log"
+touch -d "3 hours ago" "$LIFE/.husk-slurm-spool/broker.log" 2>/dev/null \
+  || touch -t 200001010000 "$LIFE/.husk-slurm-spool/broker.log"
+mkdir -p "$LIFE/.husk-slurm-spool-999999"           # owner recorded, owner gone
+printf 'pid=999999\n' > "$LIFE/.husk-slurm-spool-999999/owner"
+mkdir -p "$LIFE/.husk-slurm-spool-999998"           # owner gone, but holds a foreign file
+printf 'pid=999998\n' > "$LIFE/.husk-slurm-spool-999998/owner"
+printf 'not husk\n'  > "$LIFE/.husk-slurm-spool-999998/notes.txt"
+
+# `exec` so $! is the BROKER's pid and not the subshell's: the owner file records the
+# broker, and the teardown signal has to reach the broker rather than its parent.
+( cd "$LIFE" && exec "$BROKER" --spool "$LIFE_SPOOL" --poll-ms 100 ) >"$LIFE/session.log" 2>&1 &
+LIFE_PID=$!
+# Wait for the startup banner rather than sleeping a guessed interval.
+for _ in $(seq 1 50); do grep -q "watching" "$LIFE/session.log" 2>/dev/null && break; sleep 0.1; done
+
+# L1 — the spool says who owns it. This is what makes "live or stale?" answerable.
+if [ -f "$LIFE_SPOOL/owner" ] && grep -q "^pid=$LIFE_PID$" "$LIFE_SPOOL/owner"; then
+  check PASS lifecycle spool.owner "spool records its live owner pid $LIFE_PID"
+else
+  check FAIL lifecycle spool.owner "no usable owner file: $(cat "$LIFE_SPOOL/owner" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# L2 — the session log opens by identifying the session. An append-only shared log gave
+# a reader no way to date a line; this is the fix for that.
+if grep -qE "session pid $LIFE_PID started [0-9]{8}-[0-9]{6}Z" "$LIFE/session.log"; then
+  check PASS lifecycle spool.banner "session log opens with pid + UTC start time"
+else
+  check FAIL lifecycle spool.banner "no session banner: $(head -3 "$LIFE/session.log" | tr '\n' ' ')"
+fi
+
+# L3 — reaping, all three branches at once.
+if [ ! -d "$LIFE/.husk-slurm-spool" ] && [ ! -d "$LIFE/.husk-slurm-spool-999999" ] \
+   && [ -f "$LIFE/.husk-slurm-spool-999998/notes.txt" ]; then
+  check PASS lifecycle spool.reap "reaped the idle legacy + dead-owner spools; spared the one holding a foreign file"
+else
+  check FAIL lifecycle spool.reap "legacy=$([ -d "$LIFE/.husk-slurm-spool" ] && echo kept || echo gone) dead=$([ -d "$LIFE/.husk-slurm-spool-999999" ] && echo kept || echo gone) foreign_file=$([ -f "$LIFE/.husk-slurm-spool-999998/notes.txt" ] && echo kept || echo DELETED)"
+fi
+
+# L4 — the audit log is not in the spool. The spool must be writable by the caged agent
+# for the stub to reach it, so a log kept there is one the confined side can rewrite.
+if [ ! -e "$LIFE_SPOOL/broker.log" ]; then
+  check PASS lifecycle spool.log_outside "no broker log inside the agent-writable spool"
+else
+  check FAIL lifecycle spool.log_outside "broker.log is in the spool, where the caged agent can rewrite it"
+fi
+
+# L5 — the session ends and takes its spool with it. This is the whole point.
+kill -TERM "$LIFE_PID" 2>/dev/null
+for _ in $(seq 1 50); do kill -0 "$LIFE_PID" 2>/dev/null || break; sleep 0.1; done
+wait "$LIFE_PID" 2>/dev/null || true
+if [ ! -d "$LIFE_SPOOL" ]; then
+  check PASS lifecycle spool.teardown "spool removed when the session ended"
+else
+  check FAIL lifecycle spool.teardown "spool survived its session: $(ls -a "$LIFE_SPOOL" | tr '\n' ' ')"
+fi
+rm -rf "$LIFE"
+
 # ============================ CONTAINMENT TIER =================================
 # The live piece: submit fixed probes THROUGH the broker, let it re-cage each job,
 # and read the SLURM output back out-of-band. Needs a real scheduler + node.

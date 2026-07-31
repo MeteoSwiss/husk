@@ -37,7 +37,7 @@ use std::ptr;
 
 // The one internal, dependency-free shared const (keeps this binary's zero-crate
 // audit surface intact — see the module header).
-use husk_slurm_broker::READONLY_SLURM;
+use husk_slurm_broker::{session_log_path, session_spool_dir, READONLY_SLURM};
 
 // ---- the only FFI: two namespace syscalls std doesn't expose ----------------
 const CLONE_NEWNS: c_int = 0x0002_0000; // new mount namespace
@@ -134,10 +134,16 @@ impl Config {
             std::process::exit(0);
         }
 
+        // Per-session by default (`.husk-slurm-spool-<pid>`, this pid, which becomes the
+        // agent's after the exec). Two husk sessions in one project directory then get
+        // their own rendezvous, and — with the `owner` file the broker writes — a spool
+        // left on disk can be told apart from one in use.
         let spool = raw
             .spool
             .or_else(|| std::env::var_os("HUSK_SLURM_SPOOL").map(PathBuf::from))
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join(".husk-slurm-spool"));
+            .unwrap_or_else(|| {
+                session_spool_dir(&std::env::current_dir().unwrap_or_default(), std::process::id())
+            });
         let agent = if raw.agent.is_empty() {
             vec!["husk".to_string()]
         } else {
@@ -196,11 +202,44 @@ impl Drop for BrokerHandle {
     }
 }
 
-fn spawn_broker(broker: &Path, spool: &Path) -> io::Result<BrokerHandle> {
+/// Choose where the broker's session log goes, creating the directory for it.
+///
+/// `~/.husk/log/husk-<utc>-<pid>.log`, which is deliberately NOT in the spool. The spool
+/// has to be writable by the caged agent for the stub to reach it, so a log kept there
+/// is one the confined side can truncate or forge — the audited party must not be able
+/// to author the audit trail. Reads are unrestricted, so the agent can still open this
+/// file to diagnose itself.
+///
+/// Falls back to the old in-spool location if `$HOME` is unusable, with a warning:
+/// logging is diagnostics, not the boundary, so it must not be able to abort a launch.
+fn resolve_session_log(spool: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let Some(home) = home.filter(|h| !h.as_os_str().is_empty()) {
+        let path = session_log_path(&home, secs, std::process::id());
+        match path.parent().map(fs::create_dir_all) {
+            Some(Ok(())) => return path,
+            _ => eprintln!(
+                "husk-slurm-wrapper: cannot create '{}' — falling back to a log inside the \
+                 spool, which the sandboxed agent can write",
+                path.parent().unwrap_or(&path).display()
+            ),
+        }
+    }
+    spool.join("broker.log")
+}
+
+fn spawn_broker(broker: &Path, spool: &Path, log_path: &Path) -> io::Result<BrokerHandle> {
     let log = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(spool.join("broker.log"))?;
+        .open(log_path)
+        .map_err(|e| {
+            io::Error::new(e.kind(), format!("cannot open session log '{}': {e}", log_path.display()))
+        })?;
     let errlog = log.try_clone()?;
     let child = Command::new(broker)
         .arg("--spool")
@@ -278,6 +317,9 @@ fn exec_agent(
     let mut cmd = Command::new(&agent[0]);
     cmd.args(&agent[1..]);
     cmd.env("HUSK_SLURM_SPOOL", spool);
+    if let Some(log) = std::env::var_os("HUSK_SESSION_LOG") {
+        cmd.env("HUSK_SESSION_LOG", log);
+    }
     // `exec` only returns on failure; on success the image is replaced and
     // `_broker` is "leaked" into the new image (it keeps running). On failure we
     // return Err and `_broker` drops here -> killed. Fail-closed either way.
@@ -364,8 +406,14 @@ fn run() -> io::Result<Infallible> {
             })?;
             std::env::set_var("HUSK_SLURM_SPOOL", &cfg.spool);
 
+            // Published into the agent's environment so a session that hits a husk denial
+            // has somewhere to look. The agent can READ this file and not write it, which
+            // is the whole reason it is not in the spool.
+            let session_log = resolve_session_log(&cfg.spool);
+            std::env::set_var("HUSK_SESSION_LOG", &session_log);
+
             // Broker first, in the clean outer namespaces (keeps MUNGE + network).
-            let broker_handle = spawn_broker(broker, &cfg.spool)?;
+            let broker_handle = spawn_broker(broker, &cfg.spool, &session_log)?;
 
             // Now shrink OUR world and swap sbatch for the stub.
             enter_user_mount_ns()?;
@@ -375,8 +423,9 @@ fn run() -> io::Result<Infallible> {
             shadow_readonly_commands(stub);
 
             eprintln!(
-                "husk-slurm-wrapper: SLURM detected; spool={} sbatch<-stub OK; launching {}",
+                "husk-slurm-wrapper: SLURM detected; spool={} log={} sbatch<-stub OK; launching {}",
                 cfg.spool.display(),
+                session_log.display(),
                 cfg.agent.join(" ")
             );
             exec_agent(ready, broker_handle, &cfg.agent, &cfg.spool)
@@ -409,7 +458,8 @@ USAGE: husk-slurm-wrapper --stub PATH --broker PATH [--spool DIR]\n\
 \n\
   --stub PATH       in-sandbox sbatch stub to bind over the real sbatch (required)\n\
   --broker PATH     trusted broker binary to launch outside the sandbox (required)\n\
-  --spool DIR       spool dir (default: $HUSK_SLURM_SPOOL or ./.husk-slurm-spool)\n\
+  --spool DIR       spool dir (default: $HUSK_SLURM_SPOOL or\n\
+                    ./.husk-slurm-spool-<pid>, removed when the session ends)\n\
   --sbatch-path P   sbatch to shadow (default: first `sbatch` on PATH)\n\
   -- AGENT_CMD...   command to exec after setup (default: husk)\n"
     );

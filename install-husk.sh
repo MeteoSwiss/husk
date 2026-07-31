@@ -87,6 +87,8 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   echo "    $CLAUDE_SETTINGS to their pre-install state (all other settings kept)"
   echo "  - socat at $PREFIX/bin/socat is LEFT in place (a shared dependency);"
   echo "    remove it yourself if nothing else uses it"
+  echo "  - session logs in $HOME/.husk/log are LEFT in place — they are the record"
+  echo "    of what husk brokered, so an uninstall does not erase them"
   echo ""
   echo "Press Enter to continue or Ctrl+C to cancel."
   read -r

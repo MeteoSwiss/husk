@@ -30,20 +30,51 @@ in* may be re-wired later (e.g. for `srun`/recursive brokering). Keep this versi
 
 ## Spool
 
-- **Location (decided 2026-06-11):** a dedicated subdir of the project
-  directory, `./.husk-slurm-spool/`. The stub finds it via the
-  `HUSK_SLURM_SPOOL` env var (set by the outer wrapper), falling back to
-  `$PWD/.husk-slurm-spool`. The location may be revisited in a later version.
+- **Location:** a per-session subdir of the project directory,
+  `./.husk-slurm-spool-<pid>/`. The stub finds it **only** via the
+  `HUSK_SLURM_SPOOL` env var, set by the outer wrapper; there is deliberately no
+  guess-the-path fallback, because a stale spool from an earlier session looks
+  exactly like a live one and picking it up silently is how a dead session's
+  project root gets read as the current one.
+
+  It has to live in the project directory: the stub runs *inside* the cage, and
+  the project directory is the one place the sandbox makes writable. That is a
+  constraint, not a preference, and everything below follows from it.
 - **Files:** `req-<uuid>.json` (stub → broker), `resp-<uuid>.json`
-  (broker → stub). `<uuid>` pairs a response to its request.
+  (broker → stub). `<uuid>` pairs a response to its request. `owner` records the
+  pid, start time, project dir and husk version of the session using the spool.
 - **Atomicity:** every file is written to `.<name>.tmp` in the same directory
   and then `rename()`d into place, so a reader never sees a partial file.
-- **Lifecycle:** the stub owns its pair — it deletes both `req-` and `resp-`
-  after reading the response. The broker removes the staged `job-<id>.sh` right
-  after `sbatch` returns (sbatch has copied the script into SLURM's own spool by
-  then), and, at the start of each scan, GCs orphaned `resp-*.json`/`job-*.sh`/
-  `.*.tmp` older than a cutoff (a stub or broker that died before cleanup) — it
-  never touches `req-*.json`.
+- **Lifecycle (per request):** the stub owns its pair — it deletes both `req-`
+  and `resp-` after reading the response. The broker removes the staged
+  `job-<id>.sh` right after `sbatch` returns (sbatch has copied the script into
+  SLURM's own spool by then), and, at the start of each scan, GCs orphaned
+  `resp-*.json`/`job-*.sh`/`.*.tmp` older than a cutoff (a stub or broker that
+  died before cleanup) — it never touches `req-*.json`.
+- **Lifecycle (per session):** the spool is a directory husk creates in someone
+  else's source tree, so it cleans up after itself, by two independent paths
+  because neither alone is sufficient:
+  1. the broker removes its own spool when its session ends (it receives SIGTERM
+     via `PDEATHSIG`), and
+  2. a starting broker reaps the dead spools it finds **beside its own** — those
+     whose `owner` names a pid that no longer exists, plus pre-v0.5 fixed-name
+     spools once everything in them has gone an hour untouched.
+
+  The reaper never leaves the directory husk was launched in, never considers a
+  directory owned by another user, and removes only the filenames husk creates
+  before `rmdir`-ing — so a spool holding anything else survives intact.
+
+## The session log is not in the spool
+
+`~/.husk/log/husk-<utc>-<pid>.log`, one file per session, pointed at by
+`HUSK_SESSION_LOG` in the agent's environment.
+
+The spool must be writable by the caged agent for the stub to reach it at all.
+A log kept there is therefore one the confined side can truncate, rewrite, or
+plant lines in — the audited party must not be able to author the audit trail.
+Reads are unrestricted, so the agent can still open this file to diagnose itself;
+it just cannot write it. One file per session also answers a question the old
+shared append-only `broker.log` could not: which lines belong to *this* run.
 
 ## Request  (`req-<uuid>.json`, written by the stub)
 

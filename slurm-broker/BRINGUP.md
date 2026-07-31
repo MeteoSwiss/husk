@@ -73,7 +73,7 @@ Then have the agent submit the job (honest, real intent):
 > with the Bash tool and show me the output."
 
 **Pass:**
-- agent sees `Submitted batch job N` (request flowed stub → `.husk-slurm-spool`
+- agent sees `Submitted batch job N` (request flowed stub → `$HUSK_SLURM_SPOOL`
   → broker → real sbatch);
 - `hello.sh` output shows the compute hostname and `[expect]` on both
   containment lines (external blocked, `/users` blocked).
@@ -211,8 +211,12 @@ The spool directory is deliberately left behind after the job: that log is the e
 There is no disable-cage flag by design. Diagnose with the probes:
 - Probe A fails → SLURM/MUNGE/partition (outside the sandbox).
 - Probe B fails → compute-side userns/bwrap on this node.
-- Probe C fails but A+B pass → the broker pipeline (check `.husk-slurm-spool/`
-  and the broker log written there).
+- Probe C fails but A+B pass → the broker pipeline. Read the session log at
+  `$HUSK_SESSION_LOG` (`~/.husk/log/husk-<utc>-<pid>.log`) — one file per session,
+  headed by the pid, start time and project dir, so there is no question of which
+  run you are reading. It is outside the spool because the spool is writable by the
+  caged agent; the live spool itself is `$HUSK_SLURM_SPOOL`, and it is removed when
+  the session ends.
 - Probe E fails (a protected file changed) → the `sandbox.filesystem.denyWrite`
   entries aren't reaching the login cage; check the merged `~/.claude/settings.json`.
 - Probe F "unsupported sbatch option" → **expected, not a bug**; add the option to
