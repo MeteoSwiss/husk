@@ -66,7 +66,11 @@ redundant copies of the same wall, and one of those copies silently cost us CMA.
    bytes), while an unlisted host and a SLURM daemon port were both refused with 403 and
    a direct connection out of the cage still failed. Compute nodes DO have a route to the
    internet, so this is not login-only.
-   Original scope note kept for the record: Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
+   A field report from a caged agent running that production experiment also produced two
+   fixes that belong here: the cage's writable root is now the **trusted project dir**
+   (it was `req.cwd`, which the agent supplies — the confined side was choosing its own
+   confinement), and the cage **announces its writable paths** in the job via a banner and
+   `HUSK_WRITABLE`. Original scope note kept for the record: Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
    an SNI/host allowlist likely suffices; full TLS-MITM only if content filtering is
    actually needed. Reactivates **AV8** (broker bypass) and is safe *only because* srun is
    now brokered and `slurmctld` stays off the allowlist.
@@ -88,6 +92,11 @@ redundant copies of the same wall, and one of those copies silently cost us CMA.
    does not. A proxied `http://` request is an absolute-URI `GET`, and serving it would mean
    a second HTTP parser — the F13/F14 shape. The refusal names `https://` so it is
    actionable.
+
+**v0.5 FEATURE WORK COMPLETE (2026-08-01).** ICON runs with CMA enabled, and a **production
+KENDA assimilation experiment ran green end to end** on Balfrin — the first real production
+workload through husk. Selftest 56/56 with no failures. Everything below step 3b is done;
+the only thing between here and release is the review.
 
 4. **Security review before release** — a multi-agent adversarial pass over the whole
    surface, as was done for v0.4, where it found four criticals. The submission surface,
