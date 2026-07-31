@@ -499,7 +499,7 @@ run_srun_probe() {
     return
   fi
   reset_spool
-  mkreq srunprobe sbatch '[]' "$work" "$(cat "$script")" 1 file
+  mkreq srunprobe sbatch "[\"--partition=$PART\"]" "$work" "$(cat "$script")" 1 file
   run_broker live "$SPOOL/out.srunprobe" "$work"
   local st jid; st="$(respfield srunprobe status)"; jid="$(respfield srunprobe job_id)"
   if [ "$st" != submitted ]; then
@@ -955,7 +955,18 @@ fi
 if [ -z "${HUSK_NET_SOCK:-}" ]; then
   echo "RESULT INFO containment net.egress no allowlist configured - job has no network (default)"
 else
-  echo "RESULT PASS functional net.relay egress is configured; relay socket present"
+  if [ -S "$HUSK_NET_SOCK" ]; then
+    echo "RESULT PASS functional net.relay the egress proxy socket exists at $HUSK_NET_SOCK"
+  else
+    echo "RESULT FAIL functional net.relay HUSK_NET_SOCK is set to $HUSK_NET_SOCK but there is no socket there - the proxy did not start; see .husk-step-spool-*/net-proxy.log beside the job"
+  fi
+  # socat is what turns the socket into the 127.0.0.1:3128 that proxy env vars name. Its
+  # absence is a NODE fact, not a husk failure, and it explains a local DNS error later.
+  if command -v socat >/dev/null 2>&1; then
+    echo "RESULT PASS functional net.socat socat is present, so the in-cage relay can run"
+  else
+    echo "RESULT INFO functional net.socat socat is NOT installed on this node - husk cannot build the in-cage relay, so the job has no network and name resolution fails locally"
+  fi
   # The proxy is the ONLY way out: the cage has no route, so a direct connection must
   # still fail even though egress is now configured. If this ever passes, the hole is not
   # the only hole.
@@ -971,12 +982,15 @@ PY
   fi
   # An unlisted host must be refused BY THE PROXY, with 403 rather than a timeout: a
   # refusal that looks like a network fault costs somebody an afternoon.
-  _egress_unlisted=$(python3 - <<"PY" 2>/dev/null
-import socket, os
-s = socket.socket(socket.AF_UNIX); s.settimeout(6)
-s.connect(os.environ["HUSK_NET_SOCK"])
-s.sendall(b"CONNECT husk-should-never-reach-this.example.com:443 HTTP/1.1\r\n\r\n")
-print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+  _egress_unlisted=$(python3 - <<"PY" 2>&1
+import socket, os, sys
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(6)
+    s.connect(os.environ["HUSK_NET_SOCK"])
+    s.sendall(b"CONNECT husk-should-never-reach-this.example.com:443 HTTP/1.1\r\n\r\n")
+    print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+except Exception as e:
+    print("PROBE-ERROR %s: %s" % (type(e).__name__, e))
 PY
 )
   case "$_egress_unlisted" in
@@ -1006,12 +1020,15 @@ PY
     *)         echo "RESULT INFO functional net.live could not fetch the allowlisted host [$_egress_live] - husk refuses nothing here, so this is most likely a compute node with no route to the internet" ;;
   esac
   # ...and the scheduler stays unreachable even if some allowlist entry named its host.
-  _egress_sched=$(python3 - <<"PY" 2>/dev/null
-import socket, os
-s = socket.socket(socket.AF_UNIX); s.settimeout(6)
-s.connect(os.environ["HUSK_NET_SOCK"])
-s.sendall(b"CONNECT localhost:6817 HTTP/1.1\r\n\r\n")
-print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+  _egress_sched=$(python3 - <<"PY" 2>&1
+import socket, os, sys
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(6)
+    s.connect(os.environ["HUSK_NET_SOCK"])
+    s.sendall(b"CONNECT localhost:6817 HTTP/1.1\r\n\r\n")
+    print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+except Exception as e:
+    print("PROBE-ERROR %s: %s" % (type(e).__name__, e))
 PY
 )
   case "$_egress_sched" in
