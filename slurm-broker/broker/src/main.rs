@@ -357,6 +357,7 @@ fn main() {
         session,
         dry_run,
         fs_policy,
+        project_dir: project_dir.clone(),
     };
     eprintln!(
         "broker: watching {spool:?}{}",

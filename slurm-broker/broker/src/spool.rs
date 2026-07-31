@@ -31,6 +31,13 @@ pub struct Broker {
     /// Compute-cage filesystem policy, resolved once at startup from the TRUSTED project
     /// dir (never from the agent-controlled req.cwd). See main.rs. (F17)
     pub fs_policy: FsPolicy,
+    /// The TRUSTED project dir — where husk was launched, captured before the agent ran.
+    ///
+    /// This is the cage's writable root, and it is deliberately NOT `req.cwd`: that comes
+    /// from the agent over the spool, so deriving the write boundary from it lets the
+    /// confined side choose its own confinement. F17 already established this for the
+    /// POLICY; the workdir bind was still using the agent's value.
+    pub project_dir: PathBuf,
 }
 
 impl Broker {
@@ -115,7 +122,7 @@ impl Broker {
         // Use the cage policy captured at startup from the TRUSTED project dir — NOT
         // re-resolved from the agent-controlled req.cwd (that let the agent author its
         // own cage by planting a nested .claude/settings.local.json). (F17)
-        let resp = match policy::decide(&req, &self.session, &self.fs_policy) {
+        let resp = match policy::decide(&req, &self.session, &self.fs_policy, &self.project_dir) {
             Decision::Reject(msg) => Response::rejected(&id, msg),
             Decision::Query(argv) => self.run_query(&id, argv),
             Decision::Submit(sub) => self.submit(&id, &req, sub),
@@ -472,6 +479,7 @@ mod tests {
             session: Session { uenv: None, view: None, required_partition: "preemptible".into() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
+            project_dir: PathBuf::from("/work"),
         };
         broker.process_once().unwrap();
 
@@ -504,7 +512,8 @@ mod tests {
             spool: spool.clone(),
             session: Session { uenv: None, view: None, required_partition: "preemptible".into() },
             dry_run: true,
-            fs_policy: FsPolicy::default(), // as if resolved from a clean, trusted project root
+            fs_policy: FsPolicy::default(),
+            project_dir: PathBuf::from("/work"), // as if resolved from a clean, trusted project root
         };
         let req_json = format!(
             r##"{{"version":1,"id":"f17id","tool":"sbatch","submitted_at":"t","cwd":"{}","argv":["--partition=preemptible"],"script":{{"source":"file","body":"#!/bin/bash\necho hi\n"}},"job_args":[],"env":{{}}}}"##,
@@ -537,6 +546,7 @@ mod tests {
             session: Session { uenv: None, view: None, required_partition: "preemptible".into() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
+            project_dir: PathBuf::from("/work"),
         };
         // cutoff 0 => every orphan (any positive age) is stale and reclaimed.
         broker.gc(std::time::Duration::ZERO);
