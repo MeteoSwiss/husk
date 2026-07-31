@@ -350,6 +350,11 @@ fn cage_banner(writable: &[String]) -> String {
     }
     b.push_str("echo \"husk: reads are unrestricted. A write outside the list above fails\" >&2\n");
     b.push_str("echo \"husk: with 'Read-only file system' - that is husk, not the filesystem.\" >&2\n");
+    // Where husk's side of the story is. The job cannot read it (the cage masks $HOME) and
+    // that is the point - but whoever reads this output is on the login node, where it is
+    // an ordinary file. Naming it here is the difference between one place to look and a
+    // search.
+    b.push_str("echo \"husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}\" >&2\n");
     b
 }
 
@@ -487,7 +492,7 @@ fn wrap_script(
   if [ -n "$_husk_spool" ]; then
     _husk_net_sock="$_husk_spool/net.sock"
     "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD" \
-      >>"$_husk_spool/net-proxy.log" 2>&1 &
+      >>"$_husk_log" 2>&1 &
     _husk_net_pid=$!
     export HUSK_NET_SOCK="$_husk_net_sock"
   fi
@@ -562,6 +567,30 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   # only \"line 43: : command not found\", no proxy ever ran, and three network arms failed\n\
   # for a reason none of them could see (Balfrin 4987657).\n\
   _husk_broker={broker_q}\n\
+  # Where husk's own record of this job goes, and it is deliberately NOT the spool.\n\
+  # The spool sits inside the workdir, which the cage binds WRITABLE, so a log kept there\n\
+  # is one the job can truncate, rewrite or plant lines in - the audited party must not be\n\
+  # able to author the audit trail. $HOME is tmpfs-masked inside the cage, so this file is\n\
+  # out of the job's reach entirely; it is read from the login node, where husk was\n\
+  # launched. One file per job, named by job id, so there is no question which run it is.\n\
+  #\n\
+  # The step-broker and the egress proxy BOTH append here. They are two trusted processes\n\
+  # with one story to tell about one job, they prefix their lines distinctly, and one place\n\
+  # to look beats two.\n\
+  _husk_log=/dev/stderr\n\
+  if [ -n \"${{HOME:-}}\" ] && mkdir -p \"$HOME/.husk/log\" 2>/dev/null; then\n\
+    _husk_log=\"$HOME/.husk/log/job-${{SLURM_JOB_ID:-nojob}}.log\"\n\
+    echo \"husk: job ${{SLURM_JOB_ID:-nojob}} on $(hostname 2>/dev/null || echo '?') \
+started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
+      >>\"$_husk_log\" 2>/dev/null || _husk_log=/dev/stderr\n\
+  fi\n\
+  if [ \"$_husk_log\" = /dev/stderr ]; then\n\
+    # Logging is diagnostics, not the boundary, so a home it cannot write must never abort\n\
+    # a job. Merge into the job's stderr and SAY the record is no longer out of reach.\n\
+    echo \"husk: $HOME/.husk/log is not writable from this node, so husk's log for this\" >&2\n\
+    echo \"husk: job is merged into the job's own stderr instead of kept outside it.\" >&2\n\
+  fi\n\
+  export HUSK_JOB_LOG=\"$_husk_log\"\n\
 {net_start}  _husk_step_pid=\n\
   _husk_stub={stub_q}\n\
   _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
@@ -569,7 +598,7 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
     if [ -n \"$_husk_spool\" ]; then\n\
       export HUSK_STEP_SPOOL=\"$_husk_spool\"\n\
       \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir {workdir_q} \\\n\
-        >\"$_husk_spool/step-broker.log\" 2>&1 &\n\
+        >>\"$_husk_log\" 2>&1 &\n\
       _husk_step_pid=$!\n\
       _husk_extra+=(--ro-bind \"$_husk_stub\" \"$_husk_real_srun\")\n\
     fi\n\
@@ -591,20 +620,28 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
   # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
   [ -n \"$_husk_step_pid\" ] && kill \"$_husk_step_pid\" 2>/dev/null\n\
-  # Remove the step spool. It is per-JOB and worthless once the job is over, but it is\n\
-  # created in the user's working directory, so leaving one behind per job turns an\n\
-  # active project directory into a litter tray. Deleted by exact name, never a glob:\n\
-  # this runs with the user's rights in a directory the agent can write, so a pattern\n\
-  # would be a deletion primitive pointed at whatever else matched. Kept when the\n\
-  # step-broker logged something, because that log is the only record of why a step\n\
-  # failed.\n\
+  # The egress proxy holds the one route out of this job, so it dies WITH the job for the\n\
+  # same reason the step-broker does. It sets PR_SET_PDEATHSIG too; this is the belt.\n\
+  [ -n \"${{_husk_net_pid:-}}\" ] && kill \"$_husk_net_pid\" 2>/dev/null\n\
+  # --- husk: remove the step spool ---\n\
+  # Per-JOB and worthless the moment the job ends, but it is created in the user's working\n\
+  # directory, so one left behind per job turns an active project into a litter tray. It is\n\
+  # now unconditional: the record worth keeping is $_husk_log, which is not in here.\n\
+  #\n\
+  # Removed by name and then rmdir, never `rm -rf`: this runs with the user's rights in a\n\
+  # directory the JOB can write, so a recursive delete would be a deletion primitive aimed\n\
+  # at whatever else ended up there. Anything unrecognised makes rmdir fail, the directory\n\
+  # survives, and we say so - the safe outcome, out loud rather than silently.\n\
+  #\n\
+  # This list must cover every file the guard creates in the spool. When egress was added\n\
+  # it did not: net.sock, socat and net-proxy.log were never removed, so rmdir failed and\n\
+  # EVERY networked job leaked its spool, silently, because the failure had no branch that\n\
+  # reported it. A test now derives the required names from the generated script.\n\
   if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
-    if [ -s \"$_husk_spool/step-broker.log\" ]; then\n\
-      echo \"husk: kept $_husk_spool (the step-broker logged something)\" >&2\n\
-    else\n\
-      rm -f \"$_husk_spool/step-broker.log\" 2>/dev/null\n\
-      rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
-      rmdir \"$_husk_spool\" 2>/dev/null\n\
+    rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
+    rm -f \"$_husk_spool/net.sock\" \"$_husk_spool/socat\" 2>/dev/null\n\
+    if ! rmdir \"$_husk_spool\" 2>/dev/null; then\n\
+      echo \"husk: kept $_husk_spool - it holds files husk did not create\" >&2\n\
     fi\n\
   fi\n\
   if [ \"$_husk_rc\" = 159 ]; then\n\
@@ -1165,6 +1202,73 @@ mod tests {
         assert!(script.contains("if [ -r "), "{script}");
     }
 
+    /// Every `"$_husk_spool/<name>"` literal in a generated script, i.e. every file the
+    /// guard puts in the step spool.
+    fn spool_files_created_by(script: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        for (_, rest) in script.match_indices("$_husk_spool/").map(|(i, _)| {
+            (i, &script[i + "$_husk_spool/".len()..])
+        }) {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        names
+    }
+
+    // The step spool is created in the user's working directory, so a job that leaves one
+    // behind turns an active project into a litter tray. The cleanup removes files by
+    // exact name and then rmdir-s, which is the safe design — and precisely the design
+    // that fails SILENTLY when a new feature adds a file nobody added to the list: rmdir
+    // just fails and the directory stays. Egress did exactly that (net.sock, socat,
+    // net-proxy.log), so every networked job leaked a spool.
+    //
+    // This asserts the property rather than the list: whatever the guard creates in the
+    // spool, the cleanup must name.
+    #[test]
+    fn every_file_the_guard_creates_in_the_step_spool_is_cleaned_up() {
+        for net in [false, true] {
+            let script = wrap_script(
+                "#!/bin/bash\ntrue\n",
+                &[],
+                profile::Profile::SingleNode,
+                "/work",
+                net,
+                &["/work".to_string()],
+            );
+            let block = script
+                .split_once("# --- husk: remove the step spool")
+                .map(|(_, rest)| rest.split_once("fi\n").map(|(c, _)| c).unwrap_or(rest))
+                .unwrap_or_else(|| panic!("no marked cleanup block in the guard:\n{script}"));
+            // CODE ONLY. The first version of this test searched the whole block, and the
+            // comment explaining the net.sock leak contains the string "net.sock" — so the
+            // test passed against a cleanup that had stopped removing it. A test that can be
+            // satisfied by prose is not testing anything.
+            let cleanup: String = block
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for name in spool_files_created_by(&script) {
+                // A glob in the cleanup covers the family it matches.
+                let covered = cleanup.contains(&name)
+                    || name
+                        .split_once('-')
+                        .is_some_and(|(p, _)| cleanup.contains(&format!("{p}-*")));
+                assert!(
+                    covered,
+                    "the guard creates '{name}' in the step spool but the cleanup never \
+                     removes it, so rmdir fails and the spool is left behind (net={net})\n\
+                     --- cleanup block ---\n{cleanup}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn egress_is_absent_unless_an_allowlist_was_configured() {
         // With no allowlist a job keeps today's behaviour EXACTLY - --unshare-net and no
@@ -1252,7 +1356,11 @@ mod tests {
         // an empty command and reported only "line 43: : command not found". No proxy
         // started, and three network arms failed for a reason none of them could see.
         let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
-        for var in ["_husk_spool", "_husk_broker", "_husk_stub"] {
+        // `_husk_log` has exactly the shape that caused this: it is assigned in the hoisted
+        // preamble and first USED inside `net_start`, which is interpolated above the
+        // step-pair block. Get the order wrong and both the proxy and the step-broker
+        // redirect into the empty string.
+        for var in ["_husk_spool", "_husk_broker", "_husk_stub", "_husk_log"] {
             let def = on
                 .find(&format!("{var}="))
                 .unwrap_or_else(|| panic!("{var} is never assigned:\n{on}"));

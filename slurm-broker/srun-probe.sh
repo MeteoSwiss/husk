@@ -34,7 +34,7 @@ else
   echo "       If this says 'no step spool configured', the stub is bound but the guard"
   echo "       did not export HUSK_STEP_SPOOL. If it says the step was rejected, the"
   echo "       message is from the step allowlist and says which option to drop."
-  echo "       Otherwise see .husk-step-spool-*/step-broker.log next to this job."
+  echo "       Otherwise see this job's husk log: ${HUSK_JOB_LOG:-~/.husk/log/job-<jobid>.log}"
 fi
 
 # 2) The step must be CAGED too, not merely launched. A rank that can read other
@@ -172,7 +172,7 @@ if [ "$el" -lt 5 ]; then
 else
   echo "conc : ${el}s for 2x 3s OVERLAPPING steps — steps serialised even with --overlap."
   echo "       That points at the step-broker (it spawns and polls, so it should not"
-  echo "       block); see .husk-step-spool-*/step-broker.log."
+  echo "       block); see ${HUSK_JOB_LOG:-~/.husk/log/job-<jobid>.log}."
 fi
 
 # 4b) For contrast, the same thing WITHOUT --overlap. Serialising here is normal and

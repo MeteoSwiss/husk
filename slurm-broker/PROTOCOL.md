@@ -64,17 +64,49 @@ in* may be re-wired later (e.g. for `srun`/recursive brokering). Keep this versi
   directory owned by another user, and removes only the filenames husk creates
   before `rmdir`-ing — so a spool holding anything else survives intact.
 
+## The step spool (compute side)
+
+`<workdir>/.husk-step-spool-<jobid>/`, holding the srun request/response pair, the
+egress socket `net.sock`, and the bind target for `socat`. Per-job by construction,
+and removed when the job ends — by name, then `rmdir`, never `rm -rf`: the cleanup
+runs with the user's rights in a directory the *job* can write, so a recursive
+delete would be a deletion primitive aimed at whatever else ended up there. If
+anything unrecognised is left, `rmdir` fails, the directory survives, and the job
+says so.
+
+That list must cover every file the guard creates. When egress was added it did not
+— `net.sock`, `socat` and `net-proxy.log` were never removed, so `rmdir` failed and
+**every networked job leaked its spool**, silently, because the failing branch had
+nothing to report it. A test now derives the required names from the generated
+script rather than trusting the list.
+
 ## The session log is not in the spool
 
-`~/.husk/log/husk-<utc>-<pid>.log`, one file per session, pointed at by
-`HUSK_SESSION_LOG` in the agent's environment.
+Both halves of husk keep their record outside the directory the confined side can
+write, for the same reason:
 
-The spool must be writable by the caged agent for the stub to reach it at all.
-A log kept there is therefore one the confined side can truncate, rewrite, or
-plant lines in — the audited party must not be able to author the audit trail.
-Reads are unrestricted, so the agent can still open this file to diagnose itself;
-it just cannot write it. One file per session also answers a question the old
-shared append-only `broker.log` could not: which lines belong to *this* run.
+| | log | pointed at by |
+|---|---|---|
+| login session | `~/.husk/log/husk-<utc>-<pid>.log` | `HUSK_SESSION_LOG` |
+| compute job | `~/.husk/log/job-<jobid>.log` | `HUSK_JOB_LOG`, and the cage banner |
+
+A spool must be writable by the confined side — the login stub and the in-cage
+`srun` stub both have to write into one. A log kept there is therefore one that
+side can truncate, rewrite, or plant lines in, and **the audited party must not be
+able to author the audit trail**.
+
+The two differ in what the confined side can still *read*. On the login node reads
+are unrestricted, so the agent can open its own session log to diagnose itself; it
+simply cannot write it. Inside the compute cage `$HOME` is tmpfs-masked, so the job
+log is beyond the job's reach entirely — it is read from the login node, which is
+why the cage banner prints its path.
+
+For a job, the step-broker and the egress proxy both append to the one file. They
+are two trusted processes telling one story about one job, they prefix their lines
+distinctly (`step-broker:`, `husk-proxy:`), and one place to look beats two.
+
+One file per session or job also answers what a shared append-only `broker.log`
+could not: which lines belong to *this* run.
 
 ## Request  (`req-<uuid>.json`, written by the stub)
 
