@@ -57,8 +57,12 @@ redundant copies of the same wall, and one of those copies silently cost us CMA.
 
 2. ~~**`srun` brokering → single-node multi-process MPI**~~ **DONE, ICON verified.**
 
-3. **Network: socat + allowlist on compute nodes.** *This is the last feature before
-   v0.5.* Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
+3. ~~**Network: socat + allowlist on compute nodes.**~~ **BUILT 2026-07-31** — allowlist
+   (`netallow.rs`), egress proxy (`netproxy.rs`), guard wiring, and four selftest arms.
+   Off unless an operator configures `sandbox.network.allowedDomains`; `*` available for
+   deliberate open egress; SLURM daemon ports refused regardless. **Not yet exercised on
+   hardware** — that is the next Balfrin run.
+   Original scope note kept for the record: Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
    an SNI/host allowlist likely suffices; full TLS-MITM only if content filtering is
    actually needed. Reactivates **AV8** (broker bypass) and is safe *only because* srun is
    now brokered and `slurmctld` stays off the allowlist.
@@ -67,6 +71,11 @@ redundant copies of the same wall, and one of those copies silently cost us CMA.
    socket crosses a network namespace because it is a filesystem object. Only a dumb relay
    is per rank. The host-side allowlist must accept **host-or-IP + port**, not just
    domains, because a self-hosted model endpoint is an internal address with no SNI.
+
+3b. **Remaining network work before the review:** egress is wired into the JOB cage only.
+   MPI ranks keep their own netns and have no egress — deliberate, since the job script is
+   where downloads happen and the rank path is the one we just stabilised. Wire the relay
+   into the rank cage if a workload needs it.
 
 4. **Security review before release** — a multi-agent adversarial pass over the whole
    surface, as was done for v0.4, where it found four criticals. The submission surface,
