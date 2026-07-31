@@ -394,6 +394,22 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
   # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
   [ -n \"$_husk_step_pid\" ] && kill \"$_husk_step_pid\" 2>/dev/null\n\
+  # Remove the step spool. It is per-JOB and worthless once the job is over, but it is\n\
+  # created in the user's working directory, so leaving one behind per job turns an\n\
+  # active project directory into a litter tray. Deleted by exact name, never a glob:\n\
+  # this runs with the user's rights in a directory the agent can write, so a pattern\n\
+  # would be a deletion primitive pointed at whatever else matched. Kept when the\n\
+  # step-broker logged something, because that log is the only record of why a step\n\
+  # failed.\n\
+  if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
+    if [ -s \"$_husk_spool/step-broker.log\" ]; then\n\
+      echo \"husk: kept $_husk_spool (the step-broker logged something)\" >&2\n\
+    else\n\
+      rm -f \"$_husk_spool/step-broker.log\" 2>/dev/null\n\
+      rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
+      rmdir \"$_husk_spool\" 2>/dev/null\n\
+    fi\n\
+  fi\n\
   if [ \"$_husk_rc\" = 159 ]; then\n\
     echo \"husk: job killed by SIGSYS - a syscall blocked by husk's seccomp-wrapper.\" >&2\n\
     echo \"husk: to identify which one, re-run the job with your command wrapped in\" >&2\n\

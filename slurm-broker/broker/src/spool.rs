@@ -290,7 +290,28 @@ fn cap_output(bytes: &[u8]) -> String {
 /// same reason the broker has `--dry-run` and not a debug mode): to identify a blocked
 /// syscall, re-run the job under `strace` INSIDE the unchanged cage — the filter still
 /// kills, strace merely shows which call it died attempting.
-const STRIPPED_SUBMIT_ENV: &[&str] = &["SECCOMP_WRAPPER_DEBUG"];
+/// The second category is CREDENTIALS THE JOB HAS NO USE FOR. The broker inherits the
+/// launching session's environment and forces `--export=ALL`, so an agent's model
+/// credentials would otherwise ride into every compute job — where nothing needs them,
+/// since a brokered job has no network at all today. Stripping them here is stronger than
+/// masking them in the cage (F4): the value never leaves the login node, so it is absent
+/// from slurmd's copy of the environment and from anything that inspects a running job.
+///
+/// These are bearer tokens that buy paid inference (`CSCS_INFERENCE_API_KEY` is the CSCS
+/// one, `ANTHROPIC_AUTH_TOKEN` the form Claude Code uses against an
+/// Anthropic-compatible endpoint). `ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` are deliberately
+/// NOT here: they are not secrets, and a job that somehow carried them can do nothing with
+/// them without a token or a route.
+///
+/// This is the submission surface only. Preventing the AGENT from redirecting its own
+/// model traffic — `ANTHROPIC_BASE_URL` pointed at a host husk did not intend — needs husk
+/// to own the login environment, which is ROADMAP step 6a.
+const STRIPPED_SUBMIT_ENV: &[&str] = &[
+    "SECCOMP_WRAPPER_DEBUG",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CSCS_INFERENCE_API_KEY",
+];
 
 fn run_sbatch(argv: &[String]) -> Result<u64, String> {
     use std::process::Command;
@@ -362,6 +383,25 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn model_credentials_are_stripped_from_the_submission() {
+        // The broker inherits the launching session's environment and forces
+        // --export=ALL, so without this an agent's inference token rides into every
+        // compute job - which has no network and no use for it. Stripping at submission
+        // is stronger than masking in the cage: the value never leaves the login node.
+        for k in ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CSCS_INFERENCE_API_KEY"] {
+            assert!(STRIPPED_SUBMIT_ENV.contains(&k), "{k} must not reach a job");
+        }
+        // The enforcement off-switch stays stripped for a different reason: a job must
+        // never run with a weakened filter.
+        assert!(STRIPPED_SUBMIT_ENV.contains(&"SECCOMP_WRAPPER_DEBUG"));
+        // Not secrets, and useless without a token or a route - stripping them would be
+        // noise rather than defence.
+        for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL"] {
+            assert!(!STRIPPED_SUBMIT_ENV.contains(&k), "{k} is not a credential");
+        }
+    }
     use super::*;
     use std::os::unix::fs::symlink;
 
