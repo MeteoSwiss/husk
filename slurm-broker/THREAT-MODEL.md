@@ -11,6 +11,46 @@ compute node (`seccomp-wrapper bwrap …`):
 - `--dev-bind-try /dev/nvidia*` — GPUs
 - `--unshare-net` — no network **(current — treated as TEMPORARY)**
 
+## Design principle (the unit of confinement) — one cage per job-on-a-node
+
+**The security border is the job on a node, not the process.** All ranks of one MPI
+job are a **single trust domain**: same uid, same allocation, same files, same data,
+launched from the same script. There is no boundary between rank 0 and rank 3 to
+defend — the boundary that exists is *job ↔ host*.
+
+So the cage is built **once per node** and every task of the step joins it. A cage per
+*task* does not add a boundary; it makes **N redundant copies of the same one**, and
+the copies are not free — they actively cost containment and function:
+
+| symptom | root cause |
+|---|---|
+| Cray MPICH dies `process_vm_readv: EPERM` | each task's bwrap makes its own **user namespace**; siblings cannot `ptrace_may_access` each other |
+| `--unshare-pid` unusable as a hardening step | it would put each rank in its own PID namespace and break rank-to-rank CMA |
+| N socat bridges instead of 1 when the network opens | each task has its own netns, so each needs its own gateway |
+| per-job binds (`/dev/shm`, step spool) repeated per task | they were never per-task to begin with |
+
+Measured, 2026-07-31: two sibling bwrap cages cannot CMA-read each other (`EPERM`)
+**even with Yama neutralised**; two cages sharing one identity-mapped user namespace
+can. The user namespace was the deciding gate all along — it is a fifth member of the
+`ptrace_may_access` set alongside credentials, Yama, the dumpable flag and PID
+visibility, and we had not written it down.
+
+Two consequences to hold to:
+
+1. **Joining must be fail-closed.** With a cage per task, failing to build it means the
+   task does not run. With a shared cage the task *joins* namespaces, so a bug could
+   let it run **outside** — silently. After `setns`, a task must verify its
+   `/proc/self/ns/{user,mnt,net}` are the expected ones and abort before exec'ing the
+   workload. This is the one genuinely new risk the design introduces, and it is a
+   test, not a comment.
+2. **Sharing is scoped to the job.** One netns per node means ranks share loopback and
+   can reach each other's ports; one userns means they can CMA each other. Both are
+   *within* the trust domain defined above. Neither the broker nor any other job is
+   inside it — the broker stays outside and is non-dumpable regardless.
+
+Generalises beyond MPI: the question to ask of any new cage is *what is the trust
+domain here*, and to put exactly one wall around it.
+
 ## Design principle (the cage)
 Layers must be **independent**. `--unshare-net` *will* be relaxed (allowlisted
 socat at best, open internet at worst), so the **filesystem cage must protect

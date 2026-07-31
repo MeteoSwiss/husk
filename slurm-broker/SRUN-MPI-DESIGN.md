@@ -1,12 +1,18 @@
 # husk — srun / MPI phase design (experimental)
 
-**Status: CHAPTER 1 COMPLETE — ICON ran to completion inside husk on Balfrin
-(2026-07-31): single node, 4 MPI ranks, GPU, brokered end to end.** One item outstanding:
-CMA (see "The last blocker" below). Branch `experimental`, off the frozen v0.4 `main`.
-All of Chapter 1 is built and on hardware: cage profiles (topology forced, multi-node
-rejected), the seccomp `--profile` flag, the step allowlist, the rank cage, the in-cage
-`srun` stub, the step-broker and the guard bootstrap. See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
-(AV1–AV8 + the two design principles), [ROADMAP.md](../ROADMAP.md).
+**Status: the brokering works end to end — ICON ran to completion inside husk on Balfrin
+(2026-07-31): single node, 4 MPI ranks, GPU. But it needed
+`MPICH_SMP_SINGLE_COPY_MODE=NONE`, and removing that tax turned out to require a design
+change rather than a filter change: the cage must be built ONCE PER NODE and joined by
+each task, not built per task.** See "The redesign — one cage per node" below; the reason
+is in "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
+
+Branch `experimental`, off the frozen v0.4 `main`. Built and on hardware: cage profiles
+(topology forced, multi-node rejected), the seccomp `--profile` flag with the CMA
+exemption, the step allowlist, the per-task rank cage, the in-cage `srun` stub, the
+step-broker and the guard bootstrap — selftest 37/37 on Balfrin at `842f92f`.
+See [BROKER.md](BROKER.md) (current broker), [THREAT-MODEL.md](THREAT-MODEL.md)
+(AV1–AV8 + the design principles), [ROADMAP.md](../ROADMAP.md).
 
 ## Scope & premise
 
@@ -596,13 +602,83 @@ Pinned in three places, because build-time and deploy-time are different failure
 The selftest probe self-attaches, so the kernel's ptrace-attach check always permits it
 and the only thing under test is the seccomp filter.
 
-**Open on hardware:** whether the read side alone is enough for ICON, i.e. whether it
-completes *without* `MPICH_SMP_SINGLE_COPY_MODE=NONE`. If it dies at a new SIGSYS, MPICH
-wants the write side too — a real decision, not a registry line.
+**Answered on hardware 2026-07-31 — and the answer sent us one layer down.** The
+exemption deployed cleanly (selftest 37/37, both `cma.*` arms green), and ICON then died
+with:
+
+```
+process_vm_readv: Operation not permitted
+```
+
+**EPERM, not SIGSYS.** The filter kills with `SCMP_ACT_KILL_PROCESS`, so a returned
+errno proves the syscall passed seccomp and the *kernel* refused it — `ptrace_may_access`,
+not our deny-list. Isolated one variable at a time on a laptop, with Yama taken out of the
+picture via `PR_SET_PTRACER_ANY`:
+
+| target | reader | result |
+|---|---|---|
+| plain process | plain sibling | OK — so Yama really was neutralised |
+| inside bwrap | outside (owns the namespace) | OK |
+| inside bwrap A | inside **sibling** bwrap B | **EPERM** |
+| inside cage A | inside cage B, **sharing one identity-mapped userns** | OK |
+
+**The per-task cage is the blocker.** Each rank's `bwrap` creates its own user namespace,
+and sibling user namespaces cannot attach to each other whatever the seccomp filter says.
+`process_vm_writev` is therefore **not** required and stays blocked — the fix is structural,
+and the next section is the redesign.
+
+**Lesson worth keeping: read the errno before widening a filter.** SIGSYS versus EPERM
+named the layer. Treating "CMA still fails" as "the filter is still too strict" would have
+opened the write side — the concession we had explicitly agreed not to make casually — and
+it would not have worked either.
+
+**And the selftest arm could not have caught this**, by construction: the probe
+self-attaches, which I documented as a feature ("the only thing under test is the seccomp
+filter"). That is exactly the blind spot — it validates the layer we changed, not the thing
+the workload needs. It has to become a **two-process, two-cage** probe. Same shape as gate
+C12, which measured AF_UNIX on a sample containing no CUDA: *a green probe means the
+probe's scenario passes.*
+
+## The redesign — one cage per node (TO BUILD)
+
+**The border is the job on a node, not the process.** Ranks of one job share uid,
+allocation, files and data; there is no boundary between rank 0 and rank 3 to defend. The
+per-task cage was making N redundant copies of the *job ↔ host* wall, and the copies cost
+capability: CMA (above), `--unshare-pid` (ruled out earlier for the same reason), one socat
+per rank instead of one per node, and per-job binds repeated per task. See "the unit of
+confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
+
+**Shape.** The step-broker builds the cage **once per node** and holds it open; each task
+joins it, applies seccomp, and execs the workload. It has to be *joining* rather than
+"run bwrap once", because `srun` launches the tasks — `slurmstepd` execs each one
+independently, so they can never be children of a bwrap we started.
+
+Mechanism notes, measured (bwrap 0.11.0 on Balfrin, 0.6.1 locally):
+- `bwrap --userns FD` exists and is how a task enters an existing user namespace.
+  **`bwrap` always creates its own userns when unprivileged unless given `--userns`** —
+  so a per-task `bwrap` nested inside a shared namespace still produces siblings, and
+  still fails. This is the trap to avoid when implementing.
+- `bwrap` has `--userns FD` and `--pidns FD` but **no `--netns FD`**, so the network
+  namespace must be entered by `setns` before `bwrap`.
+- `setns` into a netns needs `CAP_SYS_ADMIN` in *both* the target's user namespace and the
+  caller's own — so the **user namespace must be joined first**. Verified: joining the
+  netns from outside the userns fails `EPERM`.
+- The uid map must be **identity**, never a root map — see the userns root-map episode.
+
+**Fail-closed joining is the one new risk.** With a per-task cage, failing to build it
+means the task does not run; with joining, a bug means the task runs **outside** the cage,
+silently. After `setns` a task must verify `/proc/self/ns/{user,mnt,net}` are the expected
+namespaces and abort before exec. Write that test first.
+
+**Bonus this unlocks:** one network gateway per node instead of one per rank. `socat`'s
+`fork` option already forks a child per accepted connection, so a single bridge serves 4
+ranks or 128 — the concurrency question is answered before the network phase begins.
 
 ## Chapter 1 — the rank cage, as specified by hardware
 
-Everything below is measured on Balfrin, not inferred. Per task, the guard runs:
+**Superseded in shape by the redesign above, not in content:** every bind below is still required;
+what changes is that they are applied **once per node** rather than per task. Everything
+here is measured on Balfrin, not inferred. Per task, the guard currently runs:
 
 ```
 --ro-bind / /                                  # root read-only (unchanged)

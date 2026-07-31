@@ -14,7 +14,8 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | rank-cage args (per-job `/dev/shm`, apinfo bind, CXI) | done — `settings::CageKind::Rank` + `rank::wrap_command` |
 | in-cage `srun` stub, step-broker, guard bootstrap | done — **ICON ran to completion, 2026-07-31** |
 | broker refuses ptrace/CMA (`PR_SET_DUMPABLE`) | done — `df414ea` |
-| `process_vm_readv` for single-node (CMA) | done — the first real profile delta; `SINGLE_NODE_EXEMPT`, smoke 8-10 + selftest `cma.*`. Hardware run pending |
+| `process_vm_readv` for single-node (CMA) | done — `SINGLE_NODE_EXEMPT`, smoke 8-10 + selftest `cma.*`, **37/37 green on Balfrin** |
+| **one cage per node, tasks join it** | **TO BUILD** — the per-task cage is what still blocks CMA (sibling user namespaces); see "the unit of confinement" in THREAT-MODEL.md |
 
 ## Why profiles exist
 
@@ -70,6 +71,16 @@ network and credential reach the job requires.
 **CPU vs GPU is not a profile.** The only difference is the `/dev/nvidia*` nodes, and
 `--dev-bind-try` is already absent-safe: on a node without GPUs the binds silently skip.
 The variant is implicit in the mechanism, so there are three profiles, not six.
+
+**A profile describes ONE cage per node, not one per process.** The profile answers
+*what the wall permits*; this answers *where the wall goes*, and the two are independent
+questions we conflated at first. All ranks of a job are one trust domain — same uid,
+allocation, files, data — so the cage is built once per node and every task of the step
+joins it. See "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md); the short
+version is that a cage per task adds no boundary, only N copies of the same one, and the
+copies cost real capability (they are what blocked CMA, `--unshare-pid`, and a single
+network gateway). The join must be **fail-closed**: a task that cannot enter the cage
+must die, never run outside it.
 
 Each profile is **floor + declared delta**, and every delta entry carries three fields:
 *what it opens*, *why the workload needs it*, *what compensating control bounds it*. A
@@ -142,9 +153,21 @@ Discovering what each profile needs is the tedious part. Four things bound it:
   deliberately writes it into an exemption table with a reason. Forking the list per
   profile would have made *forgetting* an entry the way a hole appears.
 
-  **Still open:** whether the read side alone is enough for ICON — the hardware run is
-  ICON *without* the env var. Failure would be a new SIGSYS, and the write side is a
-  decision to argue rather than a line to add.
+  **Answered on hardware 2026-07-31, and the answer was not the one on offer.** The
+  exemption is *necessary but not sufficient*: ICON now fails with
+  `process_vm_readv: Operation not permitted` — **EPERM, not SIGSYS**. Since the filter
+  kills with `SCMP_ACT_KILL_PROCESS`, an errno proves the call passed seccomp and the
+  **kernel** refused it. The cause is the per-task cage: each rank's bwrap creates its
+  own user namespace, and sibling user namespaces cannot `ptrace_may_access` each other.
+  Verified by isolating the variable — two sibling bwrap cages fail with `EPERM` even
+  with Yama neutralised via `PR_SET_PTRACER_ANY`, while two cages sharing one
+  identity-mapped userns succeed.
+
+  So `process_vm_writev` is **not** required and stays blocked; the fix is structural
+  (one cage per node) rather than another exemption. **Read the errno before widening a
+  filter** — the difference between SIGSYS and EPERM named the layer, and had we treated
+  "CMA still fails" as "the filter is still too strict" we would have opened the write
+  side for nothing.
 
 - ~~Does a caged MPI job need AF_UNIX at all?~~ **Measured twice, and the second
   measurement overturned the first.**
