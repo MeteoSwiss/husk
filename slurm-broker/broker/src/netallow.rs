@@ -88,6 +88,14 @@ pub struct Entry {
     /// `None` matches any port.
     port: Option<u16>,
     wildcard: bool,
+    /// The explicit "everything" entry, `*` (or `*:443` for everything on one port).
+    ///
+    /// Kept as its own thing rather than as a wildcard with an empty base, so that
+    /// relaxing the rule for `*` does NOT relax it for `*.com`. A vague pattern is still
+    /// refused; only an unmistakable "I want the whole internet" is honoured. Some sites
+    /// legitimately want that, and husk refusing to express a policy an operator has
+    /// deliberately chosen would just push them to turn husk off.
+    everything: bool,
 }
 
 /// Split a trailing `:port`, if there is one.
@@ -150,6 +158,10 @@ impl Entry {
             }
         }
 
+        if host == "*" {
+            return Ok(Entry { host: String::new(), port, wildcard: false, everything: true });
+        }
+
         let (wildcard, base) = match host.strip_prefix("*.") {
             Some(b) => (true, b),
             None => (false, host),
@@ -172,7 +184,7 @@ impl Entry {
         if !wildcard && host.contains('*') {
             return Err(EntryError::TooBroad);
         }
-        Ok(Entry { host: base.to_ascii_lowercase(), port, wildcard })
+        Ok(Entry { host: base.to_ascii_lowercase(), port, wildcard, everything: false })
     }
 
     /// Does this entry authorise a connection to `host:port`?
@@ -181,6 +193,9 @@ impl Entry {
             if p != port {
                 return false;
             }
+        }
+        if self.everything {
+            return true;
         }
         let h = host.to_ascii_lowercase();
         if !self.wildcard {
@@ -246,6 +261,15 @@ impl Allowlist {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Does this policy permit the whole internet?
+    ///
+    /// Exposed so the broker can SAY SO on every job. An operator who chose `*` should be
+    /// reminded, and one who did not should find out immediately — an egress policy nobody
+    /// notices is the one that silently outlives the reason for it.
+    pub fn is_open(&self) -> bool {
+        self.entries.iter().any(|e| e.everything && e.port.is_none())
     }
 }
 
@@ -386,13 +410,35 @@ mod tests {
     }
 
     #[test]
-    fn overly_broad_entries_are_refused_at_configuration_time() {
-        // An allowlist that matches most of the internet is indistinguishable from no
-        // policy - and worse than an honest deny-all, because it reads like a control.
-        for bad in ["*", "*.com", "*.", "*.x"] {
+    fn vague_wildcards_are_refused_but_an_explicit_everything_is_not() {
+        // `*.com` matches most of the internet while READING like a control, which is
+        // worse than an honest deny-all - so it stays refused.
+        for bad in ["*.com", "*.", "*.x", "ex*.com", "*example.com"] {
             assert!(Entry::parse(bad).is_err(), "must refuse {bad:?}");
         }
         assert!(Entry::parse("*.example.com").is_ok());
+
+        // `*` is different in kind, not degree: nobody writes it by accident, and a site
+        // that has deliberately chosen open egress should be able to say so. husk
+        // refusing to express a policy an operator chose would only push them to turn
+        // husk off, which is worse for them than an honest `*`.
+        let open = list(&["*"]);
+        assert!(open.permits("anything.example.org", 443));
+        assert!(open.permits("1.2.3.4", 8080));
+        assert!(open.is_open(), "the broker must be able to say that egress is wide open");
+
+        // ...and it is still bounded where it matters. AV8 does not become reachable just
+        // because someone opened the internet: the scheduler ports stay closed, and the
+        // MUNGE mask is untouched either way.
+        for p in [6817, 6818, 6819, 6820] {
+            assert!(!open.permits("slurmctld.example.com", p), "port {p} must stay closed under *");
+        }
+
+        // `*:443` is everything on ONE port - useful, and not the same as wide open.
+        let https_only = list(&["*:443"]);
+        assert!(https_only.permits("anything.example.org", 443));
+        assert!(!https_only.permits("anything.example.org", 22));
+        assert!(!https_only.is_open(), "a port-scoped * is not open egress");
     }
 
     #[test]
@@ -459,6 +505,34 @@ mod tests {
             assert!(Allowlist::from_settings_json(json).is_empty(), "{json}");
         }
         assert!(!Allowlist::parse(&[]).unwrap().permits("example.com", 443));
+    }
+
+    #[test]
+    fn the_shipped_default_allowlist_is_valid_and_says_what_it_means() {
+        // The shipped config is a policy every husk install inherits, so a typo in it is a
+        // policy bug. Compile it here rather than discovering it on a cluster.
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../user-config/settings.json");
+        let Ok(text) = std::fs::read_to_string(&shipped) else { return };
+        let raw = Allowlist::from_settings_json(&text);
+        let a = Allowlist::parse(&raw).expect("the shipped allowlist must compile");
+
+        assert!(a.permits("github.com", 443), "the default must reach GitHub over HTTPS");
+        assert!(a.permits("raw.githubusercontent.com", 443));
+        assert!(!a.is_open(), "the shipped default must NOT be open egress");
+
+        // WHAT IT DOES NOT DO. GitHub serves every organisation from the same hosts and
+        // the org lives in the PATH, which is inside the TLS session husk deliberately
+        // does not terminate - so `github.com` means ALL of GitHub, not one org. Asserted
+        // here because it is exactly the kind of thing someone would otherwise assume.
+        assert!(a.permits("github.com", 443));
+        assert!(!a.permits("gitlab.com", 443), "the default is GitHub only");
+        assert!(!a.permits("evil.example.com", 443));
+
+        // ...and the scheduler stays unreachable regardless of what the file says.
+        for p in [6817, 6818, 6819, 6820] {
+            assert!(!a.permits("github.com", p));
+        }
     }
 
     #[test]
