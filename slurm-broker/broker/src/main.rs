@@ -121,9 +121,15 @@ fn hold_cage_mode() -> ! {
     // holder whose namespaces the ranks cannot open. It also makes `/proc/<pid>` root-
     // owned, which is confusing to anyone debugging a step.
     //
-    // The exposure is nil in a way the broker's is not: this process holds no
-    // credentials, no daemon route and no memory worth reading. It exists only to keep
-    // two namespaces alive, and every process that could read it is already inside them.
+    // It does not need the flag anyway: a rank is MEASURABLY unable to read this process
+    // (2026-07-31, `process_vm_readv` -> EPERM with Yama neutralised, against a control
+    // that reads a peer rank successfully). The likely reason — explanation, not
+    // measurement — is that this process's mm belongs to the INITIAL user namespace,
+    // since it was created at exec and the namespace came later, so the kernel's
+    // ptrace-attach check demands CAP_SYS_PTRACE there, which a rank does not have.
+    //
+    // And the exposure would be nil regardless: no credentials, no daemon route, no
+    // memory worth reading. It exists only to keep one namespace alive.
 
     use std::io::{Read, Write};
     println!("{}", std::process::id());

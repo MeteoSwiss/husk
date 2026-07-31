@@ -51,6 +51,15 @@ Two consequences to hold to:
    design introduces: the task refuses to start if the holder's namespace is unreadable,
    and `bwrap --userns` exits rather than inventing a namespace of its own. Both are
    tests, not comments.
+   Measured 2026-07-31 (laptop, Yama neutralised, against a control that succeeds
+   rank-to-rank): a rank cannot `process_vm_readv` **anything outside the shared user
+   namespace** — not the holder, not an uncaged process, not even a fully dumpable one.
+   So the broker now has *two* independent protections rather than one: the namespace
+   boundary and `PR_SET_DUMPABLE`. Keep both; neither should be load-bearing alone. It
+   also means the holder is protected without the dumpable flag, which it cannot use —
+   clearing it would make `/proc/<pid>/ns/user` unopenable and no rank could join.
+   Belongs in `selftest.sh` as a hardware-verified arm rather than an inference.
+
 2. **Sharing is scoped to the job, and is exactly one namespace.** Only the **user**
    namespace is shared, because it is the only one that cost a capability; mount and
    network namespaces stay per task. Ranks can therefore CMA each other, which is within
