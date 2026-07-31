@@ -766,8 +766,13 @@ Two things to verify when building it:
   plausible, and C9 saw the file present, but that is not the same as guaranteed);
 - that a file-level bind over the original path satisfies MPICH's `O_RDWR` open.
 
-Not urgent: the current bind works and is bounded. Worth doing before anything relaxes
-who can reach that spool.
+**Status 2026-07-31: DEFERRED on purpose, and listed as an accepted residual in
+THREAT-MODEL.md so the security review sees it as a decision rather than an oversight.**
+The current bind works and is bounded (user-owned, 0600, this job's own step). Against
+that, the copy can only happen per-rank once the step exists, which puts a race — rank 0
+writing while rank 3 reads — into the pre-cage path the MPI bootstrap depends on, and a
+bug there presents as an MPI failure rather than a husk one. Worth doing before anything
+relaxes who can reach that spool, or if the review judges the exposure to warrant it.
 
 ## Threat-model deltas (vs the current single-node cage)
 

@@ -264,6 +264,18 @@ cooperative gates disappear, and the sentence still reads correctly.
    AV6 to LOW and lets you keep `slurmctld` off the list to blunt AV8.
 
 ## Residual / accepted risks
+- **A caged job can write to its own per-step `apinfo` directory** inside `SlurmdSpoolDir`
+  (`<spool>/mpi_cray_shasta/<job>.<step>`). Cray MPICH opens `apinfo` `O_RDWR` although it
+  only reads it, and the cage's read-only root made that `EROFS` and broke the PMI
+  bootstrap (gate C8) — so the rank cage binds that one directory read-write. The
+  directory is the user's, mode 0600, and belongs to this job, so the exposure is narrow.
+  **ACCEPTED for now, deliberately, and flagged to the security review** (Christoph,
+  2026-07-31). The fix is known — bind a husk-owned COPY over the path, the same
+  "mediated stand-in instead of the capability" move as the broker itself, applied to a
+  file — but it can only be done per-rank after the step exists, so it puts a race into
+  the pre-cage path that the MPI bootstrap depends on. Reviewers: if you judge the
+  exposure to justify that complexity, say so and we build it. Detail in
+  SRUN-MPI-DESIGN.md "TODO — read-only shim for the apinfo file".
 - **AV3** — out of scope; treat agent-produced artifacts as untrusted.
 - **AV4** — bounded by unix perms; not worse than login.
 - **AV7 (all submissions)** — the broker forces `--export=ALL` on both the uenv and
