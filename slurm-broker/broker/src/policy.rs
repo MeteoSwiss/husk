@@ -318,6 +318,18 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
       _husk_step_pid=$!\n\
       _husk_extra+=(--ro-bind \"$_husk_stub\" \"$_husk_real_srun\")\n\
     fi\n\
+  else\n\
+    # SAY SO. Continuing is the right call - the stub is convenience, not containment -\n\
+    # but doing it silently means a job where srun is NOT brokered looks exactly like one\n\
+    # where it is, until srun fails inside the cage with a scheduler error about an\n\
+    # expired allocation. That is what a real srun does with MUNGE masked and no route,\n\
+    # and diagnosing it from the message alone costs a bring-up round (2026-07-31).\n\
+    echo \"husk: srun is NOT brokered in this job - the step pair is inactive\" >&2\n\
+    echo \"husk:   stub=$_husk_stub\" >&2\n\
+    echo \"husk:   broker=$_husk_broker\" >&2\n\
+    echo \"husk:   srun=${{_husk_real_srun:-<not found on this node>}}\" >&2\n\
+    echo \"husk:   a real srun in the cage cannot reach slurmctld; run husk from its\" >&2\n\
+    echo \"husk:   installed prefix so <prefix>/lib/husk/srun-stub.py resolves\" >&2\n\
   fi\n\
   seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
@@ -577,8 +589,21 @@ mod tests {
         // through untouched, or every failing job would blame the sandbox.
         let (code, _out, err) = run_guard_with_stub("plain", "#!/bin/bash\nexit 3\n");
         assert_eq!(code, 3);
-        assert!(!err.contains("husk:"), "no husk noise on a normal failure: {err}");
+        // The guard may report CONFIGURATION (an inactive step pair) — that is a startup
+        // fact, not a verdict on the job. What it must never do is comment on the
+        // failure itself, or every failing job would look like a sandbox problem.
+        let about_failure: Vec<&str> = err
+            .lines()
+            .filter(|l| l.contains("husk:") && !l.contains("srun") && !l.contains("stub=")
+                        && !l.contains("broker=") && !l.contains("slurmctld")
+                        && !l.contains("installed prefix"))
+            .collect();
+        assert!(
+            about_failure.is_empty(),
+            "no husk commentary on a normal failure: {about_failure:?}"
+        );
     }
+
 
     #[test]
     fn credential_mask_is_applied_only_for_paths_that_exist() {
@@ -688,6 +713,16 @@ mod tests {
             "no stub bind may be emitted when the stub is absent: {out}"
         );
         assert!(out.contains("ARGS:"), "the cage command still ran: {out}");
+        // ...and it SAYS SO. Continuing silently is what cost a bring-up round on
+        // 2026-07-31: a job where srun is not brokered looks exactly like one where it
+        // is, until a real srun inside the cage dies with a scheduler error about an
+        // expired allocation (MUNGE masked, no route). The message names the missing
+        // piece so the next person reads a cause instead of guessing one.
+        assert!(
+            _err.contains("srun is NOT brokered"),
+            "an inactive step pair must announce itself: {_err}"
+        );
+        assert!(_err.contains("stub="), "and must name what was missing: {_err}");
     }
 
     #[test]
