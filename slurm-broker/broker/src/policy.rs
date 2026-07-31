@@ -379,13 +379,19 @@ fn wrap_script(
     // how the srun bind shipped with literal quotes in it and took every job down.
     let (net_start, net_relay) = if net_enabled {
         (
-            r#"  # The relay needs socat INSIDE the cage, and husk's own socat lives under
-  # <prefix>/bin — i.e. in the user's HOME, which the cage tmpfs-masks. So bind it in,
-  # read-only, over an empty file in the spool. A COPY would also work and would be
-  # simpler, but the spool sits inside the writable workdir, so a copy is something the
-  # job can overwrite; a read-only bind is not. The bind lands in _husk_extra, which is
-  # appended last, so it wins over the workdir bind - the same ordering the MUNGE mask
-  # depends on. A system-wide socat, if the node has one, is used as-is.
+            // A format! rather than a bare raw string: it carries {socat_q}, and a
+            // placeholder inside a string that is itself INTERPOLATED is never expanded —
+            // `format!` substitutes once. That mistake put a literal `[ -x {socat_q} ]`
+            // into the guard, where it is valid shell that silently tests a file named
+            // "{socat_q}", so the bind never happened and nothing said why.
+            format!(
+                r#"  # The relay needs socat INSIDE the cage, and husk's own socat lives at
+  # <prefix>/bin/socat — under the user's HOME, which the cage tmpfs-masks. So bind it in,
+  # read-only, over an empty file in the spool. A copy would also work and be simpler, but
+  # the spool sits inside the WRITABLE workdir, so a copy is something the job could
+  # overwrite before its own relay starts; a read-only bind is not. The bind goes into
+  # _husk_extra, appended last, so it wins over the workdir bind — the same ordering the
+  # MUNGE mask depends on. A system-wide socat, if the node has one, is used as-is.
   _husk_socat=
   if command -v socat >/dev/null 2>&1; then
     _husk_socat=$(command -v socat)
@@ -398,43 +404,48 @@ fn wrap_script(
   if [ -n "$_husk_socat" ]; then
     export HUSK_SOCAT="$_husk_socat"
   else
-    echo "husk: no socat available, so this job gets no network. husk builds one at" >&2
-    echo "husk:   {socat_q}" >&2
-    echo "husk: but the cage hides /users, so it must be bound in - and the spool was" >&2
-    echo "husk: not usable here. Install socat system-wide on the compute nodes, or" >&2
-    echo "husk: re-run install-husk.sh." >&2
+    echo "husk: no socat available, so this job gets no network." >&2
+    echo "husk:   looked for {socat_q}" >&2
+    echo "husk: the cage masks /users, so a socat in your home must be bound in, and the" >&2
+    echo "husk: job spool was not usable here. Re-run install-husk.sh, or ask for socat" >&2
+    echo "husk: system-wide on the compute nodes." >&2
   fi
-  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the
-  # policy from the settings files itself rather than being handed it, so what is in
-  # force never depends on a string carried on a command line.
+  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the policy from the
+  # settings files itself rather than being handed it, so what is in force never depends on
+  # a string carried on a command line.
   #
   # Started BEFORE the step-broker on purpose: the step-broker inherits HUSK_NET_SOCK and
-  # passes it to each rank, so the socket path has ONE origin instead of being rebuilt
-  # from the job id in two places that could drift.
+  # HUSK_SOCAT and passes them to each rank, so both have ONE origin instead of being
+  # rebuilt from the job id in two places that could drift.
   if [ -n "$_husk_spool" ]; then
     _husk_net_sock="$_husk_spool/net.sock"
-    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD"       >>"$_husk_spool/net-proxy.log" 2>&1 &
+    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD" \
+      >>"$_husk_spool/net-proxy.log" 2>&1 &
     _husk_net_pid=$!
     export HUSK_NET_SOCK="$_husk_net_sock"
   fi
-"#,
-            // Inside the cage. The relay is a byte-shuffler with no policy in it - every
+"#
+            ),
+            // Inside the cage. The relay is a byte-shuffler with no policy in it — every
             // decision was made outside. It binds LOOPBACK ONLY, which is all the netns
             // has: bwrap brings `lo` up and there is no other route (both measured).
             r#"# --- injected by husk-slurm-broker: egress relay into the cage ---
-if [ -n "${HUSK_NET_SOCK:-}" ] && command -v socat >/dev/null 2>&1; then
-  socat TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK"     >/dev/null 2>&1 &
+if [ -n "${HUSK_NET_SOCK:-}" ] && [ -x "${HUSK_SOCAT:-}" ]; then
+  "$HUSK_SOCAT" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK" \
+    >/dev/null 2>&1 &
   export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128
   export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
   export ALL_PROXY=http://127.0.0.1:3128 all_proxy=http://127.0.0.1:3128
   export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
 elif [ -n "${HUSK_NET_SOCK:-}" ]; then
-  echo "husk: socat is not installed on this node, so this job has no network" >&2
+  echo "husk: the egress relay could not start (no socat in the cage), so this job has" >&2
+  echo "husk: no network. The proxy outside the cage refused nothing." >&2
 fi
-"#,
+"#
+            .to_string(),
         )
     } else {
-        ("", "")
+        (String::new(), String::new())
     };
     let guard = format!(
         "\
@@ -1032,7 +1043,7 @@ mod tests {
         let cage_at = on.find("\nseccomp-wrapper --profile=").expect("cage must be entered");
         assert!(proxy_at < cage_at, "the proxy must start before the cage is entered");
         // ...and the relay runs INSIDE, after the re-exec guard has finished.
-        let relay_at = on.find("socat TCP-LISTEN:3128").expect("relay must be started");
+        let relay_at = on.find("TCP-LISTEN:3128").expect("relay must be started");
         let guard_end = on.find("# --- original agent script ---").expect("guard end");
         assert!(relay_at < guard_end, "the relay belongs before the agent body");
         assert!(
@@ -1051,16 +1062,26 @@ mod tests {
         // network feature failed with no proxy env set and a local DNS error, and nothing
         // in the output said why.
         let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true);
-        assert!(on.contains("--ro-bind"), "socat must be BOUND, not copied: {on}");
-        assert!(on.contains("/socat"), "{on}");
         assert!(on.contains("export HUSK_SOCAT="), "the relay learns the path by env: {on}");
-        // Read-only, because the spool is inside the WRITABLE workdir: a copy would be
-        // something the job could overwrite before its own relay starts.
-        let bind = on.find("--ro-bind").expect("bind");
-        let socat_bind = on[bind..].find("socat").expect("socat bind");
-        assert!(socat_bind < 200, "the socat bind must be a ro-bind: {}", &on[bind..bind + 200]);
         // A system-wide socat is preferred and needs no bind at all.
         assert!(on.contains("command -v socat"), "prefer a system socat: {on}");
+
+        // NO LEAKED PLACEHOLDERS. `net_start` is interpolated into the guard, and
+        // `format!` substitutes ONCE - so a placeholder inside it is never expanded. That
+        // shipped a literal `[ -x {socat_q} ]`, which is valid shell testing a file named
+        // "{socat_q}", so the bind silently never happened. An earlier version of this
+        // test asserted `contains("/socat")` and passed on the DESTINATION path while the
+        // source was broken, which is why it now checks the source is an absolute path.
+        for leaked in ["{socat_q}", "{broker_q}", "{stub_q}", "{workdir_q}", "{net_start}"] {
+            assert!(!on.contains(leaked), "placeholder {leaked} reached the guard: {on}");
+        }
+        let bind = on.find("--ro-bind ").expect("the socat bind must be emitted");
+        let src = &on[bind + "--ro-bind ".len()..];
+        assert!(
+            src.starts_with('\'') && src[1..].starts_with('/'),
+            "the bind SOURCE must be an absolute, quoted path, not a placeholder: {}",
+            &src[..src.len().min(60)]
+        );
     }
 
     #[test]
