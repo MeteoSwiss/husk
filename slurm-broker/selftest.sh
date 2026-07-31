@@ -944,6 +944,60 @@ PY
 else
   echo "RESULT INFO functional cma.peers no srun or python3 in cage - two-cage CMA probe skipped"
 fi
+# EGRESS. The network phase puts exactly one hole in `--unshare-net`, so the thing to
+# prove is not that the hole works but that it is the ONLY one. Three questions, and the
+# first two matter more than the third:
+#   1. is there still no route of our own?  (net.external already asks this)
+#   2. can we reach an UNLISTED host through the proxy?   must be NO
+#   3. can we reach an allowlisted host?                  yes, when configured
+# Reported as INFO when no allowlist is configured, which is the default: absence of
+# egress is not a failure, it is the shipped posture.
+if [ -z "${HUSK_NET_SOCK:-}" ]; then
+  echo "RESULT INFO containment net.egress no allowlist configured - job has no network (default)"
+else
+  echo "RESULT PASS functional net.relay egress is configured; relay socket present"
+  # The proxy is the ONLY way out: the cage has no route, so a direct connection must
+  # still fail even though egress is now configured. If this ever passes, the hole is not
+  # the only hole.
+  if python3 - <<"PY" >/dev/null 2>&1
+import socket
+socket.setdefaulttimeout(4)
+socket.create_connection(("1.1.1.1", 443))
+PY
+  then
+    echo "RESULT FAIL containment net.direct a caged job reached the internet WITHOUT the proxy - --unshare-net is not holding"
+  else
+    echo "RESULT PASS containment net.direct no direct route out of the cage; the proxy is the only path"
+  fi
+  # An unlisted host must be refused BY THE PROXY, with 403 rather than a timeout: a
+  # refusal that looks like a network fault costs somebody an afternoon.
+  _egress_unlisted=$(python3 - <<"PY" 2>/dev/null
+import socket, os
+s = socket.socket(socket.AF_UNIX); s.settimeout(6)
+s.connect(os.environ["HUSK_NET_SOCK"])
+s.sendall(b"CONNECT husk-should-never-reach-this.example.com:443 HTTP/1.1\r\n\r\n")
+print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+PY
+)
+  case "$_egress_unlisted" in
+    *403*) echo "RESULT PASS containment net.allowlist an unlisted host is refused by the proxy [$_egress_unlisted]" ;;
+    *200*) echo "RESULT FAIL containment net.allowlist the proxy TUNNELLED to an unlisted host [$_egress_unlisted]" ;;
+    *)     echo "RESULT FAIL containment net.allowlist no verdict from the proxy for an unlisted host [$_egress_unlisted]" ;;
+  esac
+  # ...and the scheduler stays unreachable even if some allowlist entry named its host.
+  _egress_sched=$(python3 - <<"PY" 2>/dev/null
+import socket, os
+s = socket.socket(socket.AF_UNIX); s.settimeout(6)
+s.connect(os.environ["HUSK_NET_SOCK"])
+s.sendall(b"CONNECT localhost:6817 HTTP/1.1\r\n\r\n")
+print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+PY
+)
+  case "$_egress_sched" in
+    *403*) echo "RESULT PASS containment net.scheduler a SLURM daemon port is refused by the proxy (AV8) [$_egress_sched]" ;;
+    *)     echo "RESULT FAIL containment net.scheduler the proxy did not refuse a SLURM daemon port [$_egress_sched]" ;;
+  esac
+fi
 echo "===HUSK-PROBE-END==="
 '
     # Bake the real workdir into the probe (heredoc is single-quoted to protect the
