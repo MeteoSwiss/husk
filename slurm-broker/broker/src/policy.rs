@@ -239,7 +239,7 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     Decision::Submit(Submission {
         options,
         job_args: req.job_args.clone(),
-        wrapped_script: wrap_script(&req.script.body, &bwrap_args, profile),
+        wrapped_script: wrap_script(&req.script.body, &bwrap_args, profile, &cwd),
     })
 }
 
@@ -273,7 +273,12 @@ fn husk_paths() -> (String, String) {
     (broker, stub)
 }
 
-fn wrap_script(body: &str, bwrap_args: &[String], profile: profile::Profile) -> String {
+fn wrap_script(
+    body: &str,
+    bwrap_args: &[String],
+    profile: profile::Profile,
+    workdir: &str,
+) -> String {
     let mut head = String::new();
     let mut tail = String::new();
     let mut in_head = true;
@@ -327,6 +332,13 @@ fn wrap_script(body: &str, bwrap_args: &[String], profile: profile::Profile) -> 
     let (broker_path, stub_path) = husk_paths();
     let broker_q = settings::sh_quote(&broker_path);
     let stub_q = settings::sh_quote(&stub_path);
+    // The SESSION workdir, not `$PWD`. The two used to be identical because --chdir was
+    // forced to req.cwd; now a run script may start the job in a subdirectory, and using
+    // `$PWD` would silently NARROW the rank cage's writable region to that subdirectory.
+    // ICON starts in <case>/run and writes into <case>/experiments — with `$PWD` those
+    // writes fail, and nothing says why. The cage boundary must follow the workdir the
+    // broker validated, never wherever the job happens to have chdir'd.
+    let workdir_q = settings::sh_quote(workdir);
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
@@ -356,10 +368,10 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   _husk_broker={broker_q}\n\
   _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
   if [ -r \"$_husk_stub\" ] && [ -x \"$_husk_broker\" ] && [ -n \"$_husk_real_srun\" ]; then\n\
-    _husk_spool=\"$PWD/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
+    _husk_spool={workdir_q}\"/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
     if mkdir -p \"$_husk_spool\" 2>/dev/null; then\n\
       export HUSK_STEP_SPOOL=\"$_husk_spool\"\n\
-      \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir \"$PWD\" \\\n\
+      \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir {workdir_q} \\\n\
         >\"$_husk_spool/step-broker.log\" 2>&1 &\n\
       _husk_step_pid=$!\n\
       _husk_extra+=(--ro-bind \"$_husk_stub\" \"$_husk_real_srun\")\n\
@@ -714,7 +726,14 @@ mod tests {
         std::fs::write(&fake_srun, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake_srun, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let script = wrap_script("#!/bin/bash\necho AGENT_BODY_RAN\n", &[], profile::Profile::SingleNode);
+        // The workdir must EXIST: the guard creates the step spool under it, and a
+        // workdir it cannot create in means no step pair (which the guard now announces).
+        let script = wrap_script(
+            "#!/bin/bash\necho AGENT_BODY_RAN\n",
+            &[],
+            profile::Profile::SingleNode,
+            &dir.to_string_lossy(),
+        );
         let path = dir.join("job.sh");
         std::fs::write(&path, script).unwrap();
 
@@ -815,13 +834,26 @@ mod tests {
 
     #[test]
     fn guard_bootstraps_the_step_pair() {
-        let script = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode);
+        let script = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work");
         // An UN-CAGED step-broker: it needs exactly the MUNGE + daemon route the cage
         // removes, which is why it starts before the re-exec and not inside it.
         assert!(script.contains("--step-broker --spool"), "{script}");
         assert!(script.contains("export HUSK_STEP_SPOOL="), "the stub finds the spool by env: {script}");
         // The in-cage stub shadows the real srun, resolved on THIS node.
         assert!(script.contains("_husk_real_srun=$(command -v srun"), "{script}");
+        // THE RANK CAGE FOLLOWS THE SESSION WORKDIR, NOT $PWD. These were the same thing
+        // while --chdir was forced to req.cwd; once a run script may start the job in a
+        // subdirectory they diverge, and using $PWD would silently narrow the rank cage's
+        // writable region to that subdirectory. ICON starts in <case>/run and writes into
+        // <case>/experiments, so with $PWD those writes fail and nothing says why.
+        assert!(
+            script.contains("--workdir '/work'") || script.contains("--workdir /work"),
+            "the step-broker must be given the validated workdir: {script}"
+        );
+        assert!(
+            !script.contains("--workdir \"$PWD\""),
+            "the rank cage must not follow the job's chdir: {script}"
+        );
         assert!(script.contains("--ro-bind"), "{script}");
         // It holds credentials the job must not have, so it dies with the job.
         assert!(script.contains("kill \"$_husk_step_pid\""), "{script}");
@@ -907,6 +939,7 @@ mod tests {
             "#!/bin/bash\ntrue\n",
             &["--ro-bind".into(), "/run".into(), "/run".into()],
             profile::Profile::SingleNode,
+            "/work",
         );
         let line = script
             .lines()
