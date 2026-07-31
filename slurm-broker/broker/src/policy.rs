@@ -432,9 +432,14 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   # network either.\n\
   _husk_spool={workdir_q}\"/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
   mkdir -p \"$_husk_spool\" 2>/dev/null || _husk_spool=\n\
+  # Hoisted with the spool, and for the same reason: BOTH the egress proxy and the\n\
+  # step-broker are started from it, and the proxy now starts first. Leaving this in the\n\
+  # step-pair block below made the proxy line expand to an EMPTY command - the guard said\n\
+  # only \"line 43: : command not found\", no proxy ever ran, and three network arms failed\n\
+  # for a reason none of them could see (Balfrin 4987657).\n\
+  _husk_broker={broker_q}\n\
 {net_start}  _husk_step_pid=\n\
   _husk_stub={stub_q}\n\
-  _husk_broker={broker_q}\n\
   _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
   if [ -r \"$_husk_stub\" ] && [ -x \"$_husk_broker\" ] && [ -n \"$_husk_real_srun\" ]; then\n\
     if [ -n \"$_husk_spool\" ]; then\n\
@@ -1002,6 +1007,28 @@ mod tests {
         );
         assert!(on.contains("bind=127.0.0.1"), "the relay must listen on loopback only: {on}");
         assert!(on.contains("HTTPS_PROXY=http://127.0.0.1:3128"), "{on}");
+    }
+
+    #[test]
+    fn every_variable_the_guard_uses_is_defined_before_it_is_used() {
+        // `bash -n` does NOT catch this: an unset variable expands to the empty string and
+        // the script still parses. It cost a Balfrin run - moving the proxy start above the
+        // step-pair block left `_husk_broker` assigned BELOW its first use, so the guard ran
+        // an empty command and reported only "line 43: : command not found". No proxy
+        // started, and three network arms failed for a reason none of them could see.
+        let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true);
+        for var in ["_husk_spool", "_husk_broker", "_husk_stub"] {
+            let def = on
+                .find(&format!("{var}="))
+                .unwrap_or_else(|| panic!("{var} is never assigned:\n{on}"));
+            if let Some(used) = on.find(&format!("\"${var}\"")) {
+                assert!(
+                    def < used,
+                    "{var} is used before it is assigned - it would expand to the empty \
+                     string and the failure would be a bare `: command not found`"
+                );
+            }
+        }
     }
 
     #[test]
