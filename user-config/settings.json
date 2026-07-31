@@ -20,10 +20,7 @@
     },
     "network": {
       "allowedDomains": [
-        "github.com",
-        "raw.githubusercontent.com",
-        "codeload.github.com",
-        "objects.githubusercontent.com"
+        "opendatadocs.meteoswiss.ch:443"
       ]
     }
   },

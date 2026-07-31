@@ -517,21 +517,28 @@ mod tests {
         let raw = Allowlist::from_settings_json(&text);
         let a = Allowlist::parse(&raw).expect("the shipped allowlist must compile");
 
-        assert!(a.permits("github.com", 443), "the default must reach GitHub over HTTPS");
-        assert!(a.permits("raw.githubusercontent.com", 443));
+        // One entry: the MeteoSwiss Open Data documentation, over HTTPS.
+        //
+        // Chosen as a DEMONSTRATION, not a grant. It is a dedicated subdomain rather than
+        // the whole corporate site, and no job's work depends on reaching documentation -
+        // so an operator who deletes it breaks nothing, which is the right property for a
+        // default nobody asked for. It also makes a stable live target for the hardware
+        // self-test.
+        assert!(a.permits("opendatadocs.meteoswiss.ch", 443));
         assert!(!a.is_open(), "the shipped default must NOT be open egress");
-
-        // WHAT IT DOES NOT DO. GitHub serves every organisation from the same hosts and
-        // the org lives in the PATH, which is inside the TLS session husk deliberately
-        // does not terminate - so `github.com` means ALL of GitHub, not one org. Asserted
-        // here because it is exactly the kind of thing someone would otherwise assume.
-        assert!(a.permits("github.com", 443));
-        assert!(!a.permits("gitlab.com", 443), "the default is GitHub only");
-        assert!(!a.permits("evil.example.com", 443));
+        assert!(
+            !a.permits("opendatadocs.meteoswiss.ch", 80),
+            "the entry is pinned to HTTPS, and husk only tunnels CONNECT anyway"
+        );
+        assert!(
+            !a.permits("www.meteoswiss.admin.ch", 443),
+            "one subdomain, not the whole site"
+        );
+        assert!(!a.permits("example.com", 443));
 
         // ...and the scheduler stays unreachable regardless of what the file says.
         for p in [6817, 6818, 6819, 6820] {
-            assert!(!a.permits("github.com", p));
+            assert!(!a.permits("opendatadocs.meteoswiss.ch", p));
         }
     }
 
