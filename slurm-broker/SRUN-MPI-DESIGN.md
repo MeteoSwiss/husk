@@ -9,6 +9,12 @@ of a job share ONE USER NAMESPACE instead of each `bwrap` making a private one, 
 sibling user namespaces cannot `ptrace_may_access` each other. See "The redesign" below;
 the principle is "the unit of confinement" in [THREAT-MODEL.md](THREAT-MODEL.md).
 
+`srun-probe.sh` is green on Balfrin (job 4986452, 2026-07-31): step launch, rank caging,
+step-allowlist refusal, 2 ranks in one step, shared `/dev/shm`, environment carried across
+the broker, reserved prefixes NOT carried, and concurrent overlapping steps. The `env` arm
+had been fixed but never run on hardware until now — it had previously tested
+`HUSK_ENV_PROBE`, a reserved prefix, i.e. the one name guaranteed never to be forwarded.
+
 Branch `experimental`, off the frozen v0.4 `main`. Built and on hardware: cage profiles
 (topology forced, multi-node rejected), the seccomp `--profile` flag with the CMA
 exemption, the step allowlist, the per-task rank cage, the in-cage `srun` stub, the
