@@ -391,14 +391,21 @@ fn wrap_script(
   # the spool sits inside the WRITABLE workdir, so a copy is something the job could
   # overwrite before its own relay starts; a read-only bind is not. The bind goes into
   # _husk_extra, appended last, so it wins over the workdir bind — the same ordering the
-  # MUNGE mask depends on. A system-wide socat, if the node has one, is used as-is.
+  # MUNGE mask depends on.
+  #
+  # ALWAYS bind, wherever the binary came from. An earlier version used a socat found on
+  # PATH as-is, on the assumption that anything on PATH is visible inside the cage. It is
+  # not: this runs OUTSIDE the cage, --export=ALL carries the login PATH, so `command -v`
+  # finds husk's OWN socat under /users — which the cage then masks. The relay silently
+  # never started (Balfrin, twice). Binding unconditionally removes the reasoning: the
+  # relay uses one known path that is visible by construction.
   _husk_socat=
-  if command -v socat >/dev/null 2>&1; then
-    _husk_socat=$(command -v socat)
-  elif [ -x {socat_q} ] && [ -n "$_husk_spool" ]; then
+  _husk_socat_src=$(command -v socat 2>/dev/null || true)
+  [ -n "$_husk_socat_src" ] || _husk_socat_src={socat_q}
+  if [ -x "$_husk_socat_src" ] && [ -n "$_husk_spool" ]; then
     if : >"$_husk_spool/socat" 2>/dev/null; then
       _husk_socat="$_husk_spool/socat"
-      _husk_extra+=(--ro-bind {socat_q} "$_husk_socat")
+      _husk_extra+=(--ro-bind "$_husk_socat_src" "$_husk_socat")
     fi
   fi
   if [ -n "$_husk_socat" ]; then
@@ -1055,32 +1062,48 @@ mod tests {
     }
 
     #[test]
-    fn the_guard_binds_a_socat_into_the_cage_when_the_system_has_none() {
-        // THE BUG THIS EXISTS FOR. install-husk.sh builds socat into <prefix>/bin, which
-        // is under the user's HOME, and the cage tmpfs-masks /users - so husk's own socat
-        // is invisible exactly where the relay needs it. The first hardware run of the
-        // network feature failed with no proxy env set and a local DNS error, and nothing
-        // in the output said why.
+    fn the_guard_always_binds_a_socat_into_the_cage() {
+        // THE BUG THIS EXISTS FOR, twice over. install-husk.sh builds socat into
+        // <prefix>/bin, under the user's HOME, and the cage tmpfs-masks /users - so
+        // husk's own socat is invisible exactly where the relay needs it.
+        //
+        // The first fix bound it only when `command -v socat` found nothing. That was
+        // wrong for a subtler reason: the guard runs OUTSIDE the cage with the login PATH
+        // carried by --export=ALL, so `command -v` FINDS the socat in /users, takes the
+        // "already available" branch, and binds nothing - after which the cage masks it.
+        // Reasoning about what will be visible inside the cage is the mistake; binding
+        // unconditionally removes the reasoning.
         let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true);
         assert!(on.contains("export HUSK_SOCAT="), "the relay learns the path by env: {on}");
-        // A system-wide socat is preferred and needs no bind at all.
-        assert!(on.contains("command -v socat"), "prefer a system socat: {on}");
+        assert!(
+            on.contains("_husk_extra+=(--ro-bind \"$_husk_socat_src\""),
+            "socat must be BOUND, and from whatever path was resolved: {on}"
+        );
+        assert!(
+            !on.contains("_husk_socat=$(command -v socat)"),
+            "a socat found on PATH must still be bound - PATH says nothing about what is \
+             visible inside the cage: {on}"
+        );
 
         // NO LEAKED PLACEHOLDERS. `net_start` is interpolated into the guard, and
         // `format!` substitutes ONCE - so a placeholder inside it is never expanded. That
-        // shipped a literal `[ -x {socat_q} ]`, which is valid shell testing a file named
+        // shipped a literal `[ -x {socat_q} ]`, valid shell testing a file named
         // "{socat_q}", so the bind silently never happened. An earlier version of this
         // test asserted `contains("/socat")` and passed on the DESTINATION path while the
-        // source was broken, which is why it now checks the source is an absolute path.
+        // source was broken.
         for leaked in ["{socat_q}", "{broker_q}", "{stub_q}", "{workdir_q}", "{net_start}"] {
             assert!(!on.contains(leaked), "placeholder {leaked} reached the guard: {on}");
         }
-        let bind = on.find("--ro-bind ").expect("the socat bind must be emitted");
-        let src = &on[bind + "--ro-bind ".len()..];
+        // The fallback source - husk's own build - must be a real absolute path.
+        let fb = on
+            .find("_husk_socat_src=")
+            .map(|i| &on[i..])
+            .and_then(|t| t.find("|| _husk_socat_src=").map(|j| &t[j + 19..]))
+            .expect("a fallback socat path must be emitted");
         assert!(
-            src.starts_with('\'') && src[1..].starts_with('/'),
-            "the bind SOURCE must be an absolute, quoted path, not a placeholder: {}",
-            &src[..src.len().min(60)]
+            fb.starts_with('\'') && fb[1..].starts_with('/'),
+            "the fallback socat must be an absolute, quoted path: {}",
+            &fb[..fb.len().min(60)]
         );
     }
 

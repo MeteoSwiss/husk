@@ -960,12 +960,22 @@ else
   else
     echo "RESULT FAIL functional net.relay HUSK_NET_SOCK is set to $HUSK_NET_SOCK but there is no socket there - the proxy did not start; see .husk-step-spool-*/net-proxy.log beside the job"
   fi
-  # socat is what turns the socket into the 127.0.0.1:3128 that proxy env vars name. Its
-  # absence is a NODE fact, not a husk failure, and it explains a local DNS error later.
-  if command -v socat >/dev/null 2>&1; then
-    echo "RESULT PASS functional net.socat socat is present, so the in-cage relay can run"
+  # Ask what the RELAY actually uses, not what is on PATH. An earlier version of this arm
+  # ran `command -v socat` and reported "socat is not installed" while husk had bound one
+  # at a path off PATH - true about PATH, wrong about the thing it was describing, and it
+  # sent the diagnosis in the wrong direction for a round.
+  if [ -x "${HUSK_SOCAT:-}" ]; then
+    echo "RESULT PASS functional net.socat the relay binary is in the cage at $HUSK_SOCAT"
+  elif [ -n "${HUSK_SOCAT:-}" ]; then
+    echo "RESULT FAIL functional net.socat HUSK_SOCAT=$HUSK_SOCAT is not executable in the cage - the bind did not take, so this job has no network"
   else
-    echo "RESULT INFO functional net.socat socat is NOT installed on this node - husk cannot build the in-cage relay, so the job has no network and name resolution fails locally"
+    echo "RESULT FAIL functional net.socat no relay binary in the cage (HUSK_SOCAT unset) - the guard found no socat to bind; see the job stderr for which path it looked at"
+  fi
+  # ...and the proxy variables should follow from it.
+  if [ -n "${HTTPS_PROXY:-}" ]; then
+    echo "RESULT PASS functional net.proxyenv the job environment points at the relay [$HTTPS_PROXY]"
+  else
+    echo "RESULT FAIL functional net.proxyenv no HTTPS_PROXY in the job - the relay never started, so nothing will use the allowlist"
   fi
   # The proxy is the ONLY way out: the cage has no route, so a direct connection must
   # still fail even though egress is now configured. If this ever passes, the hole is not
