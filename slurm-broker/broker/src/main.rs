@@ -3,11 +3,14 @@
 //! safe options, re-sandboxes the job, and submits. See BROKER.md / PROTOCOL.md.
 
 mod cage;
-// The allowlist is built and tested before anything consumes it: it is the entire
-// security decision of the network phase, so it is worth having pinned by tests before
-// the plumbing exists to hide behind. Remove this attribute when the proxy lands.
+// The network phase is built decision-first: the allowlist and the proxy that enforces it
+// are complete and tested before the relay wiring that carries traffic to them exists.
+// Nothing reaches these yet, hence the attributes — remove them when the guard starts a
+// proxy and binds its socket into the cage.
 #[allow(dead_code)]
 mod netallow;
+#[allow(dead_code)]
+mod netproxy;
 mod policy;
 mod profile;
 mod rank;

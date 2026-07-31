@@ -262,6 +262,68 @@ fn is_valid_request_host(h: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b".-_:[]".contains(&b))
 }
 
+/// Read `sandbox.network.allowedDomains` from the settings hierarchy.
+///
+/// Deliberately the SAME three files, in the same order, combined the same additive way as
+/// the filesystem lists — one policy source, one set of rules for operators to learn, and
+/// the pairing test in `settings` keeps every one of them write-denied so the agent cannot
+/// edit its own egress.
+///
+/// A consequence worth knowing rather than discovering: because the combination is
+/// additive, a PROJECT file can widen the allowlist and not only narrow it. That is
+/// consistent with `allowRead`/`allowWrite`, and safe by the same argument, but it does
+/// mean egress policy travels with a copied project directory.
+///
+/// Unreadable or invalid files are skipped, exactly like the filesystem side — and
+/// skipping is fail-SAFE here because the result of reading nothing is an empty
+/// allowlist, which permits nothing.
+#[derive(serde::Deserialize, Default)]
+struct NetSettings {
+    #[serde(default)]
+    sandbox: NetSandbox,
+}
+#[derive(serde::Deserialize, Default)]
+struct NetSandbox {
+    #[serde(default)]
+    network: NetSection,
+}
+#[derive(serde::Deserialize, Default)]
+struct NetSection {
+    #[serde(default, rename = "allowedDomains")]
+    allowed_domains: Vec<String>,
+}
+
+impl Allowlist {
+    /// Parse one settings file's worth of entries (used per file by `resolve`).
+    pub fn from_settings_json(json: &str) -> Vec<String> {
+        let s: NetSettings = serde_json::from_str(json).unwrap_or_default();
+        s.sandbox.network.allowed_domains
+    }
+
+    /// Resolve the hierarchy into a compiled allowlist.
+    ///
+    /// Returns the raw strings too, so the caller can report what it loaded: an operator
+    /// needs to be able to see the policy that is actually in force, and a network
+    /// boundary nobody can inspect is one nobody can trust.
+    pub fn resolve(
+        home: &std::path::Path,
+        project_dir: &std::path::Path,
+    ) -> Result<(Allowlist, Vec<String>), String> {
+        let mut raw: Vec<String> = Vec::new();
+        for (from_home, rel) in crate::settings::SETTINGS_SOURCES {
+            let f = if from_home { home.join(rel) } else { project_dir.join(rel) };
+            if let Ok(text) = std::fs::read_to_string(&f) {
+                for e in Allowlist::from_settings_json(&text) {
+                    if !raw.contains(&e) {
+                        raw.push(e);
+                    }
+                }
+            }
+        }
+        Ok((Allowlist::parse(&raw)?, raw))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +433,32 @@ mod tests {
         for bad in ["", "ex ample.com", "example.com\0", "a%b.example.com"] {
             assert!(!a.permits(bad, 443), "must refuse request host {bad:?}");
         }
+    }
+
+    #[test]
+    fn the_allowlist_is_read_from_the_network_section() {
+        let json = r#"{
+            "permissions": { "deny": ["Bash(curl *)"] },
+            "sandbox": {
+              "filesystem": { "allowRead": ["./"] },
+              "network": { "allowedDomains": ["api.inference.cscs.ch:443", "*.example.com"] }
+            }
+        }"#;
+        assert_eq!(
+            Allowlist::from_settings_json(json),
+            vec!["api.inference.cscs.ch:443".to_string(), "*.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn settings_without_a_network_section_yield_no_egress() {
+        // Fail-safe in the direction that matters: a file with no network key, an
+        // unreadable file, or invalid JSON all produce an EMPTY allowlist, and an empty
+        // allowlist permits nothing.
+        for json in [r#"{"sandbox":{"filesystem":{"allowRead":["./"]}}}"#, "{}", "not json"] {
+            assert!(Allowlist::from_settings_json(json).is_empty(), "{json}");
+        }
+        assert!(!Allowlist::parse(&[]).unwrap().permits("example.com", 443));
     }
 
     #[test]
