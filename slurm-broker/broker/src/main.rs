@@ -2,6 +2,7 @@
 //! Watches the spool, validates agent sbatch requests as hostile input, forces
 //! safe options, re-sandboxes the job, and submits. See BROKER.md / PROTOCOL.md.
 
+mod cage;
 mod policy;
 mod profile;
 mod rank;
@@ -82,7 +83,56 @@ extern "C" {
     fn libc_getppid() -> std::os::raw::c_int;
 }
 
+/// `--join-cage <PID> -- <command...>` — enter the node cage held by PID, then exec.
+///
+/// Handled before anything else in `main`, and it never returns. Two reasons it is not
+/// folded into the normal argument loop: the trailing command must reach `exec` byte for
+/// byte rather than being parsed, and this mode must NOT run the daemon preamble.
+/// `refuse_to_be_read()` in particular would be actively wrong here — a non-dumpable rank
+/// cannot be a CMA target, which is precisely the capability the node cage exists to
+/// restore for Cray MPICH. What is right for the broker is wrong for a rank.
+fn join_cage_mode(args: &[String]) -> ! {
+    let pid: u32 = match args.first().and_then(|s| s.parse().ok()) {
+        Some(p) => p,
+        None => {
+            eprintln!("husk: --join-cage needs the cage holder's pid");
+            std::process::exit(2);
+        }
+    };
+    let rest = match args.get(1).map(String::as_str) {
+        Some("--") => &args[2..],
+        _ => {
+            eprintln!("husk: --join-cage <PID> must be followed by -- <command>");
+            std::process::exit(2);
+        }
+    };
+    let Some((program, argv)) = rest.split_first() else {
+        eprintln!("husk: --join-cage: no command to run after --");
+        std::process::exit(2);
+    };
+
+    // Fail CLOSED. A per-task cage that cannot be built means the task does not run; a
+    // join that quietly did nothing would mean the task runs OUTSIDE the cage with
+    // /users visible and nothing in its output saying so. So: no exec unless `enter`
+    // returned Ok.
+    if let Err(e) = cage::enter(&cage::CageSpec::of_pid(pid)) {
+        eprintln!("husk: refusing to run this rank uncaged: {e}");
+        std::process::exit(1);
+    }
+
+    use std::os::unix::process::CommandExt as _;
+    let err = std::process::Command::new(program).args(argv).exec();
+    eprintln!("husk: could not exec {program} inside the node cage: {err}");
+    std::process::exit(126);
+}
+
 fn main() {
+    // Before the daemon preamble — see join_cage_mode.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--join-cage") {
+        join_cage_mode(&argv[1..]);
+    }
+
     die_with_parent();
     refuse_to_be_read();
 
