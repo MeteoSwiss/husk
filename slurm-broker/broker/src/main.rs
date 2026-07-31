@@ -7,9 +7,7 @@ mod cage;
 // are complete and tested before the relay wiring that carries traffic to them exists.
 // Nothing reaches these yet, hence the attributes — remove them when the guard starts a
 // proxy and binds its socket into the cage.
-#[allow(dead_code)]
 mod netallow;
-#[allow(dead_code)]
 mod netproxy;
 mod policy;
 mod profile;
@@ -163,11 +161,97 @@ fn hold_cage_mode() -> ! {
     std::process::exit(0);
 }
 
+/// `--net-proxy --socket PATH --workdir DIR` — the egress proxy for one job.
+///
+/// Runs OUTSIDE the cage, started by the guard before it enters the sandbox, and answers
+/// on a unix socket inside the job's spool. The cage keeps `--unshare-net`; the socket is
+/// visible inside it only because the workdir is bind-mounted, which is the whole trick —
+/// a unix socket crosses a network namespace because it is a filesystem object.
+///
+/// The allowlist is resolved HERE rather than passed in, from the same three settings
+/// files the broker reads. Passing it on the command line would mean the policy in force
+/// depends on a string the guard carried, and the guard's command line is visible to
+/// anything that can read /proc; resolving it means the policy is read from files the
+/// agent cannot write.
+fn net_proxy_mode(args: &[String]) -> ! {
+    die_with_parent();
+    refuse_to_be_read();
+
+    let mut socket = None;
+    let mut workdir = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--socket" => socket = it.next().cloned(),
+            "--workdir" => workdir = it.next().cloned(),
+            other => {
+                eprintln!("husk-proxy: unknown argument {other:?}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let (Some(socket), Some(workdir)) = (socket, workdir) else {
+        eprintln!("husk-proxy: --socket PATH --workdir DIR are both required");
+        std::process::exit(2);
+    };
+
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let (allow, raw) = match netallow::Allowlist::resolve(&home, std::path::Path::new(&workdir)) {
+        Ok(a) => a,
+        Err(why) => {
+            // A policy that does not compile must not become a policy that permits
+            // nothing SILENTLY: the operator wrote something and deserves to know it was
+            // rejected. Fail loudly, and the job simply has no egress.
+            eprintln!("husk-proxy: {why}");
+            std::process::exit(1);
+        }
+    };
+    if allow.is_empty() {
+        eprintln!("husk-proxy: no sandbox.network.allowedDomains configured; not starting");
+        std::process::exit(0);
+    }
+
+    // Announce the policy in force, on every job. An egress boundary nobody can see is
+    // one nobody can check, and `*` in particular should never be a surprise.
+    if allow.is_open() {
+        eprintln!(
+            "husk-proxy: WARNING - sandbox.network.allowedDomains contains \"*\": this job \
+             may reach ANY host. The scheduler ports stay blocked and /run/munge stays \
+             masked, so the broker cannot be bypassed, but nothing else is restricted."
+        );
+    }
+    eprintln!("husk-proxy: allowing {}", raw.join(", "));
+
+    // A stale socket from a crashed predecessor would make bind() fail; the spool is
+    // per-job, so anything here is ours.
+    let _ = std::fs::remove_file(&socket);
+    let listener = match std::os::unix::net::UnixListener::bind(&socket) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("husk-proxy: cannot bind {socket}: {e}");
+            std::process::exit(1);
+        }
+    };
+    // Owner-only. The caged job runs as this user, so this costs it nothing, and it keeps
+    // other users on a shared node from borrowing the job's egress.
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("husk-proxy: cannot restrict {socket}: {e}");
+        std::process::exit(1);
+    }
+    eprintln!("husk-proxy: listening on {socket}");
+    netproxy::serve(listener, allow);
+    std::process::exit(0);
+}
+
 fn main() {
     // Before the daemon preamble: the holder must not run it — see hold_cage_mode.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("--hold-cage") {
         hold_cage_mode();
+    }
+    if argv.first().map(String::as_str) == Some("--net-proxy") {
+        net_proxy_mode(&argv[1..]);
     }
 
     die_with_parent();

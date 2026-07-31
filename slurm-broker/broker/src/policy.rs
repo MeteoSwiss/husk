@@ -236,10 +236,23 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     // `cwd` is the forced --chdir dir, bound writable for job output.
     let bwrap_args = fs.compute_bwrap_args(&cwd);
 
+    // Does this job get an egress proxy at all? Only if the operator configured an
+    // allowlist. Resolved at SUBMIT time so the guard carries no policy of its own - the
+    // proxy re-reads the same files on the compute node, and this only decides whether to
+    // start one. An unparseable allowlist is treated as "no network" here rather than
+    // failing the submission: the proxy reports the error where an operator will see it,
+    // and a job that runs without egress is better than a job that will not run at all.
+    let net_enabled = crate::netallow::Allowlist::resolve(
+        &std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default(),
+        std::path::Path::new(&cwd),
+    )
+    .map(|(a, _)| !a.is_empty())
+    .unwrap_or(false);
+
     Decision::Submit(Submission {
         options,
         job_args: req.job_args.clone(),
-        wrapped_script: wrap_script(&req.script.body, &bwrap_args, profile, &cwd),
+        wrapped_script: wrap_script(&req.script.body, &bwrap_args, profile, &cwd, net_enabled),
     })
 }
 
@@ -278,6 +291,7 @@ fn wrap_script(
     bwrap_args: &[String],
     profile: profile::Profile,
     workdir: &str,
+    net_enabled: bool,
 ) -> String {
     let mut head = String::new();
     let mut tail = String::new();
@@ -339,6 +353,51 @@ fn wrap_script(
     // writes fail, and nothing says why. The cage boundary must follow the workdir the
     // broker validated, never wherever the job happens to have chdir'd.
     let workdir_q = settings::sh_quote(workdir);
+
+    // ---- egress: the proxy outside the cage, the relay inside it -------------------
+    //
+    // Emitted ONLY when the operator configured an allowlist. With none, a job keeps
+    // today's behaviour exactly - `--unshare-net` and no route at all - and no process is
+    // started to serve a policy that permits nothing.
+    //
+    // The socket lives in the step spool, which is inside the workdir, which the cage
+    // already binds writable. So nothing needs a special bind-mount: a unix socket crosses
+    // the network namespace because it is a filesystem object, and it arrives on a mount
+    // the job already had. Same reasoning that makes the /run/munge mask load-bearing
+    // rather than a syscall filter.
+    //
+    // Raw strings: these are shell, and escaping shell inside an escaped Rust literal is
+    // how the srun bind shipped with literal quotes in it and took every job down.
+    let (net_start, net_relay) = if net_enabled {
+        (
+            r#"  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the
+  # policy from the settings files itself rather than being handed it, so what is in
+  # force never depends on a string carried on a command line.
+  if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
+    _husk_net_sock="$_husk_spool/net.sock"
+    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD"       >>"$_husk_spool/net-proxy.log" 2>&1 &
+    _husk_net_pid=$!
+    export HUSK_NET_SOCK="$_husk_net_sock"
+  fi
+"#,
+            // Inside the cage. The relay is a byte-shuffler with no policy in it - every
+            // decision was made outside. It binds LOOPBACK ONLY, which is all the netns
+            // has: bwrap brings `lo` up and there is no other route (both measured).
+            r#"# --- injected by husk-slurm-broker: egress relay into the cage ---
+if [ -n "${HUSK_NET_SOCK:-}" ] && command -v socat >/dev/null 2>&1; then
+  socat TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK"     >/dev/null 2>&1 &
+  export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128
+  export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
+  export ALL_PROXY=http://127.0.0.1:3128 all_proxy=http://127.0.0.1:3128
+  export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
+elif [ -n "${HUSK_NET_SOCK:-}" ]; then
+  echo "husk: socat is not installed on this node, so this job has no network" >&2
+fi
+"#,
+        )
+    } else {
+        ("", "")
+    };
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
@@ -389,7 +448,7 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
     echo \"husk:   a real srun in the cage cannot reach slurmctld; run husk from its\" >&2\n\
     echo \"husk:   installed prefix so <prefix>/lib/husk/srun-stub.py resolves\" >&2\n\
   fi\n\
-  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
+{net_start}  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
   # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
@@ -419,7 +478,7 @@ if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   fi\n\
   exit \"$_husk_rc\"\n\
 fi\n\
-# --- original agent script ---\n"
+{net_relay}# --- original agent script ---\n"
     );
 
     format!("{head}{guard}{tail}")
@@ -725,8 +784,27 @@ mod tests {
     /// Run a generated script with a stubbed `seccomp-wrapper` on PATH and return
     /// (exit status, stderr). Executes the real thing rather than asserting on the
     /// script text: what matters is the behaviour a dying job produces.
-    fn run_guard_with_stub(tag: &str, stub_body: &str) -> (i32, String, String) {
+    /// Run the generated guard against a stubbed `seccomp-wrapper`.
+    ///
+    /// `want_stub` decides whether the DERIVED srun-stub path exists for this run, and the
+    /// harness arranges it **inside the lock** rather than leaving tests to set it up
+    /// around the call. The guard's behaviour depends on that path, so a test that merely
+    /// reads it races with one that mutates it - which showed up as an order-dependent
+    /// failure and then, after a first fix, as the opposite one. Owning the state here
+    /// removes the race instead of narrowing it. A flaky test is worse than no test: it
+    /// teaches people to re-run rather than to look.
+    fn run_guard_with_stub_ex(tag: &str, stub_body: &str, want_stub: bool) -> (i32, String, String) {
         use std::os::unix::fs::PermissionsExt;
+        let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let derived = derived_stub_path();
+        if want_stub {
+            if let Some(parent) = derived.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&derived, "#!/usr/bin/env python3\n").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&derived);
+        }
         // `tag` keeps concurrently-running tests off each other's stub (cargo runs them
         // in threads of ONE process, so the pid alone is not unique).
         let dir = std::env::temp_dir().join(format!("husk-guard-{}-{tag}", std::process::id()));
@@ -749,6 +827,7 @@ mod tests {
             &[],
             profile::Profile::SingleNode,
             &dir.to_string_lossy(),
+            false,
         );
         let path = dir.join("job.sh");
         std::fs::write(&path, script).unwrap();
@@ -769,6 +848,11 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).to_string(),
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
+    }
+
+    /// The common case: no srun stub installed, so no step pair.
+    fn run_guard_with_stub(tag: &str, stub_body: &str) -> (i32, String, String) {
+        run_guard_with_stub_ex(tag, stub_body, false)
     }
 
     #[test]
@@ -850,7 +934,7 @@ mod tests {
 
     #[test]
     fn guard_bootstraps_the_step_pair() {
-        let script = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work");
+        let script = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", false);
         // An UN-CAGED step-broker: it needs exactly the MUNGE + daemon route the cage
         // removes, which is why it starts before the re-exec and not inside it.
         assert!(script.contains("--step-broker --spool"), "{script}");
@@ -879,6 +963,63 @@ mod tests {
     }
 
     #[test]
+    fn egress_is_absent_unless_an_allowlist_was_configured() {
+        // With no allowlist a job keeps today's behaviour EXACTLY - --unshare-net and no
+        // route - and nothing is started to serve a policy that permits nothing. This is
+        // the default for every existing user, so it is the case worth pinning hardest.
+        let off = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", false);
+        assert!(!off.contains("--net-proxy"), "no proxy without an allowlist: {off}");
+        assert!(!off.contains("HUSK_NET_SOCK"), "no relay without an allowlist: {off}");
+        assert!(!off.contains("HTTP_PROXY"), "no proxy env without an allowlist: {off}");
+
+        let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true);
+        // The proxy runs OUTSIDE the cage, so it must be started before the guard execs
+        // into bwrap - not after, where it would be inside the thing it is meant to be
+        // outside of.
+        let proxy_at = on.find("--net-proxy").expect("proxy must be started");
+        // Anchor on the actual exec line, not the first mention of bwrap: the guard talks
+        // about bwrap in its comments long before it runs it.
+        let cage_at = on.find("  seccomp-wrapper --profile=").expect("cage must be entered");
+        assert!(proxy_at < cage_at, "the proxy must start before the cage is entered");
+        // ...and the relay runs INSIDE, after the re-exec guard has finished.
+        let relay_at = on.find("socat TCP-LISTEN:3128").expect("relay must be started");
+        let guard_end = on.find("# --- original agent script ---").expect("guard end");
+        assert!(relay_at < guard_end, "the relay belongs before the agent body");
+        assert!(
+            relay_at > on.find("exit \"$_husk_rc\"").expect("guard exit"),
+            "the relay must be in the RE-EXECED pass, inside the cage, not the outer one"
+        );
+        assert!(on.contains("bind=127.0.0.1"), "the relay must listen on loopback only: {on}");
+        assert!(on.contains("HTTPS_PROXY=http://127.0.0.1:3128"), "{on}");
+    }
+
+    #[test]
+    fn the_generated_script_is_valid_shell_with_and_without_egress() {
+        // The guard is shell generated from Rust, and a quoting mistake in it has taken
+        // every job down before. `bash -n` is cheap and catches the whole class.
+        for net in [false, true] {
+            let script = wrap_script(
+                "#!/bin/bash\necho body\n",
+                &["--ro-bind".into(), "/".into(), "/".into()],
+                profile::Profile::SingleNode,
+                "/work",
+                net,
+            );
+            let dir = std::env::temp_dir().join(format!("husk-sh-{}-{net}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("job.sh");
+            std::fs::write(&f, &script).unwrap();
+            let out = std::process::Command::new("bash").arg("-n").arg(&f).output().unwrap();
+            assert!(
+                out.status.success(),
+                "generated guard is not valid shell (net={net}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
     fn emitted_bwrap_arguments_never_carry_literal_quotes() {
         // The bug this pins took every job down on Balfrin: the guard built a STRING of
         // pre-quoted arguments and expanded it unquoted. Unquoted expansion word-splits
@@ -886,19 +1027,13 @@ mod tests {
         // and refused to bind it — cage dead, exit 1, no output to explain it.
         //
         // Inspecting the generated text cannot catch that (the text looks right); only
-        // running it and reading the ARGUMENTS can. So: make the derived stub path exist,
-        // run the guard, and check what actually arrives.
-        use std::os::unix::fs::PermissionsExt;
-        let _guard = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let stub = derived_stub_path();
-        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
-        std::fs::write(&stub, "#!/usr/bin/env python3\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let (code, out, _err) =
-            run_guard_with_stub("quoting", "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n");
-        let _ = std::fs::remove_file(&stub);
-
+        // running it and reading the ARGUMENTS can. So: ask the harness for a run WITH the
+        // derived stub present, and check what actually arrives.
+        let (code, out, _err) = run_guard_with_stub_ex(
+            "quoting",
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
+            true,
+        );
         assert_eq!(code, 0, "guard must run: {out}");
         for line in out.lines().filter_map(|l| l.strip_prefix("ARG:")) {
             assert!(
@@ -924,10 +1059,8 @@ mod tests {
         // NOT happen is the cage failing to launch - a bwrap bind whose source is missing
         // is fatal, which is how the MUNGE mask took every job down.
         //
-        let _guard = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = std::fs::remove_file(derived_stub_path());
         let (code, out, _err) =
-            run_guard_with_stub("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n");
+            run_guard_with_stub_ex("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n", false);
         assert_eq!(code, 0, "the job must still run: {out}");
         assert!(
             !out.contains("srun-stub.py"),
@@ -956,6 +1089,7 @@ mod tests {
             &["--ro-bind".into(), "/run".into(), "/run".into()],
             profile::Profile::SingleNode,
             "/work",
+            false,
         );
         let line = script
             .lines()
