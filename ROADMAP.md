@@ -60,8 +60,12 @@ redundant copies of the same wall, and one of those copies silently cost us CMA.
 3. ~~**Network: socat + allowlist on compute nodes.**~~ **BUILT 2026-07-31** — allowlist
    (`netallow.rs`), egress proxy (`netproxy.rs`), guard wiring, and four selftest arms.
    Off unless an operator configures `sandbox.network.allowedDomains`; `*` available for
-   deliberate open egress; SLURM daemon ports refused regardless. **Not yet exercised on
-   hardware** — that is the next Balfrin run.
+   deliberate open egress; SLURM daemon ports refused regardless.
+   **VERIFIED ON BALFRIN 2026-07-31 at `6ce952b` — 56/56, no failures.** A caged job on a
+   compute node fetched the allowlisted host through the proxy (`net.live`, 200, 21140
+   bytes), while an unlisted host and a SLURM daemon port were both refused with 403 and
+   a direct connection out of the cage still failed. Compute nodes DO have a route to the
+   internet, so this is not login-only.
    Original scope note kept for the record: Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
    an SNI/host allowlist likely suffices; full TLS-MITM only if content filtering is
    actually needed. Reactivates **AV8** (broker bypass) and is safe *only because* srun is
