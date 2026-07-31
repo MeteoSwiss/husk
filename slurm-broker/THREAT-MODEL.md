@@ -11,6 +11,40 @@ compute node (`seccomp-wrapper bwrap …`):
 - `--dev-bind-try /dev/nvidia*` — GPUs
 - `--unshare-net` — no network **(current — treated as TEMPORARY)**
 
+## Design principle (confine, do not merely forbid)
+
+Some options cannot simply be forced to a constant without breaking the workflows husk
+exists to serve. `--output`/`--error`/`--chdir` are the case in point: HPC run scripts
+find their files by name, and ICON writes `#SBATCH --output=<case>/run/LOG.<exp>.%j.o`.
+Forcing `slurm-%j.out` is not a cosmetic annoyance to such a workflow, it breaks it.
+
+The resolution is not "force" versus "allow" but **construct from a confined value**:
+husk reads the request, validates and canonicalises it, checks it against a boundary the
+job could already reach, and emits its own option. The agent influences the value; it
+never contributes bytes to slurmd's parser.
+
+Two things make it safe, and both are load-bearing:
+
+1. **The boundary is one the job already has.** These paths are confined to the working
+   directory subtree, which is bound writable into the cage. Nothing new is granted — only
+   a choice of *where within* the existing blast radius. If the confinement were to some
+   other boundary, this argument would not hold.
+2. **Nothing is validated that someone else will re-expand.** SLURM expands `%j`, `%x`
+   and friends *after* husk has checked the string, so an allowed specifier whose value
+   the agent controls is a parser differential of the F13/F14 kind — `<workdir>/%x` with
+   a job name of `..` resolves above the workdir. So `%` is refused in directory
+   components (husk cannot resolve what it cannot expand) and the specifier set is an
+   allowlist with `%x` excluded.
+
+Why it matters that the sink is slurmd: it writes these files **as the user and outside
+the cage**. An unconfined output path is therefore an uncaged arbitrary-write primitive —
+job stdout into `~/.bashrc` or a `.git/hooks/` file is AV2 with the cage bypassed
+entirely. The confinement, not the cage, is what stops that.
+
+An out-of-subtree request is **rejected with a teaching message**, not silently replaced.
+A job whose logs went somewhere other than where it asked is the failure mode that wastes
+an afternoon.
+
 ## Design principle (the unit of confinement) — one cage per job-on-a-node
 
 **The security border is the job on a node, not the process.** All ranks of one MPI
@@ -120,8 +154,8 @@ glued spelling) were all *visible holes* in it:
 | slurmd decision | channels that can set it | broker control today | must dominate → |
 |---|---|---|---|
 | **what code runs** (→ whether it's caged) | script file · `--wrap` · stdin | snapshot all three into `body`, stage one guarded script; `--wrap` stripped so only the staged script executes (F27) | the *one* thing slurmd executes is the broker's guarded script — no submission spelling yields an unguarded job |
-| **stdout/stderr path** | `-o/-e` (4 spellings) · `#SBATCH` · `SBATCH_OUTPUT/ERROR` | force `--output/--error` on CLI (outranks `#SBATCH`); glued shorts split first (F13); env stripped | forced value wins over every channel |
-| **working dir** | `-D/--chdir` · `#SBATCH` · `SBATCH_CHDIR` · `req.cwd` | force `--chdir`; confine `req.cwd` (reject `/`, floors, traversal) (F15/F19) | forced + confined; `cwd` treated as adversarial, not metadata |
+| **stdout/stderr path** | `-o/-e` (4 spellings) · `#SBATCH` · `SBATCH_OUTPUT/ERROR` | husk always EMITS `--output/--error` on the CLI (outranks `#SBATCH`); glued shorts split first (F13); env stripped. The *value* may come from the request but is **confined to the job working directory subtree** — canonicalised, symlinks resolved, `%` specifiers allowlisted with `%x` excluded | an emitted-by-construction value wins over every channel, and can only name a file inside the subtree the job could already write |
+| **working dir** | `-D/--chdir` · `#SBATCH` · `SBATCH_CHDIR` · `req.cwd` | emit `--chdir`; confine `req.cwd` (reject `/`, floors, traversal) (F15/F19); a requested `--chdir` must resolve inside the `req.cwd` subtree | emitted + confined; `cwd` treated as adversarial, not metadata. The writable bind is still `req.cwd`, so `--chdir` changes where the job STARTS, never what is writable |
 | **partition/account/qos** | `-p` (4 spellings) · `#SBATCH` · `SBATCH_PARTITION` | require+force exact partition; glued split (F14) | forced value wins; mismatch rejected |
 | **uenv/repo mount** (root, via slurmstepd) | `--uenv/--view/--repo` · `#SBATCH` · `SBATCH_UENV*` | strip CLI; **reject** body/env selection that differs from session or names `--repo` (F26) | reject dominates (never rewrite the body) |
 | **inherited env** | `--export` · `#SBATCH` · `SBATCH_EXPORT` | force `--export=ALL` on CLI in both branches (F24) | forced value wins; residual = env-secret masking (AV7) |

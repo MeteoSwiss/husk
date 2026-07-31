@@ -165,11 +165,57 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     // credentials + `--unshare-net`s the job. (AV7 caveat: env secrets NOT listed in
     // credentials.envVars still reach the caged, network-off job — widen that list to mask.)
     options.push("--export=ALL".to_string());
-    // req.cwd is validated non-empty/absolute/confined above (is_workdir_allowed).
+    // ---- chdir / output / error: the job MAY choose, CONFINED to the workdir subtree ----
+    //
+    // These stay forced BY CONSTRUCTION — husk always emits its own value on the real
+    // command line, which outranks any `#SBATCH` — but the value may now come from the
+    // request. Real run scripts depend on it: ICON writes
+    // `#SBATCH --output=<case>/run/LOG.<exp>.%j.o` and expects its logs there, and every
+    // HPC workflow built around finding files by name was broken by a forced
+    // `slurm-%j.out`.
+    //
+    // Why this is safe, and why it needed care. `--output`/`--error` name a file that
+    // *slurmd* writes AS THE USER and OUTSIDE the cage, so an unconfined value is an
+    // uncaged arbitrary-write primitive (job stdout into ~/.bashrc, or a .git/hooks file:
+    // AV2 with the cage bypassed). `--chdir` names a directory the job starts in.
+    // Confining both to the workdir subtree grants nothing new — that subtree is already
+    // bound writable into the cage — while letting the workflow put its files where it
+    // wants them. The CAGE IS UNCHANGED by this: the writable bind is still `cwd`.
+    //
+    // Read from the CLI first, then the body, exactly like --partition: the agent's own
+    // token is dropped by the registry (both remain `Class::Forced`), so the string below
+    // is one husk validated and re-emitted, never one forwarded into slurmd's parser.
     let cwd = req.cwd.clone();
-    options.push(format!("--chdir={cwd}"));
-    options.push(format!("--output={cwd}/slurm-%j.out"));
-    options.push(format!("--error={cwd}/slurm-%j.err"));
+    let pick = |names: &[&str]| {
+        sbatch::option_value(&cli, names).or_else(|| sbatch::option_value(&directives, names))
+    };
+
+    let chdir = match pick(&["-D", "--chdir"]) {
+        None => cwd.clone(),
+        Some(d) => match settings::confine_under_workdir(&d, &cwd) {
+            Ok(p) => p,
+            Err(why) => return Decision::Reject(format!("--chdir: {why}")),
+        },
+    };
+    // Output paths are resolved against the JOB's working directory, which is what a
+    // relative `--output=logs/x.out` means to SLURM.
+    let out = match pick(&["-o", "--output"]) {
+        None => format!("{chdir}/slurm-%j.out"),
+        Some(v) => match settings::confine_output_pattern(&v, &chdir) {
+            Ok(p) => p,
+            Err(why) => return Decision::Reject(format!("--output: {why}")),
+        },
+    };
+    let err = match pick(&["-e", "--error"]) {
+        None => format!("{chdir}/slurm-%j.err"),
+        Some(v) => match settings::confine_output_pattern(&v, &chdir) {
+            Ok(p) => p,
+            Err(why) => return Decision::Reject(format!("--error: {why}")),
+        },
+    };
+    options.push(format!("--chdir={chdir}"));
+    options.push(format!("--output={out}"));
+    options.push(format!("--error={err}"));
 
     // ---- resource options: ALLOWLIST, not passthrough ----
     // Interpret the agent's CLI against the option registry: Forced/Ignored options
@@ -370,6 +416,134 @@ mod tests {
             env: BTreeMap::new(),
         }
     }
+    /// A request whose working directory is a REAL directory, which the confinement
+    /// checks require: they resolve paths on disk and follow symlinks, because slurmd
+    /// does. `/work` in the other tests is fine only for the paths that never resolve.
+    fn req_in(dir: &std::path::Path, argv: &[&str], body: &str) -> Request {
+        let mut r = req(argv, body);
+        r.cwd = dir.to_string_lossy().to_string();
+        r
+    }
+
+    /// A workdir laid out like an ICON case: `<w>/run` for logs.
+    fn icon_workdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("husk-out-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("run")).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_run_script_may_put_its_logs_where_it_wants_inside_the_workdir() {
+        // The ICON shape, and the whole point of the change: HPC workflows find files by
+        // name, so a forced slurm-%j.out in the wrong directory is not cosmetic to them.
+        // Note `/./` in the middle — real run scripts generate paths like this.
+        let w = icon_workdir("icon");
+        let body = format!(
+            "#!/bin/bash\n#SBATCH --partition=preemptible\n\
+             #SBATCH --job-name=exp.mch_icon-ch1_small.run\n\
+             #SBATCH --chdir={w}/./run\n\
+             #SBATCH --output={w}/./run/LOG.exp.mch_icon-ch1_small.run.%j.o\n\
+             #SBATCH --error={w}/./run/LOG.exp.mch_icon-ch1_small.run.%j.o\necho hi\n",
+            w = w.display()
+        );
+        let o = opts(req_in(&w, &[], &body), &no_uenv());
+        let run = std::fs::canonicalize(w.join("run")).unwrap();
+        assert!(has(&o, &format!("--chdir={}", run.display())), "{o:?}");
+        assert!(
+            has(&o, &format!("--output={}/LOG.exp.mch_icon-ch1_small.run.%j.o", run.display())),
+            "the script's own log path must survive: {o:?}"
+        );
+        assert!(
+            has(&o, &format!("--error={}/LOG.exp.mch_icon-ch1_small.run.%j.o", run.display())),
+            "{o:?}"
+        );
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn output_paths_that_escape_the_workdir_are_refused() {
+        // Each of these is an uncaged write outside the job's blast radius, because
+        // slurmd performs the write as the user and outside the sandbox.
+        let w = icon_workdir("escape");
+        // A symlink INSIDE the workdir pointing out of it: a string prefix check would
+        // pass this, which is why confinement canonicalises instead.
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink("/tmp", w.join("out"));
+        for bad in [
+            format!("{}/../escaped.log", w.display()), // traversal
+            format!("{}/out/escaped.log", w.display()), // via symlink
+            "/users/victim/.bashrc".to_string(),        // absolute, elsewhere
+        ] {
+            let d = decide(
+                &req_in(&w, &["--partition=preemptible", &format!("--output={bad}")], "echo hi\n"),
+                &no_uenv(),
+                &FsPolicy::default(),
+            );
+            assert!(
+                matches!(d, Decision::Reject(_)),
+                "must refuse an output path escaping the workdir: {bad}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn the_job_name_specifier_is_not_allowed_in_an_output_path() {
+        // THE PARSER DIFFERENTIAL. slurmd expands %x AFTER husk has validated the string,
+        // and the job name is agent-supplied — `v_name` permits dots, so a job named `..`
+        // turns <workdir>/%x into the workdir's PARENT. Validating a string that someone
+        // else expands is the F13/F14 shape; the specifier is excluded rather than
+        // reasoned about.
+        let w = icon_workdir("spec");
+        for bad in ["%x/log.o", "run/%x.o", "%q.o"] {
+            let d = decide(
+                &req_in(
+                    &w,
+                    &["--partition=preemptible", &format!("--output={}/{bad}", w.display())],
+                    "echo hi\n",
+                ),
+                &no_uenv(),
+                &FsPolicy::default(),
+            );
+            assert!(matches!(d, Decision::Reject(_)), "must refuse {bad}");
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn a_specifier_in_a_directory_component_is_refused_rather_than_guessed() {
+        // husk cannot resolve a directory it cannot expand, and validating the
+        // unexpanded string would be validating something other than what slurmd opens.
+        let w = icon_workdir("dirspec");
+        let d = decide(
+            &req_in(
+                &w,
+                &["--partition=preemptible", &format!("--output={}/%j/log.o", w.display())],
+                "echo hi\n",
+            ),
+            &no_uenv(),
+            &FsPolicy::default(),
+        );
+        match d {
+            Decision::Reject(why) => assert!(why.contains("DIRECTORY"), "{why}"),
+            _ => panic!("a % specifier in a directory component must be refused"),
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn a_chdir_outside_the_workdir_is_refused() {
+        let w = icon_workdir("chdir");
+        let d = decide(
+            &req_in(&w, &["--partition=preemptible", "--chdir=/tmp"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::default(),
+        );
+        assert!(matches!(d, Decision::Reject(_)), "--chdir must stay inside the workdir");
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
     fn no_uenv() -> Session {
         Session { uenv: None, view: None, required_partition: "preemptible".into() }
     }
@@ -492,16 +666,15 @@ mod tests {
     fn strips_agent_overrides_of_owned_options() {
         let o = opts(
             req(
-                &["--partition=preemptible", "--export=SNEAKYVAR", "--chdir=/evil", "--time=01:00:00"],
+                &["--partition=preemptible", "--export=SNEAKYVAR", "--time=01:00:00"],
                 "echo hi\n",
             ),
             &no_uenv(),
         );
         assert!(has(&o, "--partition=preemptible")); // forced
-        assert!(has(&o, "--chdir=/work")); // forced
+        assert!(has(&o, "--chdir=/work")); // defaults to the validated cwd
         assert!(has(&o, "--export=ALL")); // broker forces this (F24)
         assert!(!o.iter().any(|x| x.contains("SNEAKYVAR"))); // agent's --export value stripped
-        assert!(!has(&o, "--chdir=/evil")); // agent's stripped
         assert!(has(&o, "--time=01:00:00")); // benign passthrough kept
         assert!(has(&o, "--nodes=1")); // cage profile forces the topology
     }
@@ -831,10 +1004,25 @@ mod tests {
 
     #[test]
     fn forces_safe_over_glued_short_output() {
-        // F13: glued `-o<path>`/`-e<path>` must not survive to override the forced --output.
-        let o = opts(req(&["--partition=preemptible", "-o/users/victim/.bashrc"], "echo hi\n"), &no_uenv());
-        assert!(!o.iter().any(|x| x.contains("/users/victim/.bashrc")), "glued -o leaked: {o:?}");
-        assert!(has(&o, "--output=/work/slurm-%j.out"));
+        // F13: a glued `-o<path>` must not reach slurmd. The job may now CHOOSE an output
+        // path, but only inside its working directory, so an escape is REFUSED rather
+        // than silently overridden — loud beats quiet, and the glued spelling must not
+        // be the thing that sneaks past.
+        let d = decide(
+            &req(&["--partition=preemptible", "-o/users/victim/.bashrc"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::default(),
+        );
+        match d {
+            Decision::Reject(why) => {
+                assert!(why.contains("--output"), "must name the option: {why}");
+                assert!(
+                    why.contains("outside") || why.contains("resolve"),
+                    "must say why it was refused: {why}"
+                );
+            }
+            _ => panic!("a glued -o pointing outside the workdir must be rejected"),
+        }
     }
 
     #[test]
@@ -856,16 +1044,20 @@ mod tests {
     }
 
     #[test]
-    fn forced_cli_dominates_body_output_and_chdir() {
-        // ICON (and most HPC run scripts) carry `#SBATCH --output=<their log>`. Accept the
-        // job and force our own safe paths on the CLI, which outrank the directives — the
-        // agent's path must not appear in the submitted options.
+    fn a_body_output_pointing_at_a_home_is_refused() {
+        // The sharp case, and the reason this option is not merely cosmetic: slurmd
+        // writes --output AS THE USER and OUTSIDE the cage, so an unconfined value is an
+        // uncaged arbitrary-write primitive — job stdout into ~/.bashrc is AV2 with the
+        // cage bypassed. A body directive must not achieve it either.
         let body = "#!/bin/bash\n#SBATCH --partition=preemptible\n\
                     #SBATCH --output=/users/victim/.bashrc\n#SBATCH --chdir=/\necho hi\n";
-        let o = opts(req(&[], body), &no_uenv());
-        assert!(has(&o, "--output=/work/slurm-%j.out"), "forced --output missing: {o:?}");
-        assert!(has(&o, "--chdir=/work"), "forced --chdir missing: {o:?}");
-        assert!(!o.iter().any(|x| x.contains(".bashrc")), "agent --output leaked: {o:?}");
+        match decide(&req(&[], body), &no_uenv(), &FsPolicy::default()) {
+            Decision::Reject(why) => assert!(
+                why.contains("--chdir") || why.contains("--output"),
+                "must name the offending option: {why}"
+            ),
+            _ => panic!("a body --output into a home must be rejected"),
+        }
     }
 
     #[test]

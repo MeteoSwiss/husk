@@ -407,14 +407,19 @@ pub fn body_reject_reason(body: &str) -> Option<String> {
         let name = tok.split_once('=').map(|(n, _)| n).unwrap_or(tok);
         // Options with dedicated handling in policy.rs: accept here (consume a
         // separated value so it isn't misread as the next option).
-        // DOMINATED: the broker forces these unconditionally on the real CLI, and sbatch
+        // DOMINATED: the broker emits these unconditionally on the real CLI, and sbatch
         // precedence is `command line > environment > #SBATCH`, so a body directive can
-        // never take effect. Rejecting it would break essentially every real HPC run
-        // script (ICON and friends all set `#SBATCH --output=...`) while buying nothing.
-        // Accept it; the forced value wins. NB this is only safe BECAUSE the force is
-        // unconditional — `--export` became dominated when the F24 fix stopped skipping
-        // it in the no-uenv branch. Anything only CONDITIONALLY forced must stay in the
-        // reject path below (that is why --uenv/--view/--repo are `dedicated`, not here).
+        // never take effect on its own. Rejecting them outright would break essentially
+        // every real HPC run script (ICON and friends all set `#SBATCH --output=...`).
+        // NB this is only safe BECAUSE the emission is unconditional — `--export` became
+        // dominated when the F24 fix stopped skipping it in the no-uenv branch. Anything
+        // only CONDITIONALLY emitted must stay in the reject path below (that is why
+        // --uenv/--view/--repo are `dedicated`, not here).
+        //
+        // For `--output`/`--error`/`--chdir` the directive is not merely ignored: policy.rs
+        // READS it, confines it to the job working directory, and re-emits its own
+        // canonical value — so a run script gets its logs where it wants them without any
+        // agent bytes reaching slurmd's parser. `--export` remains ignored outright.
         let dominated = matches!(
             name,
             "--output" | "-o" | "--error" | "-e" | "--chdir" | "-D" | "--export"

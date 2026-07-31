@@ -144,6 +144,94 @@ const AUTO_EXEC_DIRS: &[&str] = &[
 /// at all, and always exists wherever `.git` does, so absence is not a hole there.
 const AUTO_EXEC_RO_FILES: &[&str] = &[".mcp.json"];
 
+/// SLURM filename specifiers we allow in an `--output`/`--error` pattern.
+///
+/// `%x` (job name) is deliberately ABSENT. slurmd expands these AFTER husk has validated
+/// the string, so an allowed specifier whose expansion the agent controls is a
+/// parser-differential of exactly the F13/F14 kind: `<workdir>/%x` with a job name of
+/// `..` resolves one level above the workdir. Everything permitted here expands to a
+/// number, a node name or a user name — none can contain `/` or be `..`.
+const OUTPUT_SPECIFIERS: &[char] = &['%', 'A', 'a', 'J', 'j', 'N', 'n', 's', 't', 'u'];
+
+/// The filename part of an `--output`/`--error` value: charset-bounded, with `%` only in
+/// front of an allowed specifier.
+///
+/// Separate from the directory part because the two are checked differently — the
+/// directory must be RESOLVED on disk and confined, which is impossible for a string
+/// containing an unexpanded `%j`.
+pub fn is_valid_output_filename(name: &str) -> bool {
+    if name.is_empty() || name.len() > 128 || name == "." || name == ".." {
+        return false;
+    }
+    let mut chars = name.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some(spec) if OUTPUT_SPECIFIERS.contains(&spec) => continue,
+                _ => return false,
+            }
+        } else if !(c.is_ascii_alphanumeric() || "._+-".contains(c)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Resolve `path` and require it to be the workdir or a descendant of it.
+///
+/// **Why containment is the whole rule.** `--chdir` decides where the job starts and
+/// `--output`/`--error` decide where *slurmd*, running as the user OUTSIDE the cage,
+/// writes a file. An unconfined output path is therefore an uncaged arbitrary-write
+/// primitive — job stdout into `~/.bashrc` or a `.git/hooks/` file, which is AV2 with the
+/// cage bypassed entirely. Confined to the workdir subtree it grants nothing new: that
+/// subtree is bound writable into the cage, so the job could write there anyway.
+///
+/// Resolves symlinks on both sides, because slurmd follows them and a string comparison
+/// would not. `Path::starts_with` is component-wise, so `/work2` is not "under" `/work`.
+pub fn confine_under_workdir(path: &str, workdir: &str) -> Result<String, String> {
+    let root = std::fs::canonicalize(workdir)
+        .map_err(|e| format!("cannot resolve the working directory {workdir:?}: {e}"))?;
+    let target = std::fs::canonicalize(path).map_err(|e| {
+        format!(
+            "{path:?} cannot be resolved ({e}). It must already exist — SLURM does not              create output directories."
+        )
+    })?;
+    if !target.starts_with(&root) {
+        return Err(format!(
+            "{path:?} resolves to {} which is outside the job's working directory {}.              husk confines --chdir/--output/--error to that directory and below, because              SLURM writes those files as you and OUTSIDE the sandbox.",
+            target.display(),
+            root.display()
+        ));
+    }
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// Validate an `--output`/`--error` value and return it canonicalised.
+///
+/// Splits directory from filename: the directory is resolved and confined, the filename is
+/// checked as a pattern. A `%` anywhere in the DIRECTORY part is refused rather than
+/// guessed at — husk cannot resolve a path it cannot expand, and validating an
+/// unexpanded string would be validating something other than what slurmd opens.
+pub fn confine_output_pattern(value: &str, workdir: &str) -> Result<String, String> {
+    let (dir, file) = match value.rsplit_once('/') {
+        Some((d, f)) => (if d.is_empty() { "/" } else { d }, f),
+        // A bare filename is relative to --chdir, which is itself confined.
+        None => (workdir, value),
+    };
+    if dir.contains('%') {
+        return Err(format!(
+            "{value:?} puts a SLURM % specifier in a DIRECTORY component. husk cannot              resolve a directory it cannot expand, so only the filename may contain them."
+        ));
+    }
+    if !is_valid_output_filename(file) {
+        return Err(format!(
+            "{file:?} is not an acceptable output filename. Allowed: letters, digits,              `._+-`, and the SLURM specifiers %% %A %a %J %j %N %n %s %t %u. %x (job              name) is not allowed, because husk validates the path before SLURM expands it."
+        ));
+    }
+    let dir = confine_under_workdir(dir, workdir)?;
+    Ok(format!("{dir}/{file}"))
+}
+
 /// Is `cwd` an acceptable working directory to force as `--chdir` and bind WRITABLE into
 /// the compute cage? The agent controls `req.cwd`, and the workdir is re-bound writable
 /// on top of the read-only root + the `--tmpfs` floor, so an unconfined `cwd` re-mounts
@@ -784,6 +872,50 @@ fn path_has_symlink_component(p: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn output_filenames_allow_slurm_specifiers_but_not_the_job_name() {
+        // %x is the parser differential: slurmd expands it AFTER husk validates, and the
+        // job name is agent-supplied, so <workdir>/%x with a job name of `..` resolves
+        // above the workdir. Everything allowed expands to a number, node or user.
+        for ok in ["LOG.exp.mch_icon-ch1_small.run.%j.o", "slurm-%j.out", "a_%A_%a-%N.log", "x%%y"] {
+            assert!(is_valid_output_filename(ok), "must accept {ok}");
+        }
+        for bad in ["%x.log", "log.%q", "trailing%", "a/b", "..", ".", "", "with space.o"] {
+            assert!(!is_valid_output_filename(bad), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn confinement_follows_symlinks_and_rejects_traversal() {
+        // A string prefix check passes a symlink pointing out of the tree; slurmd would
+        // follow it and write outside the cage's blast radius. Canonicalise instead.
+        let root = std::env::temp_dir().join(format!("husk-conf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("run")).unwrap();
+        let w = root.to_string_lossy().to_string();
+
+        assert!(confine_under_workdir(&format!("{w}/run"), &w).is_ok(), "a descendant is fine");
+        assert!(confine_under_workdir(&w, &w).is_ok(), "the workdir itself is fine");
+        assert!(confine_under_workdir(&format!("{w}/run/.."), &w).is_ok(), "resolves back inside");
+        assert!(confine_under_workdir(&format!("{w}/.."), &w).is_err(), "traversal must fail");
+
+        #[cfg(unix)]
+        {
+            let _ = std::os::unix::fs::symlink("/tmp", root.join("out"));
+            assert!(
+                confine_under_workdir(&format!("{w}/out"), &w).is_err(),
+                "a symlink out of the workdir must not pass"
+            );
+        }
+        // `/work2` must not count as being under `/work`: the check is component-wise.
+        let sib = format!("{w}x");
+        std::fs::create_dir_all(&sib).unwrap();
+        assert!(confine_under_workdir(&sib, &w).is_err(), "sibling prefix must not pass");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&sib);
+    }
     use super::*;
     use std::os::unix::fs::symlink;
 
