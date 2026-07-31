@@ -232,6 +232,22 @@ pub fn confine_output_pattern(value: &str, workdir: &str) -> Result<String, Stri
     Ok(format!("{dir}/{file}"))
 }
 
+/// Every file the broker will read policy from: `(relative_to_home, path)`.
+///
+/// **This list has a twin**, the `sandbox.filesystem.denyWrite` entries in the shipped
+/// `user-config/settings.json`, which is what stops the agent EDITING its own policy. The
+/// two are the same list written twice, in different files and different languages, and a
+/// list duplicated in two places is the failure this project keeps meeting — the smoke
+/// probe list, `.gitignore`, `build_and_test.sh`. Adding a source here without adding the
+/// deny there hands the agent a writable policy input, which matters more once policy
+/// includes the network allowlist. `settings_sources_are_all_write_denied` asserts the
+/// pairing against the shipped file.
+pub const SETTINGS_SOURCES: [(bool, &str); 3] = [
+    (true, ".claude/settings.json"),   // ~/.claude/settings.json
+    (false, ".claude/settings.json"),  // <project>/.claude/settings.json
+    (false, ".claude/settings.local.json"),
+];
+
 /// Is `cwd` an acceptable working directory to force as `--chdir` and bind WRITABLE into
 /// the compute cage? The agent controls `req.cwd`, and the workdir is re-bound writable
 /// on top of the read-only root + the `--tmpfs` floor, so an unconfined `cwd` re-mounts
@@ -444,11 +460,9 @@ impl FsPolicy {
     /// are skipped — fail-safe.
     pub fn resolve(home: &Path, project_dir: &Path) -> FsPolicy {
         let mut pol = FsPolicy::default();
-        let files = [
-            home.join(".claude/settings.json"),
-            project_dir.join(".claude/settings.json"),
-            project_dir.join(".claude/settings.local.json"),
-        ];
+        let files = SETTINGS_SOURCES.map(|(from_home, rel)| {
+            if from_home { home.join(rel) } else { project_dir.join(rel) }
+        });
         for f in files {
             if let Ok(text) = std::fs::read_to_string(&f) {
                 pol.union(FsPolicy::parse(&text));
@@ -872,6 +886,44 @@ fn path_has_symlink_component(p: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn settings_sources_are_all_write_denied_by_the_shipped_config() {
+        // THE PAIRING. Everything the broker reads policy FROM must be something the
+        // agent cannot WRITE, or the agent edits its own cage - and, once the network
+        // allowlist lives there, grants itself egress. The two lists are the same list
+        // written twice, in different files and different languages, which is exactly the
+        // duplication that has bitten this project three times. So assert them against
+        // each other rather than trusting that both get updated.
+        //
+        // denyWrite is enforced by the bwrap filesystem cage, which THREAT-MODEL.md counts
+        // as load-bearing (policy ours, enforcement the runtime's today, ours after 6a) -
+        // NOT by the runtime's advisory permission rules.
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../user-config/settings.json");
+        let text = match std::fs::read_to_string(&shipped) {
+            Ok(t) => t,
+            // The shipped config is not present in every checkout layout; skipping is
+            // better than a false failure, and the install-time path covers deployment.
+            Err(_) => return,
+        };
+        let cfg: serde_json::Value = serde_json::from_str(&text).expect("shipped settings must be valid JSON");
+        let deny: Vec<String> = cfg["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .expect("shipped settings must carry sandbox.filesystem.denyWrite")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+
+        for (from_home, rel) in SETTINGS_SOURCES {
+            let want = if from_home { format!("~/{rel}") } else { rel.to_string() };
+            assert!(
+                deny.iter().any(|d| d == &want),
+                "the broker reads policy from {want:?} but the shipped denyWrite does not \
+                 protect it - the agent could edit its own cage. denyWrite = {deny:?}"
+            );
+        }
+    }
 
     #[test]
     fn output_filenames_allow_slurm_specifiers_but_not_the_job_name() {
