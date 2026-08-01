@@ -292,15 +292,11 @@ Two things follow, and both matter:
    | watching the agent, iterating, want a job to start *now* | a short/interactive partition | turnaround beats the guarantee; a human in the loop is the control |
    | letting an agent run for hours or weeks unattended | a **preemptible** partition | nobody is watching, so the machine must be the one that cannot be blocked |
 
-   **The default is the safe one.** `DEFAULT_PARTITION` is `preemptible`, and Balfrin
-   has a `preemptible` partition — so an install that configures nothing lands on the
-   guarantee. Weakening it takes a deliberate act: `install-husk.sh --slurm-partition
-   <name>`. That is the right way round for a knob whose wrong setting is silent, and it
-   is why this is a default rather than a required argument.
-
-   Balfrin is *currently* running `short`, set deliberately for supervised testing —
-   the first row of the table, with a human in the loop as the control. That is an
-   operator override of a safe default, not drift.
+   **The default is the safe one.** `DEFAULT_PARTITION` is `preemptible` — so an install
+   that configures nothing lands on the guarantee, and weakening it takes a deliberate
+   act: `install-husk.sh --slurm-partition <name>`. That is the right way round for a
+   knob whose wrong setting is silent, and it is why this is a default rather than a
+   required argument. A site running something else has made a choice, not drifted.
 2. **Preemption is then a correctness risk, not just an annoyance.** A preempted run
    leaves partial output. With `lrestart = .FALSE.` an ICON run that was interrupted
    looks, to anything reading its output directory, much like one that finished — and an
