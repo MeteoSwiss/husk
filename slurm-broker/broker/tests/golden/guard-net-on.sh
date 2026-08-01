@@ -204,6 +204,7 @@ fi
 # reported it. A test now derives the required names from the generated script.
 if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
+rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null
 rm -f "$_husk_spool/net.sock" "$_husk_spool/socat" 2>/dev/null
 if ! rmdir "$_husk_spool" 2>/dev/null; then
 echo "husk: kept $_husk_spool - it holds files husk did not create" >&2

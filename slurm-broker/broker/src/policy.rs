@@ -751,6 +751,7 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   # reported it. A test now derives the required names from the generated script.\n\
   if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
     rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
+    rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* 2>/dev/null\n\
     rm -f \"$_husk_spool/net.sock\" \"$_husk_spool/socat\" 2>/dev/null\n\
     if ! rmdir \"$_husk_spool\" 2>/dev/null; then\n\
       echo \"husk: kept $_husk_spool - it holds files husk did not create\" >&2\n\
@@ -1528,6 +1529,35 @@ mod tests {
                 .filter(|l| !l.trim_start().starts_with('#'))
                 .collect::<Vec<_>>()
                 .join("\n");
+            // THE OTHER PRODUCER. This test used to derive names only from the generated
+            // shell, so it covered what the GUARD creates and silently ignored what the
+            // step-broker (Rust) writes into the same directory: `out-<id>` and `err-<id>`,
+            // the captured stdout/stderr of every srun step. Those were never removed, so
+            // rmdir failed and EVERY job that ran a step kept its spool — 16 of them in one
+            // review session (2026-08-01), reported as "it holds files husk did not create"
+            // when husk had created them.
+            //
+            // A completeness test must cover the DIRECTORY, not one writer of it. Scanning
+            // step.rs for `spool.join(format!("…"))` is crude, but it fails loudly when a
+            // new file appears, which is the property that was missing.
+            let step_rs = include_str!("step.rs");
+            for (_, rest) in step_rs.match_indices("spool.join(format!(\"").map(|(i, _)| {
+                (i, &step_rs[i + "spool.join(format!(\"".len()..])
+            }) {
+                let name: String = rest.chars().take_while(|c| *c != '{' && *c != '"').collect();
+                if name.is_empty() {
+                    continue;
+                }
+                let covered = cleanup.contains(&name)
+                    || name.split_once('-').is_some_and(|(p, _)| cleanup.contains(&format!("{p}-*")));
+                assert!(
+                    covered,
+                    "the step-broker writes '{name}*' into the step spool but the guard's \
+                     cleanup never removes it, so rmdir fails and the spool is left behind\n\
+                     --- cleanup block ---\n{cleanup}"
+                );
+            }
+
             for var in ["_husk_spool", "_husk_net_dir"] {
                 for name in files_created_under(&script, var) {
                     // A glob in the cleanup covers the family it matches.
