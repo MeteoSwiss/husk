@@ -163,9 +163,19 @@ can see the other, and an un-caged process outside is neither in their `/proc` n
 signalable (`kill` → `No such process`). Isolation and working MPI at the same time.
 
 One process is deliberately visible inside a rank's namespace: PID 1, the holder's
-namespace-keeper. It carries no credentials, no daemon route and no memory worth reading —
-it exists only to keep the namespace alive. A rank can signal it, which tears down its own
-job's ranks: self-harm, not escape.
+namespace-keeper.
+
+**It is not the step-broker**, and the distinction matters because the process name invites
+exactly that misreading: PID 1 is `husk-slurm-broker --hold-cage`, the same binary in its
+holder mode, so `comm` reads `husk-slurm-brok`. The holder runs *outside* any cage and owns
+a deliberately **bare** user namespace — no mounts, no network, no MUNGE, no daemon route,
+no memory worth reading. It exists only to keep the namespace alive.
+
+The trusted step-broker, which does hold MUNGE and the route to slurmctld, is in neither
+namespace: a rank cannot see it, signal it, or read it (`cma.outside`).
+
+So a rank's reach over PID 1 is: signal it, and thereby tear down its own job's ranks.
+Self-harm, not escape.
 
 *(Earlier note, corrected: `--pidns` was thought unusable because bwrap answered `Can't send
 pid: Invalid argument`. That was a holder with no uid map — the overflow-uid case. With the
