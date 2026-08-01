@@ -709,6 +709,17 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
     echo \"husk:   a real srun in the cage cannot reach slurmctld; run husk from its\" >&2\n\
     echo \"husk:   installed prefix so <prefix>/lib/husk/srun-stub.py resolves\" >&2\n\
   fi\n\
+  # Catch the signal SLURM ends a job with, for TWO reasons.\n\
+  #\n\
+  # 1. Without a trap an untrapped SIGTERM kills this shell outright, so NONE of the\n\
+  #    cleanup below runs - the step-broker, the proxy, the socket dir and the step spool\n\
+  #    all leak on every preempted job. bash defers a trap until the foreground command\n\
+  #    finishes, and that command has been signalled too, so the handler runs right after\n\
+  #    the cage exits and the normal path continues.\n\
+  # 2. It is how the job learns its output is PARTIAL. See the message below.\n\
+  _husk_signalled=\n\
+  trap '_husk_signalled=SIGTERM' TERM\n\
+  trap '_husk_signalled=SIGINT' INT\n\
   seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
@@ -744,6 +755,40 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
     if ! rmdir \"$_husk_spool\" 2>/dev/null; then\n\
       echo \"husk: kept $_husk_spool - it holds files husk did not create\" >&2\n\
     fi\n\
+  fi\n\
+  # PARTIAL OUTPUT IS THE FAILURE MODE THAT MATTERS HERE.\n\
+  #\n\
+  # husk forces every job onto one partition, and on a preemptible one any job from any\n\
+  # other partition interrupts it - that is exactly what keeps an agent from ever blocking\n\
+  # the machine. The cost of that cheap guarantee is this: an interrupted run leaves output\n\
+  # behind. A model that does not checkpoint (ICON with lrestart = .FALSE.) leaves a\n\
+  # directory that looks much like a finished run, and an agent reading it can report that\n\
+  # the science ran. For a weather service that is a worse outcome than an escape.\n\
+  #\n\
+  # So say it, unmissably, in BOTH places someone looks: the job's own stderr and husk's\n\
+  # job log. The exit status already differs (143), but the thing at risk is a reader\n\
+  # looking at the OUTPUT DIRECTORY, who never sees an exit status.\n\
+  #\n\
+  # Deliberately NOT claiming \"preempted\": SLURM sends SIGTERM for preemption, for a\n\
+  # wall-clock limit and for scancel alike, and they are indistinguishable from in here.\n\
+  # Naming the wrong cause confidently is the mistake husk keeps having to fix - so state\n\
+  # the fact (it ended early) and the consequence (the output is incomplete), which hold\n\
+  # whichever it was.\n\
+  if [ -n \"$_husk_signalled\" ] || [ \"$_husk_rc\" = 143 ] || [ \"$_husk_rc\" = 137 ]; then\n\
+    {{\n\
+      echo \"husk: ==========================================================\"\n\
+      echo \"husk: THIS JOB WAS TERMINATED EARLY - ITS OUTPUT IS INCOMPLETE\"\n\
+      echo \"husk:   job        : ${{SLURM_JOB_ID:-nojob}}\"\n\
+      echo \"husk:   ended by   : ${{_husk_signalled:-signal}} (exit $_husk_rc)\"\n\
+      echo \"husk:   likely why : preemption, the partition wall limit, or scancel -\"\n\
+      echo \"husk:                these are indistinguishable from inside the job.\"\n\
+      echo \"husk: Do NOT read the output directory as a completed run. A model that\"\n\
+      echo \"husk: does not checkpoint (e.g. ICON with lrestart = .FALSE.) leaves files\"\n\
+      echo \"husk: that look like a successful run. Check the job's state with\"\n\
+      echo \"husk:   sacct -j ${{SLURM_JOB_ID:-<jobid>}} -o JobID,State,Elapsed,ExitCode\"\n\
+      echo \"husk: before believing any result in it.\"\n\
+      echo \"husk: ==========================================================\"\n\
+    }} 2>&1 | tee -a \"$_husk_log\" >&2\n\
   fi\n\
   if [ \"$_husk_rc\" = 159 ]; then\n\
     echo \"husk: job killed by SIGSYS - a syscall blocked by husk's seccomp-wrapper.\" >&2\n\
@@ -1499,6 +1544,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    // husk forces every job onto one partition; on a preemptible one anything from another
+    // partition interrupts it. That is what keeps an agent from blocking the machine, and
+    // its cost is partial output. A model that does not checkpoint (ICON with
+    // lrestart = .FALSE.) leaves a directory that looks like a finished run, so an agent
+    // reading it can report that the science ran — worse, for a weather service, than an
+    // escape. The exit status already says 143, but nobody reading an output DIRECTORY
+    // sees an exit status.
+    #[test]
+    fn a_job_ended_by_a_signal_says_its_output_is_incomplete() {
+        let script = wrap_script(
+            "#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", false,
+            &["/work".to_string()],
+        );
+        // The trap is load-bearing twice over: an UNTRAPPED SIGTERM kills the guard shell
+        // outright, so the message never prints AND none of the cleanup below it runs —
+        // the step spool leaked on every preempted job before this existed.
+        assert!(script.contains("trap '_husk_signalled=SIGTERM' TERM"), "{script}");
+        let warn = script
+            .split_once("TERMINATED EARLY")
+            .map(|(_, r)| r)
+            .expect("a signalled job must be told its output is incomplete");
+        // Both places a human or an agent looks: the job's own stderr and husk's job log.
+        assert!(warn.contains("tee -a \"$_husk_log\""), "the warning must reach the husk job log: {warn}");
+        assert!(warn.contains(">&2"), "the warning must reach the job's stderr: {warn}");
+        // Name the consequence, and the specific way it misleads.
+        assert!(warn.contains("lrestart"), "name the non-checkpointing case: {warn}");
+        assert!(warn.contains("sacct"), "give the command that settles it: {warn}");
+        // Do NOT claim "preempted": SLURM sends SIGTERM for preemption, the wall limit and
+        // scancel alike, and confidently naming the wrong cause is the mistake husk keeps
+        // having to fix.
+        let head = &script[..script.find("TERMINATED EARLY").unwrap()];
+        assert!(
+            !head.contains("echo \"husk: THIS JOB WAS PREEMPTED"),
+            "the guard cannot tell preemption from a wall limit or scancel"
+        );
+        // 137 (SIGKILL) as well as 143: a job past GraceTime is killed outright.
+        assert!(script.contains("\"$_husk_rc\" = 137"), "{script}");
     }
 
     #[test]

@@ -593,6 +593,33 @@ run_srun_probe() {
     "srun-probe produced no step verdict - see $out and ${out%.out}.err"
 }
 
+# Does THIS site's slurmd honour a `#SBATCH` spelling husk's parser cannot see?
+#
+# husk gates directives with its own parser and then submits the body verbatim, so two
+# parsers read one file: husk's decides what is ALLOWED, slurmd's decides what is
+# HONOURED. For the Forced/dominated family that cannot matter (husk emits its own value
+# on the CLI and sbatch precedence is `command line > #SBATCH`); for options husk would
+# REJECT, a spelling it cannot see is an ungated channel. Which spellings those are is
+# site- and version-specific, so it is measured rather than assumed — same reasoning, and
+# the same shell-out shape, as the srun probe above.
+run_directive_parity_probe() {
+  local script="$HERE/directive-parity-probe.sh"
+  if [ ! -x "$script" ]; then
+    check SKIP containment sbatch.directive_parity "directive-parity-probe.sh not found beside selftest.sh"
+    return
+  fi
+  local out="$PWORK/directive-parity.out" rc=0
+  # It submits HELD jobs and cancels them, so it consumes no allocation. It refuses to run
+  # with HUSK_SLURM_SPOOL set (there sbatch is husk's stub, and it would measure the wrong
+  # parser), which is exactly the state the policy tier leaves behind — so clear it.
+  ( unset HUSK_SLURM_SPOOL; "$script" --partition "$PART" ) >"$out" 2>&1 || rc=$?
+  if [ "$rc" = 0 ]; then
+    check PASS containment sbatch.directive_parity "no #SBATCH spelling is honoured by slurmd that husk's parser cannot see"
+  else
+    check FAIL containment sbatch.directive_parity "$(grep -c DIVERGES "$out" 2>/dev/null || echo '?') spelling(s) reach slurmd unseen by husk — see $out"
+  fi
+}
+
 run_live_probe() {
   local reqid="$1" argv="$2" work="$3" body="$4" src="${5:-file}"
   reset_spool
@@ -821,6 +848,41 @@ else
     check PASS lifecycle guard.sock_cleaned "the job removed its egress socket directory"
   else
     check FAIL lifecycle guard.sock_cleaned "$GSOCKDIR survived the job: $(ls -A "$GSOCKDIR" | tr '\n' ' ')"
+  fi
+  # G6 — a job ended by a signal must say its output is INCOMPLETE, in both places
+  # someone looks. husk forces every job onto one partition; on a preemptible one anything
+  # from another partition interrupts it — that is what stops an agent blocking the
+  # machine, and partial output is its price. ICON with lrestart = .FALSE. leaves a
+  # directory that looks like a finished run, so an agent reading it can report that the
+  # science ran. Signalled for real rather than pattern-matched: `timeout` signals the
+  # process group, which is how SLURM ends a job.
+  cat > "$GJOB/spool/req-sig.json" <<JSON
+{"version":1,"id":"sig","tool":"sbatch","submitted_at":"t","cwd":"$GJOB/work",
+ "argv":["--partition=$PART"],
+ "script":{"source":"file","name":"j.sh","body":"#!/bin/bash\n#SBATCH --nodes=1\necho GUARD-SLEEPING\nsleep 30\necho GUARD-FINISHED\n"},
+ "job_args":[],"env":{}}
+JSON
+  ( cd "$GJOB/work" && HOME="$GJOB/home" "$BROKER" --dry-run --once --spool "$GJOB/spool" ) \
+    >>"$GJOB/dryrun.out" 2>>"$BROKER_LOG"
+  if [ ! -s "$GJOB/spool/job-sig.sh" ]; then
+    check FAIL lifecycle guard.preempt_warned "the broker staged no script for the signal probe"
+  else
+    ( cd "$GJOB/work" && PATH="$GJOB/bin:$PATH" HOME="$GJOB/home" SLURM_JOB_ID=990003 \
+        timeout -s TERM 3 bash "$GJOB/spool/job-sig.sh" ) >"$GJOB/sig.out" 2>"$GJOB/sig.err"
+    SIGLOG="$GJOB/home/.husk/log/job-990003.log"
+    if grep -q "TERMINATED EARLY" "$GJOB/sig.err" && grep -q "TERMINATED EARLY" "$SIGLOG" 2>/dev/null; then
+      check PASS lifecycle guard.preempt_warned "a signalled job warns that its output is incomplete, in the job output AND the husk log"
+    else
+      check FAIL lifecycle guard.preempt_warned "stderr=$(grep -c 'TERMINATED EARLY' "$GJOB/sig.err") log=$(grep -c 'TERMINATED EARLY' "$SIGLOG" 2>/dev/null || echo 0) — a preempted run can be read as a finished one"
+    fi
+    # The trap is what makes the cleanup reachable at all: an untrapped SIGTERM kills the
+    # guard shell outright, so before it existed EVERY signalled job leaked its step spool.
+    SIGLEFT="$(ls -d "$GJOB/work"/.husk-step-spool-990003 2>/dev/null || true)"
+    if [ -z "$SIGLEFT" ]; then
+      check PASS lifecycle guard.preempt_cleanup "a signalled job still cleans up after itself"
+    else
+      check FAIL lifecycle guard.preempt_cleanup "signalled job leaked $SIGLEFT"
+    fi
   fi
 fi
 rm -rf "$GJOB"
@@ -1349,6 +1411,10 @@ echo "===HUSK-PROBE-END==="
     # with the step-broker - and it is the copy that drifts which reports green while the
     # real path is broken.
     run_srun_probe "$WORK"
+
+    # Same shape, for the other place a second parser reads husk's input: slurmd's own
+    # reading of the `#SBATCH` lines husk forwarded.
+    run_directive_parity_probe
   fi
 else
   echo
