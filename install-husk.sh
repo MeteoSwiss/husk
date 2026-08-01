@@ -53,11 +53,14 @@ SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # built-in default `preemptible`; Santis has no such partition (use `debug` or `shared`).
 # Extracted first so the positional --help/--uninstall checks below still see $1.
 SLURM_PARTITION_ARG=""
+SLURM_ACCOUNT_ARG=""
 _args=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --slurm-partition)   SLURM_PARTITION_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
     --slurm-partition=*) SLURM_PARTITION_ARG="${1#*=}"; shift ;;
+    --slurm-account)     SLURM_ACCOUNT_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --slurm-account=*)   SLURM_ACCOUNT_ARG="${1#*=}"; shift ;;
     *)                   _args+=("$1"); shift ;;
   esac
 done
@@ -82,7 +85,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   echo "  - delete  $PREFIX/bin/{husk,seccomp-wrapper,seccomp-wrapper.sha256}"
   echo "            $PREFIX/bin/{husk-slurm-wrapper,husk-slurm-broker} (if installed)"
   echo "            $PREFIX/bin/husk-slurm (legacy, if left by an older install)"
-  echo "            $PREFIX/lib/husk/{apply-seccomp,sbatch-stub.py,srun-stub.py,slurm-partition}"
+  echo "            $PREFIX/lib/husk/{apply-seccomp,sbatch-stub.py,srun-stub.py,slurm-partition,slurm-account}"
   echo "  - revert the enableAllProjectMcpServers / sandbox / permissions blocks in"
   echo "    $CLAUDE_SETTINGS to their pre-install state (all other settings kept)"
   echo "  - socat at $PREFIX/bin/socat is LEFT in place (a shared dependency);"
@@ -114,6 +117,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
            "$PREFIX/lib/husk/sbatch-stub.py" \
            "$PREFIX/lib/husk/srun-stub.py" \
            "$PREFIX/lib/husk/slurm-partition" \
+           "$PREFIX/lib/husk/slurm-account" \
            "$MANIFEST"; do
     if [[ -e "$f" ]]; then rm -f "$f"; printf '  [ok]   removed %s\n' "$f"; fi
   done
@@ -384,6 +388,18 @@ done
 # Site partition (operator-recorded at install; agent-inaccessible). An explicit
 # HUSK_SLURM_PARTITION env var wins; otherwise use the recorded value. The broker
 # forces this partition onto every job.
+# The project account, where the site requires one (Santis rejects every submission
+# without it). Same trusted path as the partition: recorded at install, under ~/.local,
+# unreachable from the cage. The broker FORCES it, so the agent cannot bill another project.
+if [ -z "${HUSK_SLURM_ACCOUNT:-}" ]; then
+  for cfg in "$here/../lib/husk/slurm-account" "$here/slurm-account"; do
+    if [ -r "$cfg" ]; then
+      acct="$(head -n1 "$cfg" | tr -d '[:space:]')"
+      if [ -n "$acct" ]; then export HUSK_SLURM_ACCOUNT="$acct"; fi
+      break
+    fi
+  done
+fi
 if [ -z "${HUSK_SLURM_PARTITION:-}" ]; then
   for cfg in "$here/../lib/husk/slurm-partition" "$here/slurm-partition"; do
     if [ -r "$cfg" ]; then
@@ -449,6 +465,18 @@ if [[ -x "$SLURM_BROKER_SRC" && -x "$SLURM_WRAPPER_SRC" ]]; then
   else
     rm -f "$PREFIX/lib/husk/slurm-partition"
     skip "SLURM partition not set — broker default 'preemptible' (set with --slurm-partition NAME; Santis has no preemptible, use debug or shared)"
+  fi
+  # The project account. Some sites refuse every submission without one: Santis's
+  # cli_filter answers "you must specify a project account (-A <account>)". The broker
+  # FORCES this value, so recording it here is also what stops an agent billing another
+  # project.
+  SLURM_ACCOUNT="${SLURM_ACCOUNT_ARG:-${HUSK_SLURM_ACCOUNT:-}}"
+  if [[ -n "$SLURM_ACCOUNT" ]]; then
+    printf '%s\n' "$SLURM_ACCOUNT" > "$PREFIX/lib/husk/slurm-account"
+    ok "SLURM account → '$SLURM_ACCOUNT' (recorded in $PREFIX/lib/husk/slurm-account)"
+  else
+    rm -f "$PREFIX/lib/husk/slurm-account"
+    skip "SLURM account not set — fine where the site does not require one (Balfrin). Santis DOES: re-run with --slurm-account NAME or no job will submit"
   fi
   HUSK_SLURM_INSTALLED=1
 else

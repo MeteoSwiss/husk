@@ -152,7 +152,12 @@ pub const REGISTRY: &[OptSpec] = &[
     spec!("--dependency", "-d", true, Class::Allowed, v_dep),
     spec!("--job-name", "-J", true, Class::Allowed, v_name),
     spec!("--qos", "-q", true, Class::Allowed, v_name),
-    spec!("--account", "-A", true, Class::Allowed, v_name),
+    // FORCED, not Allowed. The account is who gets BILLED, so letting the agent name it
+    // would let a caged job charge another project's allocation — and on sites whose
+    // cli_filter requires an account (Santis), it is also mandatory for any job to run at
+    // all. Same treatment as the partition: taken from the operator's trusted config, never
+    // from the request.
+    spec!("--account", "-A", true, Class::Forced, v_name),
     spec!("--reservation", "", true, Class::Allowed, v_name),
     spec!("--comment", "", true, Class::Allowed, v_comment),
     spec!("--distribution", "-m", true, Class::Allowed, v_dist),
@@ -715,11 +720,18 @@ mod tests {
         let out = interpret_cli(&cli).expect("a normal job must be accepted");
         for want in [
             "--ntasks-per-node=4", "--cpus-per-task=8", "--time=24:00:00",
-            "--mem=0", "--gpus=4", "--constraint=gpu", "--account=myproj",
+            "--mem=0", "--gpus=4", "--constraint=gpu",
             "--job-name=train-run_1", "--exclusive",
         ] {
             assert!(out.contains(&want.to_string()), "missing {want} in {out:?}");
         }
+        // ...but NOT the account. It became Forced when Santis turned out to require one:
+        // the account decides which project is BILLED, so an agent-chosen value could
+        // charge someone else's allocation. policy.rs emits the operator's value instead.
+        assert!(
+            !out.iter().any(|o| o.contains("myproj")),
+            "the agent's --account must be dropped, not re-emitted: {out:?}"
+        );
     }
 
     #[test]

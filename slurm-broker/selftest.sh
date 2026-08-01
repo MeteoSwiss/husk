@@ -208,6 +208,19 @@ if [ -z "$PART" ]; then
 fi
 PART="${PART:-preemptible}"
 export HUSK_SLURM_PARTITION="$PART"
+# The project account, resolved exactly as the launcher does. Sites whose cli_filter
+# requires one (Santis) reject EVERY live submission without it, which is what turned the
+# first Santis run into three identical containment failures.
+ACCT="${HUSK_SLURM_ACCOUNT:-}"
+if [ -z "$ACCT" ]; then
+  for cfg in "$HOME/.local/lib/husk/slurm-account" "$HERE/../lib/husk/slurm-account"; do
+    if [ -r "$cfg" ]; then
+      ACCT="$(head -n1 "$cfg" | tr -d '[:space:]')"
+      [ -n "$ACCT" ] && break
+    fi
+  done
+fi
+[ -n "$ACCT" ] && export HUSK_SLURM_ACCOUNT="$ACCT"
 echo "== policy tier (broker --dry-run; deterministic, no submission; partition=$PART) =="
 
 expect_status() { # id expected humanid detail

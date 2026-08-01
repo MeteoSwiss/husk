@@ -208,6 +208,26 @@ pub fn decide(
     // ---- forced options (these outrank any #SBATCH directive: CLI > directive) ----
     let mut options: Vec<String> = Vec::new();
     options.push(format!("--partition={required}"));
+    // The billing account, where the site uses one. Forced from the operator's trusted
+    // config for the same two reasons as the partition: it decides WHO IS BILLED, so an
+    // agent-chosen value could charge another project's allocation; and on sites whose
+    // cli_filter requires it (Santis) no job runs without one.
+    if let Some(acct) = &session.account {
+        options.push(format!("--account={acct}"));
+    } else if pick_any(&cli, &directives, &["-A", "--account"]).is_some() {
+        // The agent asked for an account and husk has none to force. Dropping it silently
+        // would loop: the site refuses the job for want of an account, the agent reads that
+        // message, supplies one, husk drops it again. Say who has to fix it and how.
+        return Decision::Reject(
+            "husk sets --account itself, from the operator's configuration, so the one in \
+             this request was not used — and none is configured here. If this cluster \
+             requires a project account, ask whoever installed husk to re-run \
+             `install-husk.sh --slurm-account <name>` (or set HUSK_SLURM_ACCOUNT before \
+             launching husk). It is operator config on purpose: the account decides which \
+             project is billed."
+                .to_string(),
+        );
+    }
     // The cage profile's own forced options (today: --nodes=1). Emitted with the other
     // forced values, before the validated passthrough, so they outrank any #SBATCH.
     options.extend(profile.forced_sbatch_options());
@@ -385,6 +405,11 @@ fn husk_paths() -> (String, String, String) {
         .to_string_lossy()
         .to_string();
     (broker, stub, socat)
+}
+
+/// First occurrence of an option across the CLI and the `#SBATCH` body, in that order.
+fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<String> {
+    sbatch::option_value(cli, names).or_else(|| sbatch::option_value(directives, names))
 }
 
 /// Validate a `scancel` invocation down to a list of job ids, or explain the refusal.
@@ -1070,7 +1095,7 @@ mod tests {
     }
 
     fn no_uenv() -> Session {
-        Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() }
+        Session { uenv: None, view: None, required_partition: "preemptible".into(), account: None, limits: Default::default() }
     }
 
     /// A session that knows the partition's limits, as a real broker does after asking
@@ -1201,6 +1226,7 @@ mod tests {
             uenv: Some("prgenv-gnu:v1".into()),
             view: Some("prgenv-gnu:default".into()),
             required_partition: "preemptible".into(),
+            account: None,
             limits: Default::default(),
         }
     }
@@ -1752,6 +1778,47 @@ mod tests {
     // reading it can report that the science ran — worse, for a weather service, than an
     // escape. The exit status already says 143, but nobody reading an output DIRECTORY
     // sees an exit status.
+    // Santis rejects EVERY submission without a project account (its cli_filter says so),
+    // and the account decides which project is billed — so it is operator config, forced,
+    // never the agent's.
+    #[test]
+    fn the_account_is_forced_from_operator_config_and_never_the_agents() {
+        let with_acct = Session { account: Some("csstaff".into()), ..no_uenv() };
+        let argv = opts(
+            req_in(std::path::Path::new("/work"), &["--partition=preemptible", "-A", "evil"], "echo hi\n"),
+            &with_acct,
+        );
+        assert!(argv.contains(&"--account=csstaff".to_string()), "{argv:?}");
+        assert!(
+            !argv.iter().any(|a| a.contains("evil")),
+            "the agent's account must never reach sbatch: {argv:?}"
+        );
+
+        // A site with no account configured keeps today's behaviour: nothing emitted.
+        let argv = opts(
+            req_in(std::path::Path::new("/work"), &["--partition=preemptible"], "echo hi\n"),
+            &no_uenv(),
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("--account")), "{argv:?}");
+
+        // ...but if the agent ASKED for one and husk has none, say who fixes it. Silently
+        // dropping it loops: the site refuses for want of an account, the agent supplies
+        // one, husk drops it, repeat.
+        let d = decide(
+            &req_in(std::path::Path::new("/work"), &["--partition=preemptible", "--account=x"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::default(),
+            std::path::Path::new("/work"),
+        );
+        match d {
+            Decision::Reject(why) => {
+                assert!(why.contains("--slurm-account"), "name the fix: {why}");
+                assert!(why.contains("billed"), "say why it is operator config: {why}");
+            }
+            _ => panic!("an unconfigured account request must be explained, not dropped"),
+        }
+    }
+
     // scancel exists so an agent can STOP what it started — husk brokered sbatch and not
     // scancel, which left a runaway needing a human. The security content is entirely in
     // what is REFUSED: a bare job id names one thing husk can check against what it

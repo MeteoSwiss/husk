@@ -84,6 +84,11 @@ pub struct Session {
     /// (operator-set, agent-inaccessible), defaulting to DEFAULT_PARTITION. Choose a
     /// low-priority/preemptible partition — every brokered job lands here.
     pub required_partition: String,
+    /// `--account` forced onto every job, from `HUSK_SLURM_ACCOUNT` in the broker's TRUSTED
+    /// environment (operator-set at install, agent-inaccessible). `None` where the site does
+    /// not use accounts — Balfrin does not, Santis REQUIRES one and its cli_filter rejects
+    /// every submission without it.
+    pub account: Option<String>,
     /// What to pass to `--view`, normalized to `uenvname:viewname`. UENV_VIEW is
     /// mount-qualified on this uenv (e.g. `/user-environment:icon:default`), which is
     /// NOT a valid `--view` argument, so a leading `/mount-point:` field is stripped.
@@ -106,6 +111,7 @@ impl Session {
             view: nonempty("UENV_VIEW").map(|v| normalize_view(&v)),
             required_partition: nonempty("HUSK_SLURM_PARTITION")
                 .unwrap_or_else(|| DEFAULT_PARTITION.to_string()),
+            account: nonempty("HUSK_SLURM_ACCOUNT"),
             limits: PartitionLimits::default(),
         }
     }
