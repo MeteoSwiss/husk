@@ -188,6 +188,39 @@ pub fn is_valid_output_filename(name: &str) -> bool {
 ///
 /// Resolves symlinks on both sides, because slurmd follows them and a string comparison
 /// would not. `Path::starts_with` is component-wise, so `/work2` is not "under" `/work`.
+/// Confine a path to the job's WRITABLE SET — the project dir plus every configured
+/// `allowWrite` root — rather than to a single directory.
+///
+/// The set, not one root, because both halves are real. `allowWrite` genuinely adds
+/// writable regions, so a job legitimately started in one must be allowed to run and to
+/// put its logs there. And `req.cwd` is ADVERSARY-CONTROLLED — the stub runs in the cage
+/// and the spool is agent-writable — so it cannot be used as the confinement base for
+/// `--output`/`--error`: slurmd writes those as the user and OUTSIDE the cage, which makes
+/// an unconfined base an uncaged arbitrary-write primitive. Confining to an agent-chosen
+/// directory is not confinement.
+///
+/// Reports against the whole set, because "outside the working directory" would be a
+/// misleading answer when several directories are writable.
+pub fn confine_under_any(path: &str, roots: &[String]) -> Result<String, String> {
+    let mut last = None;
+    for r in roots {
+        match confine_under_workdir(path, r) {
+            Ok(p) => return Ok(p),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(match last {
+        // Every root refused it: report the SET, so the message names what is allowed.
+        Some(_) => format!(
+            "{path:?} is not inside any directory this job may write. husk confines \
+             --chdir/--output/--error to the writable set, because SLURM writes those files \
+             as you and OUTSIDE the sandbox. Writable here: {}",
+            roots.join(", ")
+        ),
+        None => "no writable directory is configured for this job".to_string(),
+    })
+}
+
 pub fn confine_under_workdir(path: &str, workdir: &str) -> Result<String, String> {
     let root = std::fs::canonicalize(workdir)
         .map_err(|e| format!("cannot resolve the working directory {workdir:?}: {e}"))?;

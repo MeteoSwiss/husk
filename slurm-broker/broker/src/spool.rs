@@ -574,6 +574,10 @@ mod tests {
     #[test]
     fn cage_ignores_settings_under_agent_cwd() {
         let dir = scratch("f17-cwd");
+        // The agent's cwd is a SUBDIRECTORY of the trusted project dir — the realistic
+        // shape, and the only one that still submits now that --chdir is confined to the
+        // writable set. F17's point is unchanged: the policy comes from the project dir,
+        // never from settings the agent planted under the directory it submitted from.
         let proj = dir.join("proj");
         fs::create_dir_all(proj.join(".claude")).unwrap();
         fs::write(
@@ -590,7 +594,7 @@ mod tests {
             dry_run: true,
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
-            project_dir: PathBuf::from("/work"), // as if resolved from a clean, trusted project root
+            project_dir: dir.clone(), // the trusted root; `proj` is a subdirectory of it
         };
         let req_json = format!(
             r##"{{"version":1,"id":"f17id","tool":"sbatch","submitted_at":"t","cwd":"{}","argv":["--partition=preemptible"],"script":{{"source":"file","body":"#!/bin/bash\necho hi\n"}},"job_args":[],"env":{{}}}}"##,
