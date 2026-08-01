@@ -1128,6 +1128,25 @@ else
   echo "RESULT PASS containment pid.isolated the job sees only its own process tree ($_pids pids); the step-broker is not addressable"
 fi
 
+# The uenv, if the human had one active. The broker forces --uenv/--view from the TRUSTED
+# login session and --export=ALL carries UENV_LABEL into the job, so the job can decide this
+# for itself: a label in the environment means a uenv was requested, and the mount point
+# existing means it actually arrived. Skips cleanly where no uenv is in play, which is every
+# round run so far on both clusters - this arm exists because that made it the least tested
+# path in the system.
+# NO APOSTROPHES IN THIS BLOCK - single-quoted probe body.
+if [ -n "${UENV_LABEL:-}${UENV_MOUNT_LIST:-}" ]; then
+  echo "FP uenv_label ${UENV_LABEL:-<unset>}"
+  echo "FP uenv_view_in_job ${UENV_VIEW:-<unset>}"
+  if [ -d /user-environment ]; then
+    echo "RESULT PASS functional uenv.mounted the session uenv is mounted inside the cage (/user-environment, $(ls -A /user-environment 2>/dev/null | wc -l) entries)"
+  else
+    echo "RESULT FAIL functional uenv.mounted a uenv session was active but /user-environment is NOT present in the job - the broker did not carry it into the cage"
+  fi
+else
+  echo "RESULT SKIP functional uenv.mounted no uenv session was active - run uenv start before husk to exercise this"
+fi
+
 if [ -r /proc/self/mountinfo ]; then
   echo "FP mounts total=$(wc -l < /proc/self/mountinfo) tmpfs=$(grep -c tmpfs /proc/self/mountinfo)"
   root_mi=$(cut -d" " -f5,6 /proc/self/mountinfo | grep -m1 "^/ ")
