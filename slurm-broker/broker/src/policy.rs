@@ -6,12 +6,16 @@ use crate::sbatch;
 use crate::session::Session;
 use crate::settings::{self, FsPolicy};
 
-use husk_slurm_broker::READONLY_SLURM;
+use husk_slurm_broker::{BROKERED_MUTATING, READONLY_SLURM};
 
 pub enum Decision {
     Submit(Submission),
     /// Run a validated read-only query (argv[0] is the command) and return output.
     Query(Vec<String>),
+    /// Cancel these job ids — IF the broker submitted them. The ownership check is
+    /// deliberately NOT here: `decide` is pure, and only the broker knows what it
+    /// submitted. This carries the shape-validated targets and nothing else.
+    Cancel(Vec<String>),
     Reject(String),
 }
 
@@ -76,10 +80,12 @@ pub fn decide(
             argv.extend(req.argv.iter().cloned());
             return Decision::Query(argv);
         }
+        t if BROKERED_MUTATING.contains(&t) => return cancel_decision(&req.argv),
         other => {
             return Decision::Reject(format!(
-                "'{other}' is not brokered (only sbatch and read-only SLURM queries; \
-                 interactive srun/salloc and state-changing commands are disabled)"
+                "'{other}' is not brokered (only sbatch, scancel of this session's own \
+                 jobs, and read-only SLURM queries; interactive srun/salloc and other \
+                 state-changing commands are disabled)"
             ));
         }
     }
@@ -379,6 +385,66 @@ fn husk_paths() -> (String, String, String) {
         .to_string_lossy()
         .to_string();
     (broker, stub, socat)
+}
+
+/// Validate a `scancel` invocation down to a list of job ids, or explain the refusal.
+///
+/// **Job ids only — every option is refused, and that is the whole security content.**
+/// `scancel` has a family of selector flags (`-u/--user`, `-A/--account`, `--state`,
+/// `--partition`, `-n/--name`, `--me`) that turn one command into a mass-cancel: an agent
+/// running `scancel -u $USER` would kill every job this human owns, including production
+/// runs husk never touched. A bare id cancels exactly one thing and is checkable against
+/// what husk submitted; a selector is evaluated by slurmctld against state husk cannot
+/// see, so it can never be checked. Same reasoning as the sbatch registry — allow the form
+/// that can be validated, refuse the form that has to be trusted.
+///
+/// Accepts `<jobid>`, `<jobid>_<arraytask>` and `<jobid>.<stepid>`, since those are how a
+/// user names a piece of a job they already own. The base id before `_` or `.` is what the
+/// broker checks ownership against.
+fn cancel_decision(argv: &[String]) -> Decision {
+    if argv.is_empty() {
+        return Decision::Reject(
+            "scancel needs at least one job id. husk cancels only jobs it submitted for \
+             this session, so selectors like -u/--user, --state or --me are refused: they \
+             are resolved by the scheduler against jobs husk cannot vouch for."
+                .to_string(),
+        );
+    }
+    let mut ids = Vec::new();
+    for a in argv {
+        if a.starts_with('-') {
+            return Decision::Reject(format!(
+                "scancel option {a:?} is not permitted here. husk brokers scancel only as \
+                 a list of job ids it submitted this session — a selector such as \
+                 -u/--user, -A/--account, --state or --me would cancel jobs husk never \
+                 submitted, including this account's production runs. Pass the job id."
+            ));
+        }
+        if !is_cancellable_id(a) {
+            return Decision::Reject(format!(
+                "{a:?} is not a job id. Pass ids as they appear in squeue: 4991406, or \
+                 4991406_3 for an array task, or 4991406.0 for a step."
+            ));
+        }
+        ids.push(a.clone());
+    }
+    Decision::Cancel(ids)
+}
+
+/// `<digits>` optionally followed by `_<digits>` (array task) or `.<digits>` (step).
+/// Restrictive on purpose: this string becomes an argument to the real `scancel`.
+fn is_cancellable_id(s: &str) -> bool {
+    let (base, rest) = match s.split_once(['_', '.']) {
+        None => (s, None),
+        Some((b, r)) => (b, Some(r)),
+    };
+    let numeric = |x: &str| !x.is_empty() && x.len() <= 20 && x.bytes().all(|b| b.is_ascii_digit());
+    numeric(base) && rest.map(numeric).unwrap_or(true)
+}
+
+/// The base job id a cancel target refers to — what ownership is checked against.
+pub fn cancel_base_id(s: &str) -> Option<u64> {
+    s.split(['_', '.']).next()?.parse().ok()
 }
 
 /// Announce the cage inside the job, and say what is writable.
@@ -1145,6 +1211,7 @@ mod tests {
             Decision::Submit(sub) => sub.options,
             Decision::Reject(m) => panic!("expected Submit, got Reject: {m}"),
             Decision::Query(a) => panic!("expected Submit, got Query: {a:?}"),
+            Decision::Cancel(c) => panic!("expected Submit, got Cancel: {c:?}"),
         }
     }
     /// For tests that build a REAL temp directory: husk was "launched" there, so that is
@@ -1154,6 +1221,7 @@ mod tests {
             Decision::Submit(sub) => sub.options,
             Decision::Reject(m) => panic!("expected Submit, got Reject: {m}"),
             Decision::Query(a) => panic!("expected Submit, got Query: {a:?}"),
+            Decision::Cancel(c) => panic!("expected Submit, got Cancel: {c:?}"),
         }
     }
     fn rejected(r: Request, s: &Session) -> bool {
@@ -1684,6 +1752,51 @@ mod tests {
     // reading it can report that the science ran — worse, for a weather service, than an
     // escape. The exit status already says 143, but nobody reading an output DIRECTORY
     // sees an exit status.
+    // scancel exists so an agent can STOP what it started — husk brokered sbatch and not
+    // scancel, which left a runaway needing a human. The security content is entirely in
+    // what is REFUSED: a bare job id names one thing husk can check against what it
+    // submitted, while a selector is resolved by slurmctld against jobs husk cannot see.
+    #[test]
+    fn scancel_takes_job_ids_and_refuses_every_selector() {
+        let cancel = |argv: &[&str]| {
+            let mut r = req_in(std::path::Path::new("/work"), &[], "");
+            r.tool = "scancel".into();
+            r.argv = argv.iter().map(|s| s.to_string()).collect();
+            decide(&r, &no_uenv(), &FsPolicy::default(), std::path::Path::new("/work"))
+        };
+
+        match cancel(&["4991406", "4991406_3", "4991406.0"]) {
+            Decision::Cancel(ids) => assert_eq!(ids.len(), 3, "{ids:?}"),
+            _ => panic!("plain job ids must be cancellable"),
+        }
+
+        // The mass-cancel family. `scancel -u $USER` would kill every job this human owns,
+        // including production runs husk never submitted — the single worst thing this
+        // feature could enable, so each spelling is pinned.
+        for argv in [
+            vec!["-u", "cmueller"], vec!["--user=cmueller"], vec!["--me"],
+            vec!["-A", "acct"], vec!["--account=acct"], vec!["--state=PENDING"],
+            vec!["-p", "short"], vec!["--partition=short"], vec!["-n", "myjob"],
+            vec!["--name=myjob"], vec!["4991406", "--me"],
+        ] {
+            match cancel(&argv) {
+                Decision::Reject(why) => assert!(
+                    why.contains("not permitted here") || why.contains("at least one job id"),
+                    "{argv:?} refused with an unhelpful message: {why}"
+                ),
+                _ => panic!("{argv:?} must be refused"),
+            }
+        }
+
+        // Not ids, and a bare scancel (which in some spellings means "everything").
+        for argv in [vec![], vec!["all"], vec!["../4991406"], vec!["4991406;rm -rf /"], vec!["-"]] {
+            assert!(
+                matches!(cancel(&argv), Decision::Reject(_)),
+                "{argv:?} must be refused"
+            );
+        }
+    }
+
     #[test]
     fn a_job_ended_by_a_signal_says_its_output_is_incomplete() {
         let script = wrap_script(

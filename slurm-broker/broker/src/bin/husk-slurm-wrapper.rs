@@ -37,7 +37,7 @@ use std::ptr;
 
 // The one internal, dependency-free shared const (keeps this binary's zero-crate
 // audit surface intact — see the module header).
-use husk_slurm_broker::{session_log_path, session_spool_dir, READONLY_SLURM};
+use husk_slurm_broker::{session_log_path, session_spool_dir, BROKERED_MUTATING, READONLY_SLURM};
 
 // ---- the only FFI: two namespace syscalls std doesn't expose ----------------
 const CLONE_NEWNS: c_int = 0x0002_0000; // new mount namespace
@@ -372,7 +372,7 @@ fn plan(cfg: &Config) -> io::Result<Plan<'_>> {
 /// sbatch shadow, a missed read-shadow can't become an escape — the real command
 /// fails inside the sandbox and is read-only regardless.
 fn shadow_readonly_commands(stub: &Path) {
-    for cmd in READONLY_SLURM {
+    for cmd in READONLY_SLURM.iter().chain(BROKERED_MUTATING) {
         if let Some(target) = which(cmd) {
             match bind_file(stub, &target) {
                 Ok(()) => eprintln!("husk-slurm-wrapper: {cmd} <- stub (read-only query)"),

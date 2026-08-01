@@ -291,6 +291,22 @@ else
   check FAIL policy sbatch.time_quiet "warned a submission that chose its own --time: $(respfield p2u message)"
 fi
 
+# P2f — scancel is brokered, but ONLY as job ids this session submitted. The selectors are
+# the danger: `scancel -u $USER` would kill every job this human owns, including production
+# runs husk never submitted. A fresh broker has submitted nothing, so even a well-formed id
+# must be refused — that is the ownership gate, not a parse failure.
+for sc_case in 'sc_sel:["-u","someone"]' 'sc_me:["--me"]' 'sc_state:["--state=PENDING"]' 'sc_own:["4991406"]'; do
+  sc_id="${sc_case%%:*}"; sc_argv="${sc_case#*:}"
+  reset_spool
+  mkreq "$sc_id" scancel "$sc_argv" "$PWORK" "$VALID_BODY"
+  run_broker dry "$SPOOL/out.$sc_id"
+  if [ "$(respfield "$sc_id" status)" != rejected ]; then
+    check FAIL policy "scancel.$sc_id" "scancel $sc_argv was NOT refused - an agent could cancel jobs husk never submitted"
+    continue
+  fi
+  check PASS policy "scancel.$sc_id" "refused: $(respfield "$sc_id" message | head -c 60)"
+done
+
 # P3 — a wrong partition is rejected.
 reset_spool
 mkreq p3 sbatch "[\"--partition=${PART}-nope\"]" "$PWORK" "$VALID_BODY"
@@ -354,15 +370,23 @@ mkreq p6 squeue '["--me"]' "$PWORK" ""
 run_broker dry "$SPOOL/out.p6"
 expect_status p6 ok squeue.routed "read-only squeue routed to a query"
 
-# P7/P8/P9 — state-changing / interactive commands are rejected.
+# P7/P8 — interactive commands stay unbrokered. scancel LEFT this list when it became
+# brokered (P2f above covers it): it is now refused on ownership and on selectors, not on
+# its name, and an arm asserting "scancel is not brokered" would be pinning a claim that
+# stopped being true.
 i=7
-for tool in scancel srun salloc; do
+for tool in srun salloc; do
   reset_spool
   mkreq "p$i" "$tool" '["x"]' "$PWORK" ""
   run_broker dry "$SPOOL/out.p$i"
   expect_status "p$i" rejected "$tool.rejected" "$tool is not brokered"
   i=$((i+1))
 done
+# ...and a garbage scancel argument is still refused, as a parse failure this time.
+reset_spool
+mkreq p9 scancel '["x"]' "$PWORK" ""
+run_broker dry "$SPOOL/out.p9"
+expect_status p9 rejected scancel.not_an_id "a scancel argument that is not a job id is refused"
 
 # P10 — an unsupported protocol version is rejected before any tool dispatch.
 reset_spool

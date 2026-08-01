@@ -20,6 +20,20 @@ pub const READONLY_SLURM: &[&str] = &[
     "squeue", "sinfo", "sacct", "sstat", "sprio", "sreport", "sshare",
 ];
 
+/// Brokered commands that CHANGE state, and so are gated on more than their name.
+///
+/// Only `scancel`, and only for jobs this broker submitted (see `policy::cancel_targets`
+/// and the ownership check in `spool`). It is listed separately from `READONLY_SLURM`
+/// because the two are shadowed the same way but decided very differently: a read-only
+/// query is safe by virtue of what the command IS, a cancel is safe only by virtue of
+/// WHICH JOB it names.
+///
+/// husk made it easier for an agent to start work than to stop it: `sbatch` was brokered
+/// and `scancel` was not, so an agent could launch a job and then had no way to kill it —
+/// not even one of its own. A runaway then needed a human. That is a containment gap, not
+/// an inconvenience, and it is why this exists.
+pub const BROKERED_MUTATING: &[&str] = &["scancel"];
+
 // ---- spool naming + lifecycle ----------------------------------------------
 //
 // The spool holds the request/response files the caged stub and the trusted broker

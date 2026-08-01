@@ -483,6 +483,7 @@ fn main() {
         session,
         dry_run,
         fs_policy,
+        submitted: Default::default(),
         project_dir: project_dir.clone(),
     };
     eprintln!(

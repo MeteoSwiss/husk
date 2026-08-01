@@ -31,6 +31,15 @@ pub struct Broker {
     /// Compute-cage filesystem policy, resolved once at startup from the TRUSTED project
     /// dir (never from the agent-controlled req.cwd). See main.rs. (F17)
     pub fs_policy: FsPolicy,
+    /// Job ids this broker submitted, and the ONLY ones it will cancel.
+    ///
+    /// Trusted state: it is built from what `sbatch --parsable` returned, never from
+    /// anything the agent sent. In memory rather than on disk deliberately — the spool is
+    /// agent-writable, so a persisted list would be a list the confined side could edit,
+    /// which is precisely the authority this is meant to hold. The cost is that a restarted
+    /// broker disowns earlier jobs; they are then cancellable by the human, which is the
+    /// right way for that to fail.
+    pub submitted: std::cell::RefCell<std::collections::BTreeSet<u64>>,
     /// The TRUSTED project dir — where husk was launched, captured before the agent ran.
     ///
     /// This is the cage's writable root, and it is deliberately NOT `req.cwd`: that comes
@@ -125,6 +134,7 @@ impl Broker {
         let resp = match policy::decide(&req, &self.session, &self.fs_policy, &self.project_dir) {
             Decision::Reject(msg) => Response::rejected(&id, msg),
             Decision::Query(argv) => self.run_query(&id, argv),
+            Decision::Cancel(targets) => self.cancel(&id, targets),
             Decision::Submit(sub) => self.submit(&id, &req, sub),
         };
         Some((id, resp))
@@ -182,7 +192,12 @@ impl Broker {
         }
 
         let resp = match run_sbatch(&argv) {
-            Ok(job_id) => Response::submitted(id, job_id).with_note(sub.note),
+            Ok(job_id) => {
+                // Remember it, so the agent can later stop what it started. This is the
+                // only place the set grows, and it grows from slurmctld's answer.
+                self.submitted.borrow_mut().insert(job_id);
+                Response::submitted(id, job_id).with_note(sub.note)
+            }
             Err(e) => Response::error(id, e),
         };
         // sbatch has copied the script into SLURM's own spool by the time it returns, so
@@ -190,6 +205,63 @@ impl Broker {
         // submit. (F4) (Dry-run returns above and keeps the script for inspection.)
         let _ = fs::remove_file(&script_path);
         resp
+    }
+
+    /// Cancel jobs this broker submitted — and refuse anything else.
+    ///
+    /// husk brokers `sbatch` but not `scancel`, which left an agent able to START work and
+    /// unable to STOP it, not even its own job. That is a containment gap: a runaway needed
+    /// a human. It also bit a review session, which left 14 held probe jobs it could not
+    /// clean up.
+    ///
+    /// The gate is OWNERSHIP, checked here rather than in `policy`, because only the broker
+    /// knows what it submitted. An id husk did not submit is refused by name — this account
+    /// has jobs husk never touched (a human's production runs), and "cancel my own jobs"
+    /// must not become "cancel this user's jobs".
+    ///
+    /// All-or-nothing: one unowned id refuses the whole request. A partial cancel would
+    /// leave the agent believing it had stopped something it had not.
+    fn cancel(&self, id: &str, targets: Vec<String>) -> Response {
+        let owned = self.submitted.borrow();
+        let unowned: Vec<&String> = targets
+            .iter()
+            .filter(|t| !policy::cancel_base_id(t).is_some_and(|b| owned.contains(&b)))
+            .collect();
+        if !unowned.is_empty() {
+            let known: Vec<String> = owned.iter().map(|j| j.to_string()).collect();
+            return Response::rejected(
+                id,
+                format!(
+                    "husk will not cancel {} — this session did not submit {}. It cancels \
+                     only jobs it submitted itself, because this account also has jobs husk \
+                     never touched. Submitted this session: {}",
+                    unowned.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                    if unowned.len() == 1 { "it" } else { "them" },
+                    if known.is_empty() { "(none yet)".to_string() } else { known.join(", ") },
+                ),
+            );
+        }
+        drop(owned);
+
+        let mut argv = vec!["scancel".to_string()];
+        argv.extend(targets.iter().cloned());
+        if self.dry_run {
+            println!("---- DRY RUN cancel (request {id}) ----");
+            println!("argv: {argv:?}");
+            return Response::query(id, String::new(), String::new(), 0);
+        }
+        match run_query_cmd(&argv, std::time::Duration::from_secs(QUERY_TIMEOUT_SECS)) {
+            Ok((out, false)) => Response::query(
+                id,
+                cap_output(&out.stdout),
+                cap_output(&out.stderr),
+                out.status.code().unwrap_or(1),
+            ),
+            Ok((_, true)) => {
+                Response::error(id, format!("scancel exceeded {QUERY_TIMEOUT_SECS}s and was killed"))
+            }
+            Err(e) => Response::error(id, format!("could not run scancel: {e}")),
+        }
     }
 
     /// Reclaim stale orphaned spool files — a stub that died before deleting its response,
@@ -482,6 +554,7 @@ mod tests {
             session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
+            submitted: Default::default(),
             project_dir: PathBuf::from("/work"),
         };
         broker.process_once().unwrap();
@@ -516,6 +589,7 @@ mod tests {
             session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
+            submitted: Default::default(),
             project_dir: PathBuf::from("/work"), // as if resolved from a clean, trusted project root
         };
         let req_json = format!(
@@ -536,6 +610,42 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // THE OWNERSHIP GATE. "Cancel my own jobs" must never become "cancel this user's
+    // jobs": the account also runs production work husk never submitted. The set is built
+    // from what sbatch returned, so an id the agent invents is refused by name.
+    #[test]
+    fn scancel_refuses_a_job_this_session_did_not_submit() {
+        let dir = scratch("cancel-own");
+        let broker = Broker {
+            spool: dir.clone(),
+            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
+            dry_run: true,
+            fs_policy: FsPolicy::default(),
+            submitted: Default::default(),
+            project_dir: PathBuf::from("/work"),
+        };
+        broker.submitted.borrow_mut().insert(4991406);
+
+        // Ours, including the array-task and step spellings of the same base id.
+        for t in ["4991406", "4991406_3", "4991406.0"] {
+            let r = broker.cancel("x", vec![t.to_string()]);
+            assert_eq!(r.status, "ok", "husk must cancel its own job {t}: {}", r.message);
+        }
+
+        // Someone else's — a neighbouring job id is the realistic mistake, and a plausible
+        // attack: an agent that guesses ids could otherwise cancel a human's production run.
+        let r = broker.cancel("x", vec!["4991407".to_string()]);
+        assert_eq!(r.status, "rejected");
+        assert!(r.message.contains("4991407"), "name the job refused: {}", r.message);
+        assert!(r.message.contains("did not submit"), "{}", r.message);
+
+        // All-or-nothing: one unowned id refuses the batch, so the agent is never told it
+        // stopped something it did not.
+        let r = broker.cancel("x", vec!["4991406".into(), "4991407".into()]);
+        assert_eq!(r.status, "rejected", "a mixed list must not partially cancel");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // F2/F16: a query that never exits must be killed at the timeout, not wedge the broker.
     #[test]
     fn gc_removes_stale_orphans_but_not_live_requests() {
@@ -549,6 +659,7 @@ mod tests {
             session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
+            submitted: Default::default(),
             project_dir: PathBuf::from("/work"),
         };
         // cutoff 0 => every orphan (any positive age) is stale and reclaimed.
