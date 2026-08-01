@@ -65,13 +65,34 @@ else
   echo "pidns: could not count processes inside a step ($out)"
 fi
 # The other half: two tasks of ONE step must see each other, or MPI has no peers to attach
-# to. Each task reports how many sibling tasks it can find by name.
-if out=$(srun -n2 sh -c 'sleep 1; n=0; for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in sleep) n=$((n+1));; esac; done; echo $n' 2>&1); then
-  lo=$(printf '%s\n' "$out" | sort -n | head -1)
-  if [ "${lo:-0}" -ge 2 ] 2>/dev/null; then
-    echo "pidns: ranks can see each other ($lo peers) — CMA has someone to attach to [expect]"
+# to. Each task holds a MARKER process alive and counts how many markers it can see.
+#
+# The marker has to outlive the count, which the first version got wrong: it ran `sleep 1`
+# in the FOREGROUND and then counted processes named sleep — by which time its own sleep had
+# exited and there was nothing to find. Both tasks counted 0 and the arm reported "ranks are
+# in SEPARATE pid namespaces, MPI cannot attach" on a Balfrin run where cma.peers had just
+# proved the opposite (2026-08-01). A probe that measures the wrong instant is worse than no
+# probe: it accuses the system of the failure it was written to detect.
+#
+# So: background a marker, wait long enough for BOTH tasks to have started theirs, count,
+# then kill it. One task alone counts 1 (its own); two sharing a namespace count 2.
+PEER_SCRIPT='sleep 8 & m=$!
+sleep 2
+n=0; for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in sleep) n=$((n+1));; esac; done
+echo $n
+kill $m 2>/dev/null'
+if out=$(srun -n2 sh -c "$PEER_SCRIPT" 2>&1); then
+  lo=$(printf '%s\n' "$out" | grep -E '^[0-9]+$' | sort -n | head -1)
+  if [ "${lo:-x}" = x ]; then
+    echo "pidns: peer check inconclusive - no count came back: $(printf '%s' "$out" | tr '\n' ' ' | head -c 100)"
+  elif [ "$lo" -ge 2 ]; then
+    echo "pidns: ranks can see each other ($lo markers) — CMA has someone to attach to [expect]"
+  elif [ "$lo" -eq 1 ]; then
+    echo "pidns: peers invisible - each rank saw only its own marker, so ranks are in SEPARATE pid namespaces and MPI will fail"
   else
-    echo "pidns: peers invisible - a rank found only $lo, so ranks are in SEPARATE pid namespaces and MPI will fail"
+    # Zero means not even our OWN marker was there, so the probe measured the wrong instant.
+    # That is a fault in this script, not in husk, and must not be reported as a breach.
+    echo "pidns: peer check inconclusive - a rank could not see even its own marker (probe timing)"
   fi
 else
   echo "pidns: could not run the peer-visibility check ($out)"

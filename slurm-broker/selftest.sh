@@ -582,6 +582,7 @@ run_srun_probe() {
       "pidns: a rank sees "*)     check FAIL containment steps.pidns   "a rank is in the HOST pid namespace - it can see and signal the step-broker" ;;
       "pidns: ranks can see each other"*) check PASS containment steps.pidns_peers "ranks can name each other - CMA/MPI has peers" ;;
       "pidns: peers invisible"*)  check FAIL containment steps.pidns_peers "ranks are in SEPARATE pid namespaces - MPI cannot attach" ;;
+      "pidns: peer check inconclusive"*) check INFO containment steps.pidns_peers "the peer probe measured the wrong instant - inconclusive, NOT a breach" ;;
       "pidns: could not"*)        check INFO containment steps.pidns   "pid-namespace check did not run" ;;
       "deny : --task-prolog refused"*) check PASS containment steps.allowlist "the step allowlist refused --task-prolog by husk's own message" ;;
       "deny : --task-prolog ACCEPTED"*) check FAIL containment steps.allowlist "--task-prolog accepted - a step can run code outside the rank cage" ;;
@@ -1301,7 +1302,11 @@ PY
     *"HUSK-CMA-OUTSIDE ALLOWED"*)
       echo "RESULT FAIL containment cma.outside a rank CAN read the un-caged step-broker - it holds MUNGE and the daemon route" ;;
     *"HUSK-CMA-OUTSIDE NOBROKER"*)
-      echo "RESULT INFO containment cma.outside no step-broker found in /proc - nothing to attempt" ;;
+      # Since ranks joined the job PID namespace this is the STRONGEST outcome, not a
+      # skipped check: the rank cannot enumerate the step-broker at all, so there is no
+      # target to attempt. Reporting it as INFO understated a result that is better than
+      # DENIED - denied means addressable and refused; this means not addressable.
+      echo "RESULT PASS containment cma.outside the step-broker is not even visible to a rank - the PID namespace removed the target" ;;
     *)
       echo "RESULT INFO containment cma.outside no verdict from the probe step" ;;
   esac
