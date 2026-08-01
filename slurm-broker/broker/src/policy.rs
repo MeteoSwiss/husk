@@ -1565,9 +1565,14 @@ mod tests {
     /// The three paths husk resolves from its own install location; they differ per machine
     /// and per build, so they are normalised out before comparing.
     fn normalized_guard(net: bool) -> String {
+        // The REAL cage arguments, not a synthetic stand-in. The first version of this
+        // passed a hand-written four-element list, so the snapshot covered the guard's
+        // control flow while the mount table — the actual enforcement boundary — could
+        // change underneath it without moving the file. Adding --unshare-pid was invisible
+        // to it, which is how I noticed.
         let script = wrap_script(
             "#!/bin/bash\n#SBATCH --nodes=1\nsrun hostname\n",
-            &["--ro-bind".into(), "/".into(), "/".into(), "--unshare-net".into()],
+            &FsPolicy::default().compute_bwrap_args("/work/project"),
             profile::Profile::SingleNode,
             "/work/project",
             net,
@@ -1637,6 +1642,7 @@ mod tests {
         assert!(g.contains("<HUSK_BROKER>"), "the broker path must be normalised: {g}");
         assert!(g.contains("seccomp-wrapper --profile=single-node bwrap"), "{g}");
         assert!(g.contains("--unshare-net"), "the cage args must survive verbatim: {g}");
+        assert!(g.contains("--unshare-pid"), "the job cage must carry its pid namespace: {g}");
         // Nothing machine-specific may leak into a committed file.
         assert!(!g.contains(env!("CARGO_MANIFEST_DIR")), "a build path leaked into the golden file");
     }

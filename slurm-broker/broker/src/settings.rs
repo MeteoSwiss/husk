@@ -574,6 +574,28 @@ impl FsPolicy {
         if kind == CageKind::Job {
             a.push("--tmpfs".into());
             a.push("/dev/shm".into());
+            // PID namespace — the JOB cage only, and the asymmetry is the whole point.
+            //
+            // What it buys: everything on a compute node runs as the same uid, so without
+            // this the job can see, signal and `process_vm_readv` every other process of
+            // ours on the node — including the un-caged step-broker and egress proxy, which
+            // deliberately hold what the cage removes (MUNGE, the daemon route, the one
+            // route out). Those are defended today by clearing PR_SET_DUMPABLE, which is a
+            // credentials check. A PID namespace is stronger and structural: the job cannot
+            // NAME them, so there is nothing to check. `--proc /proc` then shows only the
+            // job's own tree (measured: 5 entries instead of 429).
+            //
+            // Why NOT for a rank. `bwrap --pidns FD` is parent-only — with `--unshare-pid`
+            // it makes the given namespace the PARENT of a fresh one, and without it bwrap
+            // fails outright ("Can't send pid: Invalid argument", measured on 0.6.1). So
+            // ranks cannot JOIN a shared PID namespace the way they join the shared user
+            // namespace, and giving each rank `--unshare-pid` would put every rank in its
+            // own namespace where it cannot even name its peers. That is precisely how
+            // sibling USER namespaces broke Cray MPICH's Cross Memory Attach, and it is the
+            // same mistake one layer down. The job cage holds no ranks, so this costs
+            // nothing there; MPI started directly from the batch script stays in ONE
+            // namespace and keeps CMA.
+            a.push("--unshare-pid".into());
         }
         if kind == CageKind::Rank {
             for dev in FABRIC_DEVICES {
@@ -1128,6 +1150,38 @@ mod tests {
             !rank.contains("cxi_sbl"),
             "the admin base-link device is 0600 root and must never be bound: {rank}"
         );
+    }
+
+    // THE PID NAMESPACE IS THE JOB CAGE'S ALONE, and the asymmetry is load-bearing.
+    //
+    // A job in its own PID namespace cannot see, signal or process_vm_readv the un-caged
+    // step-broker and egress proxy — which is stronger than the PR_SET_DUMPABLE credentials
+    // check that defends them otherwise, because there is nothing left to name.
+    //
+    // A RANK must not have one. `bwrap --pidns FD` is parent-only (with `--unshare-pid` it
+    // makes the given namespace the parent of a fresh one; without it bwrap fails outright,
+    // "Can't send pid: Invalid argument", measured on 0.6.1), so ranks cannot join a shared
+    // PID namespace the way they join the shared user namespace. Giving each rank
+    // `--unshare-pid` would put every rank in its own namespace, unable to name its peers —
+    // which is exactly how sibling USER namespaces broke Cray MPICH's Cross Memory Attach
+    // and killed ICON. Same mistake, one layer down.
+    #[test]
+    fn only_the_job_cage_unshares_pids_because_a_rank_must_still_name_its_peers() {
+        let job = joined(&FsPolicy::default(), "/work");
+        let rank = FsPolicy::default().rank_bwrap_args("/work").join(" ");
+
+        assert!(
+            job.contains("--unshare-pid"),
+            "the job cage must hide the node's other processes: {job}"
+        );
+        assert!(
+            !rank.contains("--unshare-pid"),
+            "a rank in its own PID namespace cannot name its peers, so CMA dies exactly as \
+             it did with sibling user namespaces - ICON's failure: {rank}"
+        );
+        // ...and a fresh /proc is what makes the namespace visible as isolation rather than
+        // a flag: without it the cage would still show the host's process table.
+        assert!(job.contains("--proc /proc"), "{job}");
     }
 
     #[test]

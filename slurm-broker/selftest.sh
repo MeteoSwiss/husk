@@ -1051,6 +1051,33 @@ done
 # The mount table IS the cage: mechanism, not opinion, and no permission/prompt/
 # classifier layer stands in front of it. (No single quotes in this probe body — it is
 # embedded in a single-quoted string.)
+# The PID namespace. Everything on a compute node runs as the SAME uid, so without this
+# the job can see, signal and process_vm_readv every other process of ours on the node -
+# including the un-caged step-broker and egress proxy, which deliberately hold what the
+# cage removes (MUNGE, the daemon route, the one route out). PR_SET_DUMPABLE defends those
+# with a credentials check; a PID namespace is structural, because the job cannot NAME
+# them. The check is behavioural, not a flag read: count what is actually visible, and go
+# looking for the broker by name.
+_pids=$(ls /proc 2>/dev/null | grep -c "^[0-9]")
+echo "FP visible_pids $_pids"
+# Match on comm (the EXECUTABLE name), never on cmdline. The first version grepped
+# cmdline for husk-slurm-broker and reported a breach inside a perfectly isolated cage:
+# the probe shell has that string in its OWN command line, because the pattern is part of
+# the script. It found itself. Same blind spot as the CMA self-attach probe.
+# comm is truncated to 15 bytes, so husk-slurm-broker reads as husk-slurm-brok.
+_broker_seen=0
+for _p in /proc/[0-9]*; do
+  _c=$(cat "$_p/comm" 2>/dev/null) || continue
+  case "$_c" in husk-slurm-bro*) _broker_seen=$((_broker_seen + 1)) ;; esac
+done
+if [ "$_broker_seen" -gt 0 ]; then
+  echo "RESULT FAIL containment pid.isolated the job can see the un-caged step-broker in /proc ($_broker_seen match) - the PID namespace is not in force"
+elif [ "$_pids" -gt 50 ]; then
+  echo "RESULT FAIL containment pid.isolated the job sees $_pids processes - it is in the host PID namespace"
+else
+  echo "RESULT PASS containment pid.isolated the job sees only its own process tree ($_pids pids); the step-broker is not addressable"
+fi
+
 if [ -r /proc/self/mountinfo ]; then
   echo "FP mounts total=$(wc -l < /proc/self/mountinfo) tmpfs=$(grep -c tmpfs /proc/self/mountinfo)"
   root_mi=$(cut -d" " -f5,6 /proc/self/mountinfo | grep -m1 "^/ ")
