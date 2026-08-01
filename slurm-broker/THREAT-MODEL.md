@@ -255,8 +255,47 @@ glued spelling) were all *visible holes* in it:
 | **partition/account/qos** | `-p` (4 spellings) · `#SBATCH` · `SBATCH_PARTITION` | require+force exact partition; glued split (F14) | forced value wins; mismatch rejected |
 | **uenv/repo mount** (root, via slurmstepd) | `--uenv/--view/--repo` · `#SBATCH` · `SBATCH_UENV*` | strip CLI; **reject** body/env selection that differs from session or names `--repo` (F26) | reject dominates (never rewrite the body) |
 | **inherited env** | `--export` · `#SBATCH` · `SBATCH_EXPORT` | force `--export=ALL` on CLI in both branches (F24) | forced value wins; residual = env-secret masking (AV7) |
-| **node/resources** | `--nodes/--time/--mem/--gpus` … | parse → validate (per-option grammar) → re-emit canonically; reject unknown/invalid (`interpret_cli`) | allowlist by construction |
+| **node/resources** | `--nodes/--time/--mem/--gpus` … | parse → validate (per-option grammar) → re-emit canonically; reject unknown/invalid (`interpret_cli`) | allowlist by construction — **shape only, not magnitude**: see "The resource envelope" below |
 | **identity** | — (runs as you; MUNGE) | not settable via submission | n/a |
+
+### The resource envelope, and why the partition carries it
+
+On a shared cluster the realistic harm from a misbehaving agent is not reading
+`/etc/shadow` — it is burning node-hours, storming the scheduler, or delaying someone's
+production run. That is a different axis from containment, and husk answers it in one
+line rather than with parameter caps.
+
+**The forced partition is the control.** Every brokered job is required to request, and
+is forced onto, a single partition (`HUSK_SLURM_PARTITION`, recorded at install). Choose
+a **preemptible** one and the property is structural: a job on a preemptible partition is
+interrupted by any job on any other partition, so an agent's work **cannot block the
+machine** no matter how much of it there is. No cap, no accounting logic, no per-option
+magnitude checks — the scheduler enforces it, continuously, for free. That is why the
+resource validators in `sbatch::REGISTRY` deliberately check **shape, not magnitude**
+(charset + length; `v_array` accepts `1-100000`), and why that is a defensible position
+rather than an oversight: magnitude is bounded by the site's own QOS and by preemption,
+both of which exist whether husk does or not.
+
+Two things follow, and both matter:
+
+1. **The guarantee is a property of the CONFIGURED partition, not of husk.** If the
+   partition recorded at install is not actually preemptible, this control silently is
+   not there. It is worth confirming per site — `scontrol show partition <name>` and the
+   QOS's preempt settings — because nothing in husk can check it and nothing will fail
+   loudly if it is untrue. *(As of 2026-08-01 the code's default is `preemptible` while
+   the Balfrin deployment is configured to `short`; whether `short` carries the preempt
+   behaviour is unconfirmed.)*
+2. **Preemption is then a correctness risk, not just an annoyance.** A preempted run
+   leaves partial output. With `lrestart = .FALSE.` an ICON run that was interrupted
+   looks, to anything reading its output directory, much like one that finished — and an
+   agent may report that the science ran. For a weather service that is a worse failure
+   than an escape. Preemption must therefore be made **loudly distinguishable from
+   completion** in the job's output and in the husk job log. *(Open; not yet built.)*
+
+What husk does **not** bound: node-hours consumed against the account, and queue
+pressure. Whether it should is a question for the site rather than for this document —
+partition, QOS and account limits are the operator's instruments, and husk forcing a
+single partition is what makes them apply.
 
 Every row is now closed **by construction**: the broker builds the invocation from an
 allowlist (`sbatch::REGISTRY`) — Forced options forced, benign resource options parsed
