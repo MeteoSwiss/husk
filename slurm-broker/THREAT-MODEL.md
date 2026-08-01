@@ -174,14 +174,23 @@ Egress is off by default and, when configured, is **one hole of a shape husk cho
 
 ```
 rank/job cage (--unshare-net: no route at all)
-  socat TCP-LISTEN:3128 ──► <spool>/net.sock ──► husk proxy ──► the internet
-        (dumb relay)         (a FILE, not a route)  (outside the cage)
+  socat TCP-LISTEN:3128 ──► /tmp/husk-<uid>-<jobid>/net.sock ──► husk proxy ──► the internet
+        (dumb relay)          (a FILE, not a route; ro-bind)      (outside the cage)
 ```
 
 The socket crosses the network namespace because it is a **filesystem** object, not a
 route — the same reasoning that makes the `/run/munge` mount mask load-bearing rather than
-a syscall filter. Nothing is bind-mounted specially for it: it lives in the step spool,
-inside the workdir the cage already binds.
+a syscall filter.
+
+It lives in a short, node-local, owner-only directory rather than in the step spool,
+for two reasons. A unix address must fit in `sun_path` (108 bytes, kernel-fixed), and
+the spool path spent enough of that budget that a slightly deeper project would have
+lost its network with no explanation. And the spool is inside the workdir, which the
+cage binds **writable** — so the job could delete or replace its own socket. The
+directory is bound in read-only, which stops that; `connect(2)` still works through a
+read-only bind (measured, kernel 6.8). `/tmp` is world-writable and job ids are public,
+so husk creates the directory rather than accepting one, and the proxy re-checks owner
+and mode before binding: a directory it cannot own means no egress.
 
 Three properties are asserted rather than assumed, by `selftest.sh`:
 

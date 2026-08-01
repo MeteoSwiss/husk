@@ -204,6 +204,65 @@ fn all_contents_older_than(dir: &Path, age: std::time::Duration) -> bool {
     })
 }
 
+// ---- the egress socket ------------------------------------------------------
+
+/// `sizeof(sockaddr_un.sun_path)`. A kernel constant, not a tunable: a unix socket
+/// address that does not fit is refused by `bind()`, and there is no way to ask for more.
+pub const SUN_PATH_MAX: usize = 108;
+
+/// Vet the egress socket's path before binding it.
+///
+/// Two failures this turns from obscure into obvious:
+///
+/// 1. **Too long.** The socket used to live in the job's step spool, so its address was
+///    `<workdir>/.husk-step-spool-<jobid>/net.sock` — ~34 bytes of suffix on top of a
+///    project path. A real Balfrin project measured ~57 bytes total, i.e. it worked with
+///    under 20 to spare, and a project one or two directories deeper would have lost its
+///    network to a bare `AF_UNIX path too long`.
+///
+/// 2. **A directory we do not control.** The socket now lives in node-local `/tmp`, which
+///    is world-writable, and job ids are public in `squeue`. A directory an attacker
+///    pre-created is one they can put their own socket in — which would route this job's
+///    egress through their proxy. Owner-only and owned by us, or refuse to start: no
+///    egress is a safe outcome, egress through someone else's process is not.
+pub fn check_socket_path(path: &Path) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = path.as_os_str().as_bytes().len();
+    if len >= SUN_PATH_MAX {
+        return Err(format!(
+            "socket path is {len} bytes but a unix socket address holds at most {} \
+             (sun_path is fixed by the kernel): {}",
+            SUN_PATH_MAX - 1,
+            path.display()
+        ));
+    }
+    let parent = path.parent().ok_or_else(|| format!("{} has no parent", path.display()))?;
+    let md = std::fs::symlink_metadata(parent)
+        .map_err(|e| format!("cannot inspect {}: {e}", parent.display()))?;
+    if !md.is_dir() {
+        return Err(format!("{} is not a directory", parent.display()));
+    }
+    // SAFETY: getuid cannot fail and takes no arguments.
+    let me = unsafe { libc_getuid() };
+    if md.uid() != me {
+        return Err(format!(
+            "{} is owned by uid {}, not by uid {me} — refusing to put this job's egress \
+             through a directory it does not control",
+            parent.display(),
+            md.uid()
+        ));
+    }
+    if md.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is mode {:o}; it must not be group- or world-accessible, or another user \
+             on this node could replace the socket",
+            parent.display(),
+            md.mode() & 0o7777
+        ));
+    }
+    Ok(())
+}
+
 // ---- the session log --------------------------------------------------------
 
 /// Where the broker's session log goes: `~/.husk/log/husk-<utc>-<pid>.log`.
@@ -249,6 +308,7 @@ fn civil_from_days(z: i64) -> (i64, u64, u64) {
 mod tests {
     use super::*;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     fn scratch(tag: &str) -> PathBuf {
@@ -384,6 +444,59 @@ mod tests {
         // Root-owned on every system husk runs on, and the tests do not run as root.
         assert!(!owned_by_me(Path::new("/etc")), "a root-owned directory must not read as ours");
         assert!(!owned_by_me(Path::new("/nonexistent-husk-path")), "must fail closed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // The length limit is the reason the socket left the step spool. This pins the real
+    // measurement: the old layout on a realistic project path, versus the new one.
+    #[test]
+    fn socket_path_length_is_checked_against_the_kernel_limit() {
+        let dir = scratch("sockpath");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_socket_path(&dir.join("net.sock")).is_ok());
+
+        // The old layout: <workdir>/.husk-step-spool-<jobid>/net.sock. A project path of
+        // 80 characters is not exotic on scratch, and it does not fit.
+        let deep = PathBuf::from(format!("/scratch/{}", "d".repeat(70)))
+            .join(".husk-step-spool-4988019")
+            .join("net.sock");
+        let err = check_socket_path(&deep).expect_err("an over-long path must be refused");
+        assert!(err.contains("108") || err.contains("107"), "the message must name the limit: {err}");
+        assert!(err.contains("bytes"), "the message must give the actual length: {err}");
+
+        // Exactly at the boundary: 107 bytes fits, 108 does not.
+        let base = "/tmp/";
+        let ok = PathBuf::from(format!("{base}{}", "x".repeat(107 - base.len())));
+        let over = PathBuf::from(format!("{base}{}", "x".repeat(108 - base.len())));
+        assert_eq!(ok.as_os_str().len(), 107);
+        assert_eq!(over.as_os_str().len(), 108);
+        // Both have /tmp as parent, which is world-writable — so isolate the length check
+        // by asserting only on which error comes back.
+        assert!(!check_socket_path(&ok).is_err_and(|e| e.contains("sun_path")));
+        assert!(check_socket_path(&over).is_err_and(|e| e.contains("sun_path")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // /tmp is world-writable and job ids are public, so the directory the socket goes in
+    // is the thing an attacker would target. Refusing costs the job its network; not
+    // refusing could route the job's egress through someone else's proxy.
+    #[test]
+    fn socket_path_refuses_a_directory_we_do_not_control() {
+        let dir = scratch("sockdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(check_socket_path(&dir.join("net.sock")).is_ok(), "our own 0700 dir is fine");
+
+        for mode in [0o777, 0o770, 0o707, 0o701] {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            let err = check_socket_path(&dir.join("net.sock"))
+                .expect_err("a group/world-accessible directory must be refused");
+            assert!(err.contains("mode"), "{err}");
+        }
+
+        // Owned by root, not by us.
+        let err = check_socket_path(Path::new("/etc/net.sock"))
+            .expect_err("a directory owned by another user must be refused");
+        assert!(err.contains("owned by uid"), "{err}");
         let _ = fs::remove_dir_all(&dir);
     }
 

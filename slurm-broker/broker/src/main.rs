@@ -302,8 +302,16 @@ fn net_proxy_mode(args: &[String]) -> ! {
     }
     eprintln!("husk-proxy: allowing {}", raw.join(", "));
 
-    // A stale socket from a crashed predecessor would make bind() fail; the spool is
-    // per-job, so anything here is ours.
+    // Vet the address before binding it. Both failure modes this catches produce a job
+    // with no network, and the difference between a named cause and `AF_UNIX path too
+    // long` is a bring-up round. See check_socket_path.
+    if let Err(why) = husk_slurm_broker::check_socket_path(std::path::Path::new(&socket)) {
+        eprintln!("husk-proxy: refusing to bind the egress socket: {why}");
+        std::process::exit(1);
+    }
+
+    // A stale socket from a crashed predecessor would make bind() fail; the directory is
+    // per-job and owner-only (checked just above), so anything here is ours.
     let _ = std::fs::remove_file(&socket);
     let listener = match std::os::unix::net::UnixListener::bind(&socket) {
         Ok(l) => l,

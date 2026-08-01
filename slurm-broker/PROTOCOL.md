@@ -66,8 +66,8 @@ in* may be re-wired later (e.g. for `srun`/recursive brokering). Keep this versi
 
 ## The step spool (compute side)
 
-`<workdir>/.husk-step-spool-<jobid>/`, holding the srun request/response pair, the
-egress socket `net.sock`, and the bind target for `socat`. Per-job by construction,
+`<workdir>/.husk-step-spool-<jobid>/`, holding the srun request/response pair and
+the bind target for `socat`. Per-job by construction,
 and removed when the job ends — by name, then `rmdir`, never `rm -rf`: the cleanup
 runs with the user's rights in a directory the *job* can write, so a recursive
 delete would be a deletion primitive aimed at whatever else ended up there. If
@@ -79,6 +79,30 @@ That list must cover every file the guard creates. When egress was added it did 
 **every networked job leaked its spool**, silently, because the failing branch had
 nothing to report it. A test now derives the required names from the generated
 script rather than trusting the list.
+
+## The egress socket is not in the step spool
+
+`/tmp/husk-<uid>-<jobid>/net.sock`, node-local, mode 0700, bound **read-only** into
+the cage at the same path.
+
+A unix socket address must fit in `sun_path` — 108 bytes, fixed by the kernel, with
+no way to ask for more. In the step spool the address was
+`<workdir>/.husk-step-spool-<jobid>/net.sock`, ~34 bytes of suffix, leaving ~73 for
+the project path. A real Balfrin project measured ~57: it worked, with under 20
+bytes to spare, and a project a couple of directories deeper would have lost its
+network to a bare `AF_UNIX path too long`.
+
+`/tmp` is world-writable and job ids are public in `squeue`, so the directory is
+created with `mkdir` (no `-p`) at mode 0700 and the proxy re-checks owner and mode
+before binding. A directory husk cannot own means **no egress** — that is a safe
+outcome; egress routed through a directory someone else controls is not.
+
+Read-only into the cage, and the **directory** rather than the socket: the socket
+does not exist yet when bwrap runs (a bind with a missing source kills the cage),
+and binding the directory means the socket appears inside the moment the proxy
+creates it. Measured on 6.8: `connect(2)` works through a read-only bind under
+`--unshare-net`, and the job then cannot delete or replace its own socket — which
+it could when the socket sat in the writable spool.
 
 ## The session log is not in the spool
 

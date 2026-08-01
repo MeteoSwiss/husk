@@ -489,12 +489,45 @@ fn wrap_script(
   # Started BEFORE the step-broker on purpose: the step-broker inherits HUSK_NET_SOCK and
   # HUSK_SOCAT and passes them to each rank, so both have ONE origin instead of being
   # rebuilt from the job id in two places that could drift.
-  if [ -n "$_husk_spool" ]; then
-    _husk_net_sock="$_husk_spool/net.sock"
+  # The socket does NOT live in the step spool, and cannot.
+  #
+  # A unix socket address must fit in sun_path - 108 bytes, fixed by the kernel, with no
+  # way to ask for more. <workdir>/.husk-step-spool-<jobid>/net.sock spends ~34 of those
+  # on the suffix alone, so the budget for the project path was ~73 bytes. A real Balfrin
+  # project measured ~57: it worked, with under 20 to spare, and a project a couple of
+  # directories deeper would have lost its network to a bare "AF_UNIX path too long".
+  #
+  # So: a short, node-local, per-job directory instead. `mkdir` without -p and mode 0700,
+  # because /tmp is world-writable and job ids are public in squeue - a directory someone
+  # else pre-created is one they could put their own socket in, which would route this
+  # job's egress through their proxy. If we cannot own it, the job gets no network; the
+  # proxy re-checks ownership and mode before binding, so the shell only proposes.
+  #
+  # It is bound into the cage READ-ONLY. Measured on 6.8: connect(2) works fine through a
+  # read-only bind under --unshare-net, and the job then cannot delete or replace its own
+  # socket - which it could when the socket sat in the writable spool.
+  _husk_net_dir="/tmp/husk-$(id -u 2>/dev/null || echo u)-${{SLURM_JOB_ID:-nojob}}"
+  mkdir -m 700 "$_husk_net_dir" 2>/dev/null || true
+  if [ -d "$_husk_net_dir" ] && [ -O "$_husk_net_dir" ]; then
+    chmod 700 "$_husk_net_dir" 2>/dev/null
+    rm -f "$_husk_net_dir/net.sock" 2>/dev/null
+    _husk_net_sock="$_husk_net_dir/net.sock"
     "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD" \
       >>"$_husk_log" 2>&1 &
     _husk_net_pid=$!
     export HUSK_NET_SOCK="$_husk_net_sock"
+    # The DIRECTORY, not the socket: the socket does not exist yet, and a bwrap bind with
+    # a missing source kills the cage outright. Binding the directory also means the
+    # socket appears inside the moment the proxy creates it.
+    _husk_extra+=(--ro-bind "$_husk_net_dir" "$_husk_net_dir")
+  else
+    # Report BEFORE clearing the variable - naming the path is the whole point of the
+    # message, and an unattributed "no network" is exactly the failure mode husk keeps
+    # having to fix.
+    echo "husk: could not create a private $_husk_net_dir, so this job gets no network." >&2
+    echo "husk:   that path exists and is not a directory this job owns. husk will not" >&2
+    echo "husk:   route a job's egress through a directory it does not control." >&2
+    _husk_net_dir=
   fi
 "#
             ),
@@ -623,6 +656,13 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   # The egress proxy holds the one route out of this job, so it dies WITH the job for the\n\
   # same reason the step-broker does. It sets PR_SET_PDEATHSIG too; this is the belt.\n\
   [ -n \"${{_husk_net_pid:-}}\" ] && kill \"$_husk_net_pid\" 2>/dev/null\n\
+  # ...and the node-local directory its socket lived in. Same rule as the step spool:\n\
+  # by name, then rmdir, so anything else in there keeps the directory instead of being\n\
+  # deleted. /tmp is node-local, so this is the only chance to clean it up.\n\
+  if [ -n \"${{_husk_net_dir:-}}\" ] && [ -d \"$_husk_net_dir\" ]; then\n\
+    rm -f \"$_husk_net_dir/net.sock\" 2>/dev/null\n\
+    rmdir \"$_husk_net_dir\" 2>/dev/null\n\
+  fi\n\
   # --- husk: remove the step spool ---\n\
   # Per-JOB and worthless the moment the job ends, but it is created in the user's working\n\
   # directory, so one left behind per job turns an active project into a litter tray. It is\n\
@@ -1202,12 +1242,13 @@ mod tests {
         assert!(script.contains("if [ -r "), "{script}");
     }
 
-    /// Every `"$_husk_spool/<name>"` literal in a generated script, i.e. every file the
-    /// guard puts in the step spool.
-    fn spool_files_created_by(script: &str) -> std::collections::BTreeSet<String> {
+    /// Every `"$<var>/<name>"` literal in a generated script, i.e. every file the guard
+    /// puts in one of the directories it creates.
+    fn files_created_under(script: &str, var: &str) -> std::collections::BTreeSet<String> {
         let mut names = std::collections::BTreeSet::new();
-        for (_, rest) in script.match_indices("$_husk_spool/").map(|(i, _)| {
-            (i, &script[i + "$_husk_spool/".len()..])
+        let needle = format!("${var}/");
+        for (_, rest) in script.match_indices(&needle).map(|(i, _)| {
+            (i, &script[i + needle.len()..])
         }) {
             let name: String = rest
                 .chars()
@@ -1227,10 +1268,11 @@ mod tests {
     // just fails and the directory stays. Egress did exactly that (net.sock, socat,
     // net-proxy.log), so every networked job leaked a spool.
     //
-    // This asserts the property rather than the list: whatever the guard creates in the
-    // spool, the cleanup must name.
+    // This asserts the property rather than the list: whatever the guard creates in a
+    // directory of its own, the cleanup must name. Both directories, because the egress
+    // socket moved into a second one and the same trap applies there.
     #[test]
-    fn every_file_the_guard_creates_in_the_step_spool_is_cleaned_up() {
+    fn every_file_the_guard_creates_in_its_own_directories_is_cleaned_up() {
         for net in [false, true] {
             let script = wrap_script(
                 "#!/bin/bash\ntrue\n",
@@ -1240,9 +1282,11 @@ mod tests {
                 net,
                 &["/work".to_string()],
             );
+            // Everything from the cleanup marker to the end of the guard: the step spool
+            // block and the egress-directory block both live in there.
             let block = script
                 .split_once("# --- husk: remove the step spool")
-                .map(|(_, rest)| rest.split_once("fi\n").map(|(c, _)| c).unwrap_or(rest))
+                .map(|(_, rest)| rest.split_once("if [ \"$_husk_rc\"").map(|(c, _)| c).unwrap_or(rest))
                 .unwrap_or_else(|| panic!("no marked cleanup block in the guard:\n{script}"));
             // CODE ONLY. The first version of this test searched the whole block, and the
             // comment explaining the net.sock leak contains the string "net.sock" — so the
@@ -1253,18 +1297,20 @@ mod tests {
                 .filter(|l| !l.trim_start().starts_with('#'))
                 .collect::<Vec<_>>()
                 .join("\n");
-            for name in spool_files_created_by(&script) {
-                // A glob in the cleanup covers the family it matches.
-                let covered = cleanup.contains(&name)
-                    || name
-                        .split_once('-')
-                        .is_some_and(|(p, _)| cleanup.contains(&format!("{p}-*")));
-                assert!(
-                    covered,
-                    "the guard creates '{name}' in the step spool but the cleanup never \
-                     removes it, so rmdir fails and the spool is left behind (net={net})\n\
-                     --- cleanup block ---\n{cleanup}"
-                );
+            for var in ["_husk_spool", "_husk_net_dir"] {
+                for name in files_created_under(&script, var) {
+                    // A glob in the cleanup covers the family it matches.
+                    let covered = cleanup.contains(&name)
+                        || name
+                            .split_once('-')
+                            .is_some_and(|(p, _)| cleanup.contains(&format!("{p}-*")));
+                    assert!(
+                        covered,
+                        "the guard creates '{name}' in ${var} but the cleanup never removes \
+                         it, so rmdir fails and the directory is left behind (net={net})\n\
+                         --- cleanup block ---\n{cleanup}"
+                    );
+                }
             }
         }
     }

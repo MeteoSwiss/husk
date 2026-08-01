@@ -750,8 +750,65 @@ else
   else
     check FAIL lifecycle guard.log_announced "the job never said where its husk log is"
   fi
+
+  # G4 — the egress socket is short, private, and node-local. A unix address must fit in
+  # sun_path (108 bytes, kernel-fixed); the socket used to live in the step spool, where
+  # the address was <workdir>/.husk-step-spool-<jobid>/net.sock and a project a couple of
+  # directories deeper than the ones we tested silently lost its network.
+  GSOCK="$(grep -o "husk-proxy: listening on [^ ]*" "$GJOB/home/.husk/log/job-990001.log" | awk '{print $4}')"
+  GSOCKDIR="$(dirname "${GSOCK:-/nonexistent}")"
+  if [ -n "$GSOCK" ] && [ "${#GSOCK}" -lt 108 ] && [ "${GSOCK#$GJOB/work}" = "$GSOCK" ]; then
+    check PASS lifecycle guard.sock_short "egress socket is ${#GSOCK} bytes and outside the workdir: $GSOCK"
+  else
+    check FAIL lifecycle guard.sock_short "egress socket is '${GSOCK:-<never bound>}' (${#GSOCK} bytes)"
+  fi
+  # ...and it is removed with the job. /tmp is node-local, so this is the only chance.
+  if [ ! -d "$GSOCKDIR" ]; then
+    check PASS lifecycle guard.sock_cleaned "the job removed its egress socket directory"
+  else
+    check FAIL lifecycle guard.sock_cleaned "$GSOCKDIR survived the job: $(ls -A "$GSOCKDIR" | tr '\n' ' ')"
+  fi
 fi
 rm -rf "$GJOB"
+
+# G5 — the case the move was FOR: a workdir deep enough that the old layout could not have
+# bound at all. Runs the whole guard from it and checks the proxy came up.
+GDEEP="$PWORK/$(python3 -c "print('/'.join('deepdir%02d'%i for i in range(8)))" 2>/dev/null)"
+if [ -z "$GDEEP" ] || [ "$GDEEP" = "$PWORK/" ]; then
+  check SKIP lifecycle guard.sock_deep "no python3 to build a deep path"
+else
+  GD=/tmp/husk-selftest-deep.$$
+  rm -rf "$GD"; mkdir -p "$GD/home/.claude" "$GD/spool" "$GD/bin" "$GDEEP"
+  printf '{"sandbox":{"network":{"allowedDomains":["example.com:443"]}}}\n' > "$GD/home/.claude/settings.json"
+  cat > "$GD/bin/seccomp-wrapper" <<'EOF'
+#!/bin/bash
+while [ "$1" != "--" ] && [ $# -gt 0 ]; do shift; done
+shift
+exec "$@"
+EOF
+  chmod +x "$GD/bin/seccomp-wrapper"
+  cat > "$GD/spool/req-deep.json" <<JSON
+{"version":1,"id":"deep","tool":"sbatch","submitted_at":"t","cwd":"$GDEEP",
+ "argv":["--partition=$PART"],
+ "script":{"source":"file","name":"j.sh","body":"#!/bin/bash\n#SBATCH --nodes=1\necho DEEP-INNER-RAN\n"},
+ "job_args":[],"env":{}}
+JSON
+  ( cd "$GDEEP" && HOME="$GD/home" "$BROKER" --dry-run --once --spool "$GD/spool" ) \
+    >"$GD/dryrun.out" 2>>"$BROKER_LOG"
+  if [ ! -s "$GD/spool/job-deep.sh" ]; then
+    check FAIL lifecycle guard.sock_deep "the broker staged no script for the deep workdir"
+  else
+    ( export PATH="$GD/bin:$PATH" HOME="$GD/home" SLURM_JOB_ID=990002
+      cd "$GDEEP" && bash "$GD/spool/job-deep.sh" ) >"$GD/job.out" 2>"$GD/job.err"
+    OLDLEN=$(( ${#GDEEP} + 34 ))   # what <workdir>/.husk-step-spool-<jobid>/net.sock would be
+    if grep -q "husk-proxy: listening on" "$GD/home/.husk/log/job-990002.log" 2>/dev/null; then
+      check PASS lifecycle guard.sock_deep "egress came up from a ${#GDEEP}-byte workdir (old layout would have needed $OLDLEN of 107)"
+    else
+      check FAIL lifecycle guard.sock_deep "the proxy never bound from a ${#GDEEP}-byte workdir: $(tail -2 "$GD/home/.husk/log/job-990002.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+  fi
+  rm -rf "$GD" "$PWORK/deepdir00"
+fi
 
 # ============================ CONTAINMENT TIER =================================
 # The live piece: submit fixed probes THROUGH the broker, let it re-cage each job,
