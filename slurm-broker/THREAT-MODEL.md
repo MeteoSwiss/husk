@@ -282,9 +282,21 @@ Two things follow, and both matter:
    partition recorded at install is not actually preemptible, this control silently is
    not there. It is worth confirming per site — `scontrol show partition <name>` and the
    QOS's preempt settings — because nothing in husk can check it and nothing will fail
-   loudly if it is untrue. *(As of 2026-08-01 the code's default is `preemptible` while
-   the Balfrin deployment is configured to `short`; whether `short` carries the preempt
-   behaviour is unconfirmed.)*
+   loudly if it is untrue.
+
+   **Choosing it is a supervision-mode decision, and operators should make it
+   deliberately:**
+
+   | you are… | choose | because |
+   |---|---|---|
+   | watching the agent, iterating, want a job to start *now* | a short/interactive partition | turnaround beats the guarantee; a human in the loop is the control |
+   | letting an agent run for hours or weeks unattended | a **preemptible** partition | nobody is watching, so the machine must be the one that cannot be blocked |
+
+   Balfrin is currently configured to `short` for exactly the first reason —
+   deliberately, with a human in the loop. Whether `short` also carries the preempt
+   behaviour is unconfirmed as of 2026-08-01; the code's default remains `preemptible`.
+   The point is that this is a knob the operator must set to match how the agent will be
+   used, not a value to inherit.
 2. **Preemption is then a correctness risk, not just an annoyance.** A preempted run
    leaves partial output. With `lrestart = .FALSE.` an ICON run that was interrupted
    looks, to anything reading its output directory, much like one that finished — and an
