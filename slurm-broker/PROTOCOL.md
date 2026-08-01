@@ -100,9 +100,11 @@ outcome; egress routed through a directory someone else controls is not.
 Read-only into the cage, and the **directory** rather than the socket: the socket
 does not exist yet when bwrap runs (a bind with a missing source kills the cage),
 and binding the directory means the socket appears inside the moment the proxy
-creates it. Measured on 6.8: `connect(2)` works through a read-only bind under
-`--unshare-net`, and the job then cannot delete or replace its own socket — which
-it could when the socket sat in the writable spool.
+creates it. `connect(2)` works through a read-only bind under `--unshare-net` —
+measured on 6.8, then confirmed on the kernel that matters when `net.live` fetched
+through this socket on Balfrin (5.14.21, Cray Shasta, 2026-08-01). The job then
+cannot delete or replace its own socket — which it could when the socket sat in the
+writable spool.
 
 ## The session log is not in the spool
 

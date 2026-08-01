@@ -503,9 +503,11 @@ fn wrap_script(
   # job's egress through their proxy. If we cannot own it, the job gets no network; the
   # proxy re-checks ownership and mode before binding, so the shell only proposes.
   #
-  # It is bound into the cage READ-ONLY. Measured on 6.8: connect(2) works fine through a
-  # read-only bind under --unshare-net, and the job then cannot delete or replace its own
-  # socket - which it could when the socket sat in the writable spool.
+  # It is bound into the cage READ-ONLY. connect(2) works fine through a read-only bind
+  # under --unshare-net - measured on 6.8, then confirmed on the kernel that matters when
+  # net.live fetched through this socket on Balfrin (5.14.21, Cray Shasta, 2026-08-01).
+  # The job then cannot delete or replace its own socket, which it could when the socket
+  # sat in the writable spool.
   _husk_net_dir="/tmp/husk-$(id -u 2>/dev/null || echo u)-${{SLURM_JOB_ID:-nojob}}"
   mkdir -m 700 "$_husk_net_dir" 2>/dev/null || true
   if [ -d "$_husk_net_dir" ] && [ -O "$_husk_net_dir" ]; then

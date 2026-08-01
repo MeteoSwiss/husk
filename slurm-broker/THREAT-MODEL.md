@@ -188,7 +188,8 @@ the spool path spent enough of that budget that a slightly deeper project would 
 lost its network with no explanation. And the spool is inside the workdir, which the
 cage binds **writable** — so the job could delete or replace its own socket. The
 directory is bound in read-only, which stops that; `connect(2)` still works through a
-read-only bind (measured, kernel 6.8). `/tmp` is world-writable and job ids are public,
+read-only bind (measured on 6.8; confirmed on Balfrin's 5.14.21 by `net.live`, which
+fetches through exactly this socket). `/tmp` is world-writable and job ids are public,
 so husk creates the directory rather than accepting one, and the proxy re-checks owner
 and mode before binding: a directory it cannot own means no egress.
 
