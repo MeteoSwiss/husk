@@ -1546,6 +1546,101 @@ mod tests {
         }
     }
 
+    // ---- golden output: the guard as a readable artifact -----------------------------
+    //
+    // The guard is ~180 lines of shell assembled from Rust string literals, so a
+    // one-character change to it produces a diff nobody can read AS SHELL. That is a tax on
+    // exactly the file that most needs review, and it is why every guard bug so far
+    // (`{socat_q}` leaking literally, the srun bind shipping with literal quotes,
+    // `_husk_broker` used before assignment) was invisible until hardware ran it.
+    //
+    // Snapshotting the emitted script fixes the reviewability half: any change to the guard
+    // now shows up in `git diff` as a diff of the actual program that runs on the compute
+    // node. It is also the oracle that would make a future rewrite (see the deferred typed
+    // builder) checkable rather than an act of faith — "prove the bytes are identical".
+    //
+    // Regenerate deliberately, never casually:  HUSK_UPDATE_GOLDEN=1 cargo test
+    // and READ the resulting diff — it is the whole point of the file.
+
+    /// The three paths husk resolves from its own install location; they differ per machine
+    /// and per build, so they are normalised out before comparing.
+    fn normalized_guard(net: bool) -> String {
+        let script = wrap_script(
+            "#!/bin/bash\n#SBATCH --nodes=1\nsrun hostname\n",
+            &["--ro-bind".into(), "/".into(), "/".into(), "--unshare-net".into()],
+            profile::Profile::SingleNode,
+            "/work/project",
+            net,
+            &["/work/project".to_string(), "/scratch/shared".to_string()],
+        );
+        let (broker, stub, socat) = husk_paths();
+        // Longest first: the three share a prefix, and replacing a shorter one first would
+        // corrupt the others.
+        let mut subs = [(broker, "<HUSK_BROKER>"), (stub, "<HUSK_STUB>"), (socat, "<HUSK_SOCAT>")];
+        subs.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        let mut out = script;
+        for (path, placeholder) in subs {
+            if !path.is_empty() {
+                out = out.replace(&path, placeholder);
+            }
+        }
+        out
+    }
+
+    fn check_golden(name: &str, actual: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name);
+        if std::env::var_os("HUSK_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, actual).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("cannot read {}: {e}\nrun: HUSK_UPDATE_GOLDEN=1 cargo test", path.display())
+        });
+        if expected != actual {
+            // Point at the first differing line: the whole script is too long to eyeball.
+            let (mut le, mut la) = (expected.lines(), actual.lines());
+            let mut n = 0;
+            loop {
+                n += 1;
+                match (le.next(), la.next()) {
+                    (Some(a), Some(b)) if a == b => continue,
+                    (a, b) => panic!(
+                        "the generated guard changed and {} was not updated.\n\
+                         first difference at line {n}:\n  golden: {:?}\n  actual: {:?}\n\n\
+                         If the change is intended: HUSK_UPDATE_GOLDEN=1 cargo test, then \
+                         READ the diff — this file is the program that runs on the compute node.",
+                        path.display(),
+                        a.unwrap_or("<end of file>"),
+                        b.unwrap_or("<end of file>"),
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn golden_guard_without_egress() {
+        check_golden("guard-net-off.sh", &normalized_guard(false));
+    }
+
+    #[test]
+    fn golden_guard_with_egress() {
+        check_golden("guard-net-on.sh", &normalized_guard(true));
+    }
+
+    // The snapshot only means something if it is the script that actually runs. Pin the two
+    // properties that make it so, in case a future edit normalises away something real.
+    #[test]
+    fn the_golden_guard_is_the_real_script_with_only_paths_normalised() {
+        let g = normalized_guard(true);
+        assert!(g.contains("<HUSK_BROKER>"), "the broker path must be normalised: {g}");
+        assert!(g.contains("seccomp-wrapper --profile=single-node bwrap"), "{g}");
+        assert!(g.contains("--unshare-net"), "the cage args must survive verbatim: {g}");
+        // Nothing machine-specific may leak into a committed file.
+        assert!(!g.contains(env!("CARGO_MANIFEST_DIR")), "a build path leaked into the golden file");
+    }
+
     // husk forces every job onto one partition; on a preemptible one anything from another
     // partition interrupts it. That is what keeps an agent from blocking the machine, and
     // its cost is partial output. A model that does not checkpoint (ICON with
