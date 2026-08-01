@@ -237,6 +237,60 @@ else
   check FAIL policy sbatch.no_partition "status=$(respfield p2 status) msg=$(respfield p2 message)"
 fi
 
+# P2b — the refusal must not read as a claim about the CLUSTER.
+# A caged agent hit this guard on 2026-08-01, checked sinfo, saw `normal` up with 28 idle
+# nodes, and read "only --partition=short is permitted here" as a possibly SPOOFED message
+# — spending calls corroborating before it would act on it. Availability is not
+# authorization; the message has to name husk as the restricting party and concede that
+# other partitions exist.
+P2B_MSG="$(respfield p2 message)"
+if printf '%s' "$P2B_MSG" | grep -q "husk" \
+   && printf '%s' "$P2B_MSG" | grep -qi "idle\|availability" \
+   && ! printf '%s' "$P2B_MSG" | grep -q "is permitted here"; then
+  check PASS policy sbatch.refusal_attributed "the refusal names husk and does not claim other partitions are down"
+else
+  check FAIL policy sbatch.refusal_attributed "refusal reads as a claim about the cluster: ${P2B_MSG:0:120}"
+fi
+
+# P2c — the refusal is byte-identical on retry. That agent's report was explicit that the
+# repeat is what let it conclude "standing policy" rather than "transient failure"; an
+# intermittent-looking gate "would likely have gotten a blind retry instead".
+reset_spool
+mkreq p2r sbatch '["--nodes=1"]' "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p2r"
+if [ "$(respfield p2r message)" = "$P2B_MSG" ]; then
+  check PASS policy sbatch.refusal_stable "the refusal is identical on retry (reads as standing policy)"
+else
+  check FAIL policy sbatch.refusal_stable "the refusal changed between identical requests"
+fi
+
+# P2d — the ACCEPTED path warns about the wall limit it just inherited. husk forces every
+# job onto one partition, so it moves jobs somewhere with limits their author never chose.
+# The same agent's job silently took 30 minutes and it only learned that from squeue
+# afterwards: harmless at 7 minutes, fatal for a longer run. Needs a real scontrol, so it
+# skips where there is no SLURM.
+reset_spool
+mkreq p2t sbatch "[\"--partition=$PART\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p2t"
+P2T_MSG="$(respfield p2t message)"
+if ! scontrol show partition "$PART" >/dev/null 2>&1; then
+  check SKIP policy sbatch.time_warned "no scontrol here — husk cannot read the partition's limits"
+elif printf '%s' "$P2T_MSG" | grep -q -- "--time"; then
+  check PASS policy sbatch.time_warned "an untimed submission is told the limit it inherits: ${P2T_MSG:0:60}"
+else
+  check FAIL policy sbatch.time_warned "accepted with no word about the inherited wall limit (msg='${P2T_MSG:0:80}')"
+fi
+
+# P2e — and a submission that CHOSE a limit is not lectured about it.
+reset_spool
+mkreq p2u sbatch "[\"--partition=$PART\",\"--time=02:00:00\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p2u"
+if [ -z "$(respfield p2u message)" ]; then
+  check PASS policy sbatch.time_quiet "a submission that sets --time is not lectured about limits"
+else
+  check FAIL policy sbatch.time_quiet "warned a submission that chose its own --time: $(respfield p2u message)"
+fi
+
 # P3 — a wrong partition is rejected.
 reset_spool
 mkreq p3 sbatch "[\"--partition=${PART}-nope\"]" "$PWORK" "$VALID_BODY"

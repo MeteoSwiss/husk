@@ -175,11 +175,14 @@ impl Broker {
             println!("argv: {argv:?}");
             println!("---- staged script ({}) ----", script_path.display());
             println!("{}", sub.wrapped_script);
-            return Response::submitted(id, 0);
+            // The note too. A dry run exists to show what a real submission WOULD return,
+            // so anything the live path attaches must be attached here — otherwise the one
+            // mode the tests can observe is the one mode that behaves differently.
+            return Response::submitted(id, 0).with_note(sub.note);
         }
 
         let resp = match run_sbatch(&argv) {
-            Ok(job_id) => Response::submitted(id, job_id),
+            Ok(job_id) => Response::submitted(id, job_id).with_note(sub.note),
             Err(e) => Response::error(id, e),
         };
         // sbatch has copied the script into SLURM's own spool by the time it returns, so
@@ -476,7 +479,7 @@ mod tests {
 
         let broker = Broker {
             spool: dir.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into() },
+            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             project_dir: PathBuf::from("/work"),
@@ -510,7 +513,7 @@ mod tests {
 
         let broker = Broker {
             spool: spool.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into() },
+            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             project_dir: PathBuf::from("/work"), // as if resolved from a clean, trusted project root
@@ -543,7 +546,7 @@ mod tests {
         fs::write(dir.join("req-live.json"), b"{}").unwrap();
         let broker = Broker {
             spool: dir.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into() },
+            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             project_dir: PathBuf::from("/work"),

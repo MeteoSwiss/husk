@@ -204,6 +204,13 @@ def main():
         if status == "submitted":
             # Mirror real sbatch's success line so the agent's tooling parses it.
             print(f"Submitted batch job {resp.get('job_id')}")
+            # Advice (e.g. the wall limit this job just inherited) goes to STDERR, where
+            # real sbatch puts its own warnings — stdout stays exactly the line above so
+            # anything parsing it is unaffected. A guardrail that moves a job somewhere
+            # with different limits should say so at submit time, not leave it to squeue.
+            note = resp.get("message", "")
+            if note:
+                sys.stderr.write(f"{tool_name()}: husk: {note.strip()}\n")
             sys.exit(int(resp.get("exit_code", 0)))
         die(resp.get("message", "submission rejected by broker"),
             code=int(resp.get("exit_code", 1)))

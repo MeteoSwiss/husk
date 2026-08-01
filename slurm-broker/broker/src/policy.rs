@@ -21,6 +21,41 @@ pub struct Submission {
     pub job_args: Vec<String>,
     /// The script content to stage and submit (snapshot + re-exec guard).
     pub wrapped_script: String,
+    /// Advice to print on a SUCCESSFUL submit, or empty. Goes to the submitter's stderr,
+    /// where real sbatch puts its own warnings, so stdout stays the bare
+    /// `Submitted batch job N` that tooling parses.
+    pub note: String,
+}
+
+/// Tell a submission what wall limit it is about to inherit — but only when it did not
+/// choose one, and only from numbers SLURM gave us.
+///
+/// husk forces every job onto one partition, so it moves jobs somewhere with limits their
+/// author never picked. A caged agent's job silently inherited 30 minutes on 2026-08-01
+/// and it only noticed from `squeue` afterwards; at 7 minutes that was harmless, but a
+/// longer run would have died mid-flight with nothing said at submit time.
+///
+/// Deliberately hedged on the QOS: a site QOS can lower the effective limit below the
+/// partition's, and husk cannot see that from here. So this reports what it read, says
+/// where it read it, and gives the action that is right regardless - set `--time`.
+fn time_limit_note(session: &Session, submission_sets_time: bool) -> String {
+    if submission_sets_time || session.limits.is_empty() {
+        return String::new();
+    }
+    let p = &session.required_partition;
+    let mut s = format!(" This job sets no --time, so it takes partition {p}'s");
+    match (&session.limits.default_time, &session.limits.max_time) {
+        (Some(d), Some(m)) => s.push_str(&format!(" default limit of {d} (max {m})")),
+        (Some(d), None) => s.push_str(&format!(" default limit of {d}")),
+        (None, Some(m)) => s.push_str(&format!(" limit, at most {m}")),
+        (None, None) => unreachable!("is_empty() returned false"),
+    }
+    s.push_str(
+        "; a site QOS may lower that. Note this is NOT sinfo's TIMELIMIT column, which \
+         shows the maximum, not what an untimed job gets. Set --time explicitly if the \
+         job needs longer.",
+    );
+    s
 }
 
 pub fn decide(
@@ -71,13 +106,33 @@ pub fn decide(
     let required = session.required_partition.as_str();
     let partition = sbatch::option_value(&cli, &["-p", "--partition"])
         .or_else(|| sbatch::option_value(&directives, &["-p", "--partition"]));
+    // Whether the submission chose its own wall clock. Checked across CLI *and* #SBATCH,
+    // like the partition, because a run script's directive counts as the author choosing.
+    let sets_time = sbatch::option_value(&cli, &["-t", "--time"])
+        .or_else(|| sbatch::option_value(&directives, &["-t", "--time"]))
+        .is_some();
+    let time_note = time_limit_note(session, sets_time);
+
     match partition.as_deref() {
         Some(p) if p == required => {}
         _ => {
+            // AUTHORIZATION, NOT AVAILABILITY. The previous wording was "Only
+            // --partition=X is permitted here", and a caged agent checked `sinfo`, saw
+            // `normal` up with 28 idle nodes, and read the contradiction as a possibly
+            // SPOOFED message - spending calls corroborating before it would act. Naming
+            // husk as the restricting party, and conceding that other partitions exist and
+            // may be idle, removes the contradiction instead of asking to be believed.
+            //
+            // The rest keeps what that agent reported worked: constraint, remedy and
+            // rationale in one line, and byte-identical on every retry - which is what let
+            // it conclude "standing policy" rather than "transient failure" and stop
+            // retrying blind.
             return Decision::Reject(format!(
-                "Only --partition={required} is permitted here. Resubmit with \
-                 --partition={required}. It is the partition all brokered jobs run on \
-                 (typically preemptible/low-priority, so checkpoint your work)."
+                "husk submits brokered jobs only to --partition={required}; resubmit with \
+                 --partition={required}. Other partitions may exist and be idle - this is \
+                 husk's restriction on brokered jobs, not the cluster's availability. \
+                 {required} is typically preemptible/low-priority, so checkpoint your \
+                 work.{time_note}"
             ));
         }
     }
@@ -272,6 +327,10 @@ pub fn decide(
 
     Decision::Submit(Submission {
         options,
+        // The same warning the rejection carries, on the path that actually bit: a job
+        // that asked for the right partition and no --time is accepted, and only finds
+        // out about the limit from squeue afterwards.
+        note: time_note,
         job_args: req.job_args.clone(),
         wrapped_script: wrap_script(
             &req.script.body,
@@ -899,13 +958,138 @@ mod tests {
     }
 
     fn no_uenv() -> Session {
-        Session { uenv: None, view: None, required_partition: "preemptible".into() }
+        Session { uenv: None, view: None, required_partition: "preemptible".into(), limits: Default::default() }
+    }
+
+    /// A session that knows the partition's limits, as a real broker does after asking
+    /// scontrol at startup.
+    fn with_limits() -> Session {
+        Session {
+            limits: crate::session::PartitionLimits {
+                default_time: Some("00:30:00".into()),
+                max_time: Some("01:00:00".into()),
+            },
+            ..no_uenv()
+        }
+    }
+
+    // A caged agent that hit the partition guard on 2026-08-01 reported the message read
+    // as possibly SPOOFED: it said "only --partition=short is permitted here" while sinfo
+    // showed `normal` up with 28 idle nodes. It spent extra calls corroborating before it
+    // would act. Availability is not authorization, and the message must not appear to
+    // claim otherwise.
+    #[test]
+    fn the_partition_refusal_separates_authorization_from_availability() {
+        let d = decide(
+            &req_in(std::path::Path::new("/work"), &["--partition=normal"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::default(),
+            std::path::Path::new("/work"),
+        );
+        let Decision::Reject(why) = d else { panic!("the wrong partition must be refused") };
+        assert!(why.contains("husk"), "the message must name the restricting party: {why}");
+        assert!(
+            why.contains("may exist and be idle") || why.contains("not the cluster's availability"),
+            "the message must concede that other partitions exist: {why}"
+        );
+        assert!(
+            !why.contains("is permitted here"),
+            "the old wording read as a claim about the cluster, not about husk: {why}"
+        );
+        // What that agent said WORKED, and must survive rewording: constraint, remedy and
+        // rationale together.
+        assert!(why.contains("--partition=preemptible"), "the remedy must be named: {why}");
+        assert!(why.contains("preemptible/low-priority"), "the rationale must survive: {why}");
+    }
+
+    // The same agent concluded "standing policy, not transient failure" BECAUSE the message
+    // was identical on retry — that is what stopped it retrying blind. An unstable message
+    // (a timestamp, a job count, a set iteration order) would quietly cost that.
+    #[test]
+    fn the_partition_refusal_is_byte_identical_on_retry() {
+        let msg = || match decide(
+            &req_in(std::path::Path::new("/work"), &["--partition=normal"], "echo hi\n"),
+            &with_limits(),
+            &FsPolicy::default(),
+            std::path::Path::new("/work"),
+        ) {
+            Decision::Reject(why) => why,
+            _ => panic!("must reject"),
+        };
+        let (a, b, c) = (msg(), msg(), msg());
+        assert_eq!(a, b, "the refusal changed between identical requests");
+        assert_eq!(b, c, "the refusal changed between identical requests");
+    }
+
+    // The gap the agent named: the rule was taught, its CONSEQUENCE was not. Its job
+    // inherited a 30-minute limit it only found from squeue afterwards — harmless at 7
+    // minutes, fatal for a longer run. husk moves jobs onto a partition the submitter did
+    // not choose, so it is the right place to say what that costs.
+    #[test]
+    fn a_submission_with_no_time_is_told_the_limit_it_inherits() {
+        let d = decide(
+            &req_in(std::path::Path::new("/work"), &["--partition=preemptible"], "echo hi\n"),
+            &with_limits(),
+            &FsPolicy::default(),
+            std::path::Path::new("/work"),
+        );
+        let Decision::Submit(sub) = d else { panic!("a valid submission must be accepted") };
+        assert!(sub.note.contains("00:30:00"), "the inherited default must be named: {}", sub.note);
+        assert!(sub.note.contains("--time"), "the remedy must be named: {}", sub.note);
+        // sinfo's TIMELIMIT column is MaxTime, which is NOT what an untimed job gets —
+        // that is precisely how the agent read the wrong number.
+        assert!(sub.note.contains("sinfo"), "say why sinfo disagrees: {}", sub.note);
+    }
+
+    #[test]
+    fn a_submission_that_sets_its_own_time_is_not_lectured() {
+        for argv in [
+            vec!["--partition=preemptible", "--time=02:00:00"],
+            vec!["--partition=preemptible", "-t", "02:00:00"],
+        ] {
+            let d = decide(
+                &req_in(std::path::Path::new("/work"), &argv, "echo hi\n"),
+                &with_limits(),
+                &FsPolicy::default(),
+                std::path::Path::new("/work"),
+            );
+            let Decision::Submit(sub) = d else { panic!("must be accepted: {argv:?}") };
+            assert!(sub.note.is_empty(), "the author chose a limit; say nothing: {}", sub.note);
+        }
+        // A #SBATCH directive is the author choosing, too.
+        let d = decide(
+            &req_in(
+                std::path::Path::new("/work"),
+                &["--partition=preemptible"],
+                "#SBATCH --time=02:00:00\necho hi\n",
+            ),
+            &with_limits(),
+            &FsPolicy::default(),
+            std::path::Path::new("/work"),
+        );
+        let Decision::Submit(sub) = d else { panic!("must be accepted") };
+        assert!(sub.note.is_empty(), "a #SBATCH --time is a choice too: {}", sub.note);
+    }
+
+    // Without scontrol (no SLURM, an unknown partition, a denied query) husk must say
+    // nothing rather than invent a number. A confidently wrong limit is worse than none.
+    #[test]
+    fn nothing_is_claimed_about_limits_husk_could_not_read() {
+        let d = decide(
+            &req_in(std::path::Path::new("/work"), &["--partition=preemptible"], "echo hi\n"),
+            &no_uenv(), // limits: Default::default() — nothing was read
+            &FsPolicy::default(),
+            std::path::Path::new("/work"),
+        );
+        let Decision::Submit(sub) = d else { panic!("must be accepted") };
+        assert!(sub.note.is_empty(), "husk invented a limit it never read: {}", sub.note);
     }
     fn with_uenv() -> Session {
         Session {
             uenv: Some("prgenv-gnu:v1".into()),
             view: Some("prgenv-gnu:default".into()),
             required_partition: "preemptible".into(),
+            limits: Default::default(),
         }
     }
     /// The trusted project dir for tests whose requests carry cwd "/work". Real runs get

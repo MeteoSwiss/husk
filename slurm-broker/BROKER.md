@@ -57,6 +57,42 @@ Resolve the effective partition from the agent's CLI args (`-p`/`--partition`) a
   required partition and tells the agent to resubmit with it (so it learns the
   constraint and can reason about preemption).
 
+#### How that refusal is worded, and why
+
+A caged agent hit this guard on 2026-08-01 and reported back. Three properties came
+out of it, all now pinned by tests:
+
+1. **Say authorization, not availability.** The message used to read *"Only
+   `--partition=short` is permitted here"*. The agent checked `sinfo`, saw `normal`
+   up with 28 idle nodes, and read the contradiction as a possibly **spoofed**
+   message — spending calls corroborating before it would act. It now names husk as
+   the restricting party and concedes that other partitions exist and may be idle.
+   A guardrail that appears to make a false claim about the world invites the reader
+   to disbelieve it.
+2. **Be byte-identical on retry.** The agent's own account: the repeat is what let
+   it conclude *"standing policy"* rather than *"transient failure"* — an
+   intermittent-looking gate "would likely have gotten a blind retry instead". So
+   nothing volatile (timestamps, queue depth, set iteration order) may enter it.
+3. **Teach the consequence, not just the rule.** The old message taught the
+   partition rule but not what it costs. The agent's job silently inherited a
+   30-minute wall limit and it only found out from `squeue` afterwards — harmless at
+   7 minutes, fatal for a longer run. husk moves jobs onto a partition their author
+   did not choose, so it is the right place to say what that partition does to an
+   untimed job.
+
+That third point applies to the **accepted** path too, which is where it actually
+bit: a submission with the right partition and no `--time` is accepted, and now
+carries the limit note on stderr (stdout stays the bare `Submitted batch job N`
+that tooling parses — the same split real `sbatch` uses).
+
+The numbers come from `scontrol show partition` at broker startup, never from a
+constant: they are site config and would rot. `DefaultTime` is what an untimed job
+gets; `MaxTime` is what `sinfo`'s TIMELIMIT column shows, which is why reading
+`sinfo` does not answer the question. A site QOS can lower both and husk cannot see
+that from here, so the note says so and gives the advice that is right either way —
+set `--time`. When `scontrol` cannot be read, husk says **nothing** about limits: a
+confidently wrong number is worse than no number.
+
 ### Resources — pass through, do not manage
 The broker does **not** parse/cap/forward `--nodes`/`--time`/etc. They reach
 SLURM natively and are bounded by the required partition's own limits. This

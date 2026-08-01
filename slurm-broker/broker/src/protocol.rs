@@ -61,6 +61,14 @@ impl Response {
         }
     }
 
+    /// Attach advice to an otherwise successful response. The stub writes it to STDERR,
+    /// so stdout stays the bare `Submitted batch job N` that tooling parses — the same
+    /// split real sbatch uses for its own warnings.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.message = note.into();
+        self
+    }
+
     /// A read-only query result (Tier-1 SLURM commands run by the broker).
     pub fn query(id: &str, stdout: String, stderr: String, exit_code: i32) -> Self {
         Response {

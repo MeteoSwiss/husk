@@ -421,7 +421,7 @@ fn main() {
         return;
     }
 
-    let session = Session::from_env();
+    let session = Session::from_env().with_partition_limits();
     if session.uenv.is_none() {
         // No uenv loaded is a NORMAL state on an HPC — not an error. Inform, don't scold.
         eprintln!(
