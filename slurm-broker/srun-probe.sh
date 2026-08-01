@@ -49,6 +49,34 @@ else
   echo "cage : could not run the containment check inside a step ($out)"
 fi
 
+# 2b) Ranks must share ONE pid namespace: they can see each other (which is what Cross
+# Memory Attach needs, and what MPI needs) and nothing else on the node. Per-rank
+# `--unshare-pid` would give each its own namespace, unable to name its peers — the
+# sibling-user-namespace failure that killed ICON, one layer down. So this checks BOTH
+# halves: the node is hidden, and a peer is not.
+if out=$(srun -n2 sh -c 'ls /proc | grep -c "^[0-9]"' 2>&1); then
+  hi=$(printf '%s\n' "$out" | sort -n | tail -1)
+  if [ "${hi:-999}" -gt 50 ] 2>/dev/null; then
+    echo "pidns: a rank sees $hi processes — it is in the HOST pid namespace, not the job's"
+  else
+    echo "pidns: ranks see only their own namespace (max $hi pids) [expect]"
+  fi
+else
+  echo "pidns: could not count processes inside a step ($out)"
+fi
+# The other half: two tasks of ONE step must see each other, or MPI has no peers to attach
+# to. Each task reports how many sibling tasks it can find by name.
+if out=$(srun -n2 sh -c 'sleep 1; n=0; for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in sleep) n=$((n+1));; esac; done; echo $n' 2>&1); then
+  lo=$(printf '%s\n' "$out" | sort -n | head -1)
+  if [ "${lo:-0}" -ge 2 ] 2>/dev/null; then
+    echo "pidns: ranks can see each other ($lo peers) — CMA has someone to attach to [expect]"
+  else
+    echo "pidns: peers invisible - a rank found only $lo, so ranks are in SEPARATE pid namespaces and MPI will fail"
+  fi
+else
+  echo "pidns: could not run the peer-visibility check ($out)"
+fi
+
 # 3) An option that runs code outside the per-task wrap must be REFUSED, with a
 # reason. This is the step allowlist doing its job; a silent success here would
 # mean a job can escape the rank cage.

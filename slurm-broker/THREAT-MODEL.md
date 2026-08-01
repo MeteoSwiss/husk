@@ -113,7 +113,7 @@ and function:
 | symptom | root cause |
 |---|---|
 | Cray MPICH dies `process_vm_readv: EPERM` | each task's bwrap makes its own **user namespace**; siblings cannot `ptrace_may_access` each other |
-| `--unshare-pid` unusable **for a rank** | it would put each rank in its own PID namespace and break rank-to-rank CMA (the job cage does get it — see below) |
+| `--unshare-pid` unusable **for a rank** | it would put each rank in its own PID namespace and break rank-to-rank CMA — a rank JOINS the job namespace with `--pidns` instead (see below) |
 | per-job binds (`/dev/shm`, step spool) repeated per task | they were never per-task to begin with |
 
 Only the **user** namespace turned out to be load-bearing among those copies. Mount and
@@ -135,21 +135,41 @@ namespace is stronger and structural: the job cannot **name** them, so there is 
 left to check. With `--proc /proc` the job's process table shows only its own tree
 (measured: 5 entries against 429).
 
-**The job cage gets `--unshare-pid`; a rank must not**, and the asymmetry is the same
-finding as the user namespace, one layer down:
+**Both cages have one, by different means, and the difference is the same finding as the
+user namespace one layer down.**
 
-- `bwrap --pidns FD` is **parent-only**. With `--unshare-pid` it makes the given namespace
-  the *parent* of a fresh one; without it, bwrap fails outright (`Can't send pid: Invalid
-  argument` — measured on 0.6.1). So ranks cannot **join** a shared PID namespace the way
-  they join the shared user namespace.
-- Giving each rank its own `--unshare-pid` would put every rank in a namespace where it
-  cannot name its peers — which is precisely how sibling *user* namespaces broke Cray
-  MPICH's Cross Memory Attach and killed ICON.
+The **job** cage gets `--unshare-pid` — it holds no ranks, so a private namespace costs it
+nothing, and MPI started directly from the batch script stays inside that one namespace and
+keeps CMA.
 
-The job cage holds no ranks, so it pays nothing for this, and MPI started directly from
-the batch script stays in one namespace and keeps CMA. Rank-level PID isolation remains
-open: it would need the ranks to enter the namespace before `bwrap` runs (`nsenter`), which
-adds a tool dependency and a second way to fail closed on a compute node.
+A **rank** must never get `--unshare-pid`: that would put every rank in its own namespace,
+unable to name its peers, which is exactly how sibling *user* namespaces broke Cray MPICH's
+Cross Memory Attach and killed ICON. Instead a rank **joins** the job's namespace, the same
+way it joins the shared user namespace and named by the same holder pid:
+
+```
+bwrap --userns 9 --pidns 8 …      # 9 = /proc/<holder>/ns/user, 8 = /proc/<holder>/ns/pid
+```
+
+The holder creates the PID namespace *after* the user namespace — a kernel rule, not taste:
+`CLONE_NEWPID` needs `CAP_SYS_ADMIN`, which an unprivileged process only has inside a user
+namespace it owns. `unshare(CLONE_NEWPID)` does not move the caller, only its children, so
+the holder forks; that child is PID 1, keeps the namespace alive (a PID namespace dies with
+its PID 1, taking everything in it), and reaps orphans. It inherited the user namespace, so
+one pid names both namespaces.
+
+Measured end to end against the real holder: two ranks come up as **pid 2 and pid 3**, each
+can see the other, and an un-caged process outside is neither in their `/proc` nor
+signalable (`kill` → `No such process`). Isolation and working MPI at the same time.
+
+One process is deliberately visible inside a rank's namespace: PID 1, the holder's
+namespace-keeper. It carries no credentials, no daemon route and no memory worth reading —
+it exists only to keep the namespace alive. A rank can signal it, which tears down its own
+job's ranks: self-harm, not escape.
+
+*(Earlier note, corrected: `--pidns` was thought unusable because bwrap answered `Can't send
+pid: Invalid argument`. That was a holder with no uid map — the overflow-uid case. With the
+identity-mapped holder husk actually creates, `--userns` and `--pidns` together work.)*
 
 Measured, 2026-07-31: two sibling bwrap cages cannot CMA-read each other (`EPERM`)
 **even with Yama neutralised**; two cages sharing one identity-mapped user namespace

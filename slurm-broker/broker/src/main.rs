@@ -224,8 +224,20 @@ fn hold_cage_mode() -> ! {
     // And the exposure would be nil regardless: no credentials, no daemon route, no
     // memory worth reading. It exists only to keep one namespace alive.
 
+    // The PID namespace, added on top of the user namespace (that order is a kernel rule:
+    // creating a pidns needs CAP_SYS_ADMIN, which we only have inside a userns we own).
+    // The pid reported below is the holder's PID-1 CHILD, not this process: it names both
+    // namespaces at once, and it is the one that must stay alive for the job.
+    let held = match cage::create_shared_pidns() {
+        Ok(pid) => pid,
+        Err(e) => {
+            eprintln!("husk: {e}");
+            std::process::exit(1);
+        }
+    };
+
     use std::io::{Read, Write};
-    println!("{}", std::process::id());
+    println!("{held}");
     if std::io::stdout().flush().is_err() {
         eprintln!("husk: cage holder could not report readiness");
         std::process::exit(1);

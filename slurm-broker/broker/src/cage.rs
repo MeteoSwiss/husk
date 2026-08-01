@@ -43,6 +43,7 @@
 use std::io::Write;
 
 const CLONE_NEWUSER: std::os::raw::c_int = 0x1000_0000;
+const CLONE_NEWPID: std::os::raw::c_int = 0x2000_0000;
 
 extern "C" {
     fn unshare(flags: std::os::raw::c_int) -> std::os::raw::c_int;
@@ -50,6 +51,19 @@ extern "C" {
     fn libc_getuid() -> u32;
     #[link_name = "getgid"]
     fn libc_getgid() -> u32;
+    #[link_name = "fork"]
+    fn libc_fork() -> i32;
+    #[link_name = "pause"]
+    fn libc_pause() -> std::os::raw::c_int;
+}
+
+/// The path a rank passes to `bwrap --pidns`.
+///
+/// Deliberately the SAME pid as `userns_path`: the holder's PID-1 child inherits the user
+/// namespace and is the first member of the PID namespace, so one number names both. A
+/// second reported pid would be a second thing to keep in step.
+pub fn pidns_path(pid: u32) -> String {
+    format!("/proc/{pid}/ns/pid")
 }
 
 /// The path a rank passes to `bwrap --userns`, given the holder's pid.
@@ -99,6 +113,55 @@ pub fn create_shared_userns() -> Result<(), String> {
     write_proc_self("uid_map", &identity_map(uid))?;
     write_proc_self("gid_map", &identity_map(gid))?;
     Ok(())
+}
+
+/// Add a PID namespace to the job cage and return the pid that names it.
+///
+/// Call AFTER `create_shared_userns`, and the order is a kernel rule rather than taste:
+/// creating a PID namespace needs `CAP_SYS_ADMIN`, which an unprivileged process only has
+/// inside a user namespace it owns. Reversed, this fails with `EPERM`.
+///
+/// `unshare(CLONE_NEWPID)` does NOT move the caller — it takes effect for its *children*.
+/// So this forks, and the child is PID 1 of the new namespace. That child must then stay
+/// alive for the whole job: **a PID namespace dies with its PID 1, taking every process in
+/// it along.** It also reaps orphans, which is PID 1's other job.
+///
+/// The returned pid is the CHILD's, host-side, and it names BOTH namespaces: the child
+/// inherited the user namespace, so `/proc/<pid>/ns/user` and `/proc/<pid>/ns/pid` are the
+/// two a rank needs. One number, one thing to keep in step.
+///
+/// What this buys, measured: two ranks joining it are pid 2 and pid 3, they can see each
+/// other — which is what Cross Memory Attach needs — and the un-caged step-broker is not
+/// in their `/proc` at all. Isolation and MPI at once, which per-rank `--unshare-pid`
+/// cannot give (each rank would land in its own namespace, unable to name its peers — the
+/// sibling-user-namespace failure that killed ICON, one layer down).
+pub fn create_shared_pidns() -> Result<u32, String> {
+    // SAFETY: a constant CLONE_NEW* flag; this process is single-threaded here.
+    if unsafe { unshare(CLONE_NEWPID) } != 0 {
+        return Err(format!(
+            "could not create the job's shared PID namespace: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fork in a single-threaded process. The child touches only async-signal-safe
+    // calls (`pause`) before it would exit.
+    let pid = unsafe { libc_fork() };
+    match pid {
+        -1 => Err(format!(
+            "could not fork the PID-namespace holder: {}",
+            std::io::Error::last_os_error()
+        )),
+        0 => {
+            // PID 1 of the new namespace. Sleep forever: the parent kills it on shutdown,
+            // and if the parent dies first the namespace is torn down with it anyway.
+            // `pause` rather than a sleep loop so it consumes nothing at all.
+            loop {
+                // SAFETY: pause takes no arguments and only returns on a signal.
+                unsafe { libc_pause() };
+            }
+        }
+        child => Ok(child as u32),
+    }
 }
 
 fn write_proc_self(what: &str, contents: &str) -> Result<(), String> {

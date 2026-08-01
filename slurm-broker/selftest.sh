@@ -578,6 +578,11 @@ run_srun_probe() {
       "step : FAILED"*) seen=1; check FAIL containment steps.launch "brokered srun could not launch a step" ;;
       "cage : homes hidden"*) check PASS containment steps.cage    "ranks are sandboxed (homes hidden inside the step)" ;;
       "cage : /users shows"*) check FAIL containment steps.cage    "a rank could see other homes - the per-task wrap is not applied" ;;
+      "pidns: ranks see only"*)   check PASS containment steps.pidns   "ranks share one pid namespace and cannot see the node" ;;
+      "pidns: a rank sees "*)     check FAIL containment steps.pidns   "a rank is in the HOST pid namespace - it can see and signal the step-broker" ;;
+      "pidns: ranks can see each other"*) check PASS containment steps.pidns_peers "ranks can name each other - CMA/MPI has peers" ;;
+      "pidns: peers invisible"*)  check FAIL containment steps.pidns_peers "ranks are in SEPARATE pid namespaces - MPI cannot attach" ;;
+      "pidns: could not"*)        check INFO containment steps.pidns   "pid-namespace check did not run" ;;
       "deny : --task-prolog refused"*) check PASS containment steps.allowlist "the step allowlist refused --task-prolog by husk's own message" ;;
       "deny : --task-prolog ACCEPTED"*) check FAIL containment steps.allowlist "--task-prolog accepted - a step can run code outside the rank cage" ;;
       "deny : --task-prolog failed, but NOT via husk"*) check FAIL containment steps.allowlist "the stub is not bound: that refusal came from the real srun, not husk" ;;
@@ -1067,6 +1072,13 @@ echo "FP visible_pids $_pids"
 # comm is truncated to 15 bytes, so husk-slurm-broker reads as husk-slurm-brok.
 _broker_seen=0
 for _p in /proc/[0-9]*; do
+  # PID 1 is never a finding. In a JOB cage it is the bwrap reaper; in a RANK cage it is
+  # the namespace-keeper the holder forked, which IS a husk-slurm-broker process and
+  # legitimately lives in that namespace (it is what keeps the namespace alive). Counting
+  # it would report a breach for every correctly isolated rank.
+  # NO APOSTROPHES IN THIS BLOCK - it is embedded in a single-quoted probe body, and an
+  # apostrophe here has broken the selftest three times.
+  [ "${_p#/proc/}" = 1 ] && continue
   _c=$(cat "$_p/comm" 2>/dev/null) || continue
   case "$_c" in husk-slurm-bro*) _broker_seen=$((_broker_seen + 1)) ;; esac
 done

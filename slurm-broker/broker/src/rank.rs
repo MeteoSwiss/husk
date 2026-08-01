@@ -169,7 +169,7 @@ pub struct Egress<'a> {
 fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     let sec = profile.seccomp_profile();
     let cage = format!(
-        "seccomp-wrapper --profile={sec} bwrap --userns 9 {bwrap} \
+        "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
          --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
     );
     match net {
@@ -237,6 +237,12 @@ pub fn wrap_command(
          exit 1\n\
          fi\n\
          exec 9<\"$_u\"\n\
+         _p={pidns}\n\
+         if [ ! -r \"$_p\" ]; then\n\
+         echo \"husk: the job's PID namespace is gone ($_p) - refusing to run this rank\" >&2\n\
+         exit 1\n\
+         fi\n\
+         exec 8<\"$_p\"\n\
          _d=/dev/shm/husk-${{SLURM_JOB_ID}}\n\
          mkdir -m 700 \"$_d\" 2>/dev/null || true\n\
          if [ ! -O \"$_d\" ]; then\n\
@@ -246,6 +252,7 @@ pub fn wrap_command(
          _s={spool}/mpi_cray_shasta/${{SLURM_JOB_ID}}.${{SLURM_STEP_ID}}\n\
          {exec_line}",
         userns = sh_quote(&userns),
+        pidns = sh_quote(&crate::cage::pidns_path(holder_pid)),
         spool = sh_quote(spool_dir),
         exec_line = exec_line(profile, &bwrap, net),
     );
@@ -477,6 +484,19 @@ mod tests {
         );
         let script = &argv[2];
         assert!(script.contains("--userns 9"), "rank must join the shared userns: {script}");
+        // The PID namespace is the SECOND share, and it must be joined the same way — as a
+        // namespace the holder owns, never created per rank. `bwrap --unshare-pid` here
+        // would give every rank its own namespace where it cannot name its peers, which is
+        // the sibling-user-namespace failure that killed ICON, one layer down.
+        assert!(script.contains("--pidns 8"), "rank must join the shared pidns: {script}");
+        assert!(
+            !script.contains("--unshare-pid"),
+            "a rank must JOIN the job's pid namespace, never create its own: {script}"
+        );
+        // Both namespaces are named by ONE holder pid, and both are checked before use so
+        // a dead holder is a sentence rather than a shell diagnostic.
+        assert!(script.contains("/ns/pid"), "{script}");
+        assert!(script.contains("/ns/user"), "{script}");
         assert!(
             script.contains("/proc/4242/ns/user"),
             "the holder's namespace must be named: {script}"
