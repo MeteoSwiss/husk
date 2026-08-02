@@ -679,6 +679,9 @@ run_live_probe() {
     return
   fi
   check PASS containment "$reqid.submit" "real sbatch accepted; job_id=$jid (proves MUNGE + controller + partition)"
+  # Remembered for the accumulation check, which needs a job that has FINISHED and the node
+  # it ran on, so a second job can be pinned there to look for what it left behind.
+  [ "$reqid" = probe ] && PROBE_JID="$jid"
   local out="$work/slurm-$jid.out"
   echo "   waiting for job $jid to finish (output: $out) ..."
   wait_for_job "$jid"
@@ -706,7 +709,8 @@ run_live_probe() {
     [ "$inblock" = 1 ] || continue
     case "$line" in
       "RESULT "*) read -r _kw v t id rest <<<"$line"; check "$v" "$t" "$id" "$rest" ;;
-      "FP "*) FP_LINES+=("${line#FP }") ;;
+      "FP "*) FP_LINES+=("${line#FP }")
+              case "$line" in "FP host "*) PROBE_NODE="${line#FP host }" ;; esac ;;
     esac
   done < "$out"
   if ! grep -q 'HUSK-PROBE-END' "$out"; then
@@ -1515,6 +1519,57 @@ echo "===HUSK-PROBE-END==="
     # directly and this probe would reach the net (FAIL).
     WRAP_BODY='echo ===HUSK-PROBE-BEGIN===; echo "FP wrap_resandboxed ${_HUSK_RESANDBOXED:-0}"; if timeout 5 bash -c ": < /dev/tcp/1.1.1.1/443" 2>/dev/null; then echo "RESULT FAIL containment wrap.caged --wrap job reached the network (NOT caged - F27 regressed)"; else echo "RESULT PASS containment wrap.caged --wrap job ran through the guard, caged (no net)"; fi; echo ===HUSK-PROBE-END==='
     run_live_probe wrapprobe "[\"--partition=$PART\"]" "$WORK" "$WRAP_BODY" wrap
+
+    # THE ACCUMULATION CHECK. The guard cleans up its node-local egress directory at the
+    # END of a job, so no job can observe its own cleanup, and the directory lives on the
+    # COMPUTE node where the login shell cannot see it. So: ask a SECOND job, pinned to the
+    # same node, whether the FIRST job's directory is still there.
+    #
+    # Node-local /tmp is the right home for a per-job socket only if it is reliably removed
+    # — compute-node SSDs are small and the nodes restart rarely, so a directory that fails
+    # to clean up accumulates across every user of that node. That is the risk this arm
+    # exists for, and nothing else in the suite can see it.
+    #
+    # It looks for the KNOWN probe job's directory, never "any husk directory": another of
+    # this user's jobs could legitimately be running on the same node with a live one, and
+    # a check that cannot tell those apart would cry wolf.
+    if [ -z "${PROBE_NODE:-}" ] || [ -z "${PROBE_JID:-}" ]; then
+      check SKIP containment tmp.reclaimed "no probe node/job recorded - cannot pin the follow-up job"
+    else
+      LEFT_BODY="echo ===HUSK-PROBE-BEGIN===
+if [ -d /tmp/husk-\$(id -u)-$PROBE_JID ]; then
+  echo \"RESULT FAIL containment tmp.reclaimed /tmp/husk-\$(id -u)-$PROBE_JID survived job $PROBE_JID on \$(hostname) - node-local scratch accumulates\"
+else
+  echo \"RESULT PASS containment tmp.reclaimed job $PROBE_JID left no /tmp directory behind on \$(hostname)\"
+fi
+echo ===HUSK-PROBE-END==="
+      reset_spool
+      mkreq leftover sbatch "[\"--partition=$PART\",\"--nodelist=$PROBE_NODE\",\"--time=00:02:00\"]" "$WORK" "$LEFT_BODY"
+      run_broker live "$SPOOL/out.leftover" "$WORK"
+      LJID="$(respfield leftover job_id)"
+      if [ "$(respfield leftover status)" != submitted ]; then
+        check SKIP containment tmp.reclaimed "follow-up job not submitted: $(respfield leftover message | head -c 70)"
+      else
+        # 30s cap: if someone else holds the node the job stays queued, and that says
+        # nothing about husk. Skipping beats a red arm nobody can act on.
+        _w=0
+        while squeue -h -j "$LJID" 2>/dev/null | grep -q . && [ "$_w" -lt 30 ]; do sleep 1; _w=$((_w+1)); done
+        if squeue -h -j "$LJID" 2>/dev/null | grep -q .; then
+          scancel "$LJID" >/dev/null 2>&1
+          check SKIP containment tmp.reclaimed "follow-up job did not start on $PROBE_NODE within 30s (node busy) - cancelled"
+        else
+          sleep 1
+          LOUT="$WORK/slurm-$LJID.out"
+          if [ -f "$LOUT" ]; then
+            while IFS= read -r line; do
+              case "$line" in "RESULT "*) read -r _kw v tt id rest <<<"$line"; check "$v" "$tt" "$id" "$rest" ;; esac
+            done < "$LOUT"
+          else
+            check SKIP containment tmp.reclaimed "no output from the follow-up job at $LOUT"
+          fi
+        fi
+      fi
+    fi
 
     # The step pair, end to end, by SHELLING OUT to srun-probe.sh rather than
     # reimplementing it here. That script is what a human runs by hand when steps
