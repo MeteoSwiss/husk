@@ -855,9 +855,19 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
     rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
     rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* 2>/dev/null\n\
     rm -f \"$_husk_spool/net.sock\" \"$_husk_spool/socat\" 2>/dev/null\n\
-    if ! rmdir \"$_husk_spool\" 2>/dev/null; then\n\
-      echo \"husk: kept $_husk_spool - it holds files husk did not create\" >&2\n\
+    if rmdir \"$_husk_spool\" 2>/dev/null; then\n\
+      echo \"husk: step spool removed\" >>\"$_husk_log\" 2>/dev/null\n\
+    else\n\
+      _husk_left=$(ls -A \"$_husk_spool\" 2>/dev/null | tr '\\n' ' ')\n\
+      echo \"husk: kept $_husk_spool - it still holds: $_husk_left\" >&2\n\
+      echo \"husk: kept $_husk_spool - it still holds: $_husk_left\" >>\"$_husk_log\" 2>/dev/null\n\
     fi\n\
+  else\n\
+    # UNCONDITIONAL, and this is why: a job left a step spool behind with NO message\n\
+    # anywhere, and the directory mtime proved this block had never run. Silence made\n\
+    # \"did not execute\" and \"executed and failed\" indistinguishable, which cost a round\n\
+    # of guessing. Every path through the cleanup now says what it did.\n\
+    echo \"husk: no step spool to clean (spool=${{_husk_spool:-<empty>}})\" >>\"$_husk_log\" 2>/dev/null\n\
   fi\n\
   # PARTIAL OUTPUT IS THE FAILURE MODE THAT MATTERS HERE.\n\
   #\n\

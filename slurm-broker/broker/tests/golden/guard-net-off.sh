@@ -125,9 +125,19 @@ if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
 rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null
 rm -f "$_husk_spool/net.sock" "$_husk_spool/socat" 2>/dev/null
-if ! rmdir "$_husk_spool" 2>/dev/null; then
-echo "husk: kept $_husk_spool - it holds files husk did not create" >&2
+if rmdir "$_husk_spool" 2>/dev/null; then
+echo "husk: step spool removed" >>"$_husk_log" 2>/dev/null
+else
+_husk_left=$(ls -A "$_husk_spool" 2>/dev/null | tr '\n' ' ')
+echo "husk: kept $_husk_spool - it still holds: $_husk_left" >&2
+echo "husk: kept $_husk_spool - it still holds: $_husk_left" >>"$_husk_log" 2>/dev/null
 fi
+else
+# UNCONDITIONAL, and this is why: a job left a step spool behind with NO message
+# anywhere, and the directory mtime proved this block had never run. Silence made
+# "did not execute" and "executed and failed" indistinguishable, which cost a round
+# of guessing. Every path through the cleanup now says what it did.
+echo "husk: no step spool to clean (spool=${_husk_spool:-<empty>})" >>"$_husk_log" 2>/dev/null
 fi
 # PARTIAL OUTPUT IS THE FAILURE MODE THAT MATTERS HERE.
 #
