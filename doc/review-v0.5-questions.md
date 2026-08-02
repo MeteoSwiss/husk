@@ -26,6 +26,32 @@ Rules that made it work last time, and are not optional:
   an invariant test; doing it during triage means the pipeline is candidate →
   confirmed-with-arm → fix, and the arm outlives the review and blocks the regression.
 
+## Rules of engagement (binding on the offensive workstream A)
+
+"Try to break it" is not a licence to cause harm on a shared cluster. A finding is
+**demonstrated, then stopped** — never developed. These are constraints on the reviewing
+agent's own conduct, and they are as important as the findings.
+
+- **Stop at proof of concept.** The moment a hole is shown to exist, halt. Do not explore how
+  far it reaches, chain it, or "see what else is possible". One witness is the deliverable.
+- **Smallest possible witness.** Prefer a selftest arm or a planted marker file over a live
+  exploit. If a `touch`-of-a-canary proves arbitrary write, do not write anything real.
+- **Minimal blast radius, hard limits.** Never destroy or modify data outside the test
+  workdir. Never cancel, signal, or preempt a job this review did not submit. Never consume
+  large resources (no big allocations, no fork bombs, no filling a filesystem). Never install
+  persistence (cron, shell rc, hooks).
+- **No pivoting to real targets.** The scheduler, other users' jobs and homes, production
+  data, and the CSCS network are **out of bounds as targets** even when reachable. Reaching
+  them *is* the finding; acting on them is not part of the test.
+- **Use canaries, not real secrets or data.** Planted markers with known contents, so a leak
+  is unambiguous and harmless.
+- **On a live/dangerous finding, halt and report rather than continue.** A confirmed escape is
+  a reason to stop and hand off, not to press the advantage.
+
+If following these rules blocks a demonstration, that is the correct outcome: describe what
+*would* prove it and hand the reproducer to a human. A described-but-not-detonated finding is
+worth more than a detonated one.
+
 ## Standing rules for every workstream
 
 - **Falsification only.** "Try to break X" beats "assess X".
@@ -38,8 +64,32 @@ Rules that made it work last time, and are not optional:
 
 ---
 
-## A — assumed-breach penetration test
-*Offensive, in-cage on Balfrin. The biggest share.*
+## Rules of engagement — binding on all of workstream A
+
+Balfrin and Santis are **shared production clusters** with other people's jobs and data on
+them. The review runs against the real thing, so the test must not become the incident. These
+rules bind every A brief; each one restates the pointer, none may relax them.
+
+- **Stop at proof.** The moment a boundary is shown to be crossable, that is the finding. Do
+  not explore what else is reachable, do not chain it into a second step, do not "confirm
+  impact". Escalation is the reviewer's instinct and it is wrong here — impact is assessed
+  during triage, on the laptop, from the reproducer.
+- **Evidence is a marker, not a payload.** Prove an uncaged write by creating one file with a
+  known prefix (`husk-review-<id>-`) and no meaningful content. Never write something that
+  would run: no shell profiles, no hooks, no job scripts, no anything under a path another
+  process reads.
+- **Never touch what is not ours.** Other users' files, jobs and processes are out of bounds
+  even when reachable — *especially* when reachable, because that is the finding. Reaching
+  them is provable without reading them.
+- **Never cancel a job husk did not submit**, even after demonstrating the ability to. The
+  scancel provenance gate is a review target; a job someone is waiting on is not.
+- **Respect the resource envelope.** It is the threat model here. An escape that *could* burn
+  node-hours or storm the scheduler must be demonstrated at the smallest scale that proves it
+  — one job, minimum size, shortest wall time. Never actually consume what the escape unlocks.
+- **No persistence.** Nothing that survives the session: no modified startup files, no
+  scheduled work, no daemons, no state outside the designated scratch area.
+- **Credentials: prove reach, never read.** If a secret is reachable, record *that* and its
+  path. Do not read the value, do not log
 
 The sharpest single instruction: **hunt any value the agent supplies that becomes a boundary,
 or the base for one.**
