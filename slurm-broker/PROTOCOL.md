@@ -103,18 +103,24 @@ The step spool now holds only `req-*.json`, `resp-*.json`, `out-*` and `err-*`.
 `/tmp/husk-<uid>-<jobid>/net.sock`, node-local, mode 0700, bound **read-only** into
 the cage at the same path.
 
-> **Placement is under review (2026-08-02).** Node-local `/tmp` on compute nodes is a
-> poor home for anything that might persist: the local SSDs are small and the nodes are
-> restarted rarely, so leftovers from many users accumulate. This directory is a
-> bind-mount target, and unlinking a dentry that is still a mountpoint fails with
-> `EBUSY` — the same mechanism that leaves `socat` behind in the step spool — so its
-> `rmdir` can fail and the directory can persist. The socket itself cannot move into
-> the cage's own tmpfs the way `socat` can, because the **proxy binds it outside the
-> cage**, so it must exist on the host and stay inside `sun_path`'s 108 bytes.
-> Candidates under consideration: `$HOME/.husk/run/<jobid>/` (~45 bytes, shared
-> filesystem, no node-local pressure — but whether `AF_UNIX` `bind()` works there is a
-> per-site fact to measure, not assume), or `$TMPDIR` where SLURM provides a per-job
-> directory its epilog cleans.
+Node-local `/tmp` is the right home for a per-job socket — short, fast, and gone with
+the job — **provided it is actually removed**. Compute-node SSDs are small and the
+nodes restart rarely, so a directory that fails to clean up accumulates across every
+user, which is the one thing node-local scratch must not do.
+
+That is why the **socket** is bind-mounted into the cage, not its **directory**. A
+directory bind makes the directory a mountpoint, and a dentry that is still a
+mountpoint cannot be removed while anything holds that mount — the mechanism that
+stranded the `socat` placeholder in the step spool, silently, under `2>/dev/null`.
+Binding the file leaves the directory an ordinary directory, so its `rmdir` always
+succeeds.
+
+The socket cannot use the cage's own tmpfs the way `socat` does, because the **proxy
+binds it outside the cage**: it must exist on the host and stay inside `sun_path`'s
+108 bytes. It does not exist yet when bwrap runs, and a bind with a missing source
+kills the cage — so the guard waits (bounded, 5s) for the proxy to bind before
+building the cage. If it never binds, `HUSK_NET_SOCK` is unset and the job runs
+without egress rather than with a broken one.
 
 A unix socket address must fit in `sun_path` — 108 bytes, fixed by the kernel, with
 no way to ask for more. In the step spool the address was

@@ -193,8 +193,9 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
         Some(e) => format!(
             "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
              --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" \
-             --ro-bind-try {src} {CAGED_SOCAT} --",
-            src = sh_quote(e.socat)
+             --ro-bind-try {src} {CAGED_SOCAT} --ro-bind-try {sock} {sock} --",
+            src = sh_quote(e.socat),
+            sock = sh_quote(e.sock)
         ),
     };
     match net {

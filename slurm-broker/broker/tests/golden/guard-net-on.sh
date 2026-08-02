@@ -131,10 +131,32 @@ export HUSK_JOB_LOG="$_husk_log"
       >>"$_husk_log" 2>&1 &
     _husk_net_pid=$!
     export HUSK_NET_SOCK="$_husk_net_sock"
-    # The DIRECTORY, not the socket: the socket does not exist yet, and a bwrap bind with
-    # a missing source kills the cage outright. Binding the directory also means the
-    # socket appears inside the moment the proxy creates it.
-    _husk_extra+=(--ro-bind "$_husk_net_dir" "$_husk_net_dir")
+    # Bind the SOCKET, not its directory — and wait for the proxy to create it first.
+    #
+    # Binding the directory was the obvious move (the socket does not exist yet, and a
+    # bwrap bind with a missing source kills the cage), but it makes the DIRECTORY a
+    # mountpoint, and a dentry that is still a mountpoint cannot be unlinked or removed
+    # while anything holds that mount. That is exactly what stranded the socat placeholder
+    # in the step spool: the cleanup ran, the removal failed with EBUSY, and 2>/dev/null
+    # hid it. A per-job directory on node-local /tmp that fails to rmdir accumulates on a
+    # node that reboots rarely, which is the one thing node-local scratch must not do.
+    #
+    # So: bounded wait for the bind, then bind the file. The directory is never a
+    # mountpoint, so its rmdir always succeeds. If the proxy never binds we leave
+    # HUSK_NET_SOCK unset rather than binding a missing source — the relay then sees no
+    # socket and the job runs without egress, which is the safe direction.
+    _husk_w=0
+    while [ ! -S "$_husk_net_sock" ] && [ "$_husk_w" -lt 50 ]; do
+      sleep 0.1
+      _husk_w=$((_husk_w + 1))
+    done
+    if [ -S "$_husk_net_sock" ]; then
+      _husk_extra+=(--ro-bind "$_husk_net_sock" "$_husk_net_sock")
+    else
+      unset HUSK_NET_SOCK
+      echo "husk: the egress proxy did not bind $_husk_net_sock within 5s, so this job" >&2
+      echo "husk: has no network. Its own log is ${HUSK_JOB_LOG:-the husk job log}." >&2
+    fi
   else
     # Report BEFORE clearing the variable - naming the path is the whole point of the
     # message, and an unattributed "no network" is exactly the failure mode husk keeps
