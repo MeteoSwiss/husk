@@ -621,6 +621,11 @@ run_srun_probe() {
       "pidns: peers invisible"*)  check FAIL containment steps.pidns_peers "ranks are in SEPARATE pid namespaces - MPI cannot attach" ;;
       "pidns: peer check inconclusive"*) check INFO containment steps.pidns_peers "the peer probe measured the wrong instant - inconclusive, NOT a breach" ;;
       "pidns: could not"*)        check INFO containment steps.pidns   "pid-namespace check did not run" ;;
+      "rnet : a rank has socat and"*) check PASS functional  steps.egress  "a rank binds its own socat and its relay is listening" ;;
+      "rnet : a rank has NO socat"*)  check FAIL functional  steps.egress  "a rank has no socat in its cage - ranks run with no egress" ;;
+      "rnet : a rank has socat but"*) check FAIL functional  steps.egress  "a rank relay did not start - socat is there but nothing listens" ;;
+      "rnet : no egress configured"*) check SKIP functional  steps.egress  "no allowlist configured - rank egress not exercised" ;;
+      "rnet :"*)                      check INFO functional  steps.egress  "rank egress check inconclusive" ;;
       "deny : --task-prolog refused"*) check PASS containment steps.allowlist "the step allowlist refused --task-prolog by husk's own message" ;;
       "deny : --task-prolog ACCEPTED"*) check FAIL containment steps.allowlist "--task-prolog accepted - a step can run code outside the rank cage" ;;
       "deny : --task-prolog failed, but NOT via husk"*) check FAIL containment steps.allowlist "the stub is not bound: that refusal came from the real srun, not husk" ;;

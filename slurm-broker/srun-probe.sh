@@ -98,6 +98,36 @@ else
   echo "pidns: could not run the peer-visibility check ($out)"
 fi
 
+# 2c) EGRESS INSIDE A RANK. The job cage and a rank cage are separate bwrap namespaces and
+# bwrap mounts do NOT propagate, so a rank cannot inherit the job cage socat: it must bind
+# its own. That was wrong until 2026-08-02 — ranks were handed a path to the job cage
+# placeholder, which is an EMPTY file in a rank namespace, so every rank ran with no egress
+# and said nothing about it. net.live never caught it because it tests the JOB cage.
+# Three observations, cheapest first, so a failure says WHICH half broke.
+# NO APOSTROPHES BELOW - single-quoted probe body.
+if [ -z "${HUSK_NET_SOCK:-}" ]; then
+  echo "rnet : no egress configured for this job - skipped (set sandbox.network.allowedDomains to exercise it)"
+else
+  RANK_NET='s=$([ -x /tmp/husk-socat ] && echo yes || echo no)
+p=${HTTP_PROXY:-unset}
+r=$(timeout 3 bash -c ": < /dev/tcp/127.0.0.1/3128" 2>/dev/null && echo up || echo down)
+echo "socat=$s proxy=$p relay=$r"'
+  if out=$(srun -n1 bash -c "$RANK_NET" 2>&1 | tail -1); then
+    case "$out" in
+      *"socat=yes"*"relay=up"*)
+        echo "rnet : a rank has socat and its relay is listening [$out] [expect]" ;;
+      *"socat=no"*)
+        echo "rnet : a rank has NO socat in its cage [$out] - the rank never binds one, so it has no egress" ;;
+      *"relay=down"*)
+        echo "rnet : a rank has socat but nothing is listening on 127.0.0.1:3128 [$out] - the relay did not start" ;;
+      *)
+        echo "rnet : unexpected answer from the rank [$out]" ;;
+    esac
+  else
+    echo "rnet : could not run the rank egress check ($out)"
+  fi
+fi
+
 # 3) An option that runs code outside the per-task wrap must be REFUSED, with a
 # reason. This is the step allowlist doing its job; a silent success here would
 # mean a job can escape the rank cage.
