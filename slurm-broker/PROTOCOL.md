@@ -78,12 +78,42 @@ That list must cover every file the guard creates. When egress was added it did 
 — `net.sock`, `socat` and `net-proxy.log` were never removed, so `rmdir` failed and
 **every networked job leaked its spool**, silently, because the failing branch had
 nothing to report it. A test now derives the required names from the generated
-script rather than trusting the list.
+script — and from `step.rs`, the *other* producer, which the first version of that
+test ignored: a completeness check has to cover the **directory**, not one writer of
+it.
+
+**Known open bug (2026-08-02):** a job that runs an `srun` step still leaves the
+empty `socat` placeholder behind, so the `rmdir` fails and the directory persists.
+The cleanup runs and the `rm` fails: `socat` is a **bind-mount target**, and a dentry
+that is still a mountpoint cannot be unlinked (`EBUSY`) while anything holds that
+mount — rank cages and their relays can outlive the job's own `bwrap` by moments. A
+later manual `rm` succeeds, which is what makes it look mysterious. Every path
+through the cleanup now reports itself, so the next occurrence names its own cause.
+
+The fix is structural rather than another filename: **stop creating a bind-mount
+target inside a directory we intend to delete.** `--ro-bind <socat> /tmp/husk-socat`
+places it in the cage's *own* tmpfs — measured: the binary is usable inside and
+nothing exists on the host afterwards — so there is no placeholder and no cleanup.
+The bind *source* is read in the host namespace before the cage is sealed, so this
+needs no re-exposure of `$HOME`.
 
 ## The egress socket is not in the step spool
 
 `/tmp/husk-<uid>-<jobid>/net.sock`, node-local, mode 0700, bound **read-only** into
 the cage at the same path.
+
+> **Placement is under review (2026-08-02).** Node-local `/tmp` on compute nodes is a
+> poor home for anything that might persist: the local SSDs are small and the nodes are
+> restarted rarely, so leftovers from many users accumulate. This directory is a
+> bind-mount target, and unlinking a dentry that is still a mountpoint fails with
+> `EBUSY` — the same mechanism that leaves `socat` behind in the step spool — so its
+> `rmdir` can fail and the directory can persist. The socket itself cannot move into
+> the cage's own tmpfs the way `socat` can, because the **proxy binds it outside the
+> cage**, so it must exist on the host and stay inside `sun_path`'s 108 bytes.
+> Candidates under consideration: `$HOME/.husk/run/<jobid>/` (~45 bytes, shared
+> filesystem, no node-local pressure — but whether `AF_UNIX` `bind()` works there is a
+> per-site fact to measure, not assume), or `$TMPDIR` where SLURM provides a per-job
+> directory its epilog cleans.
 
 A unix socket address must fit in `sun_path` — 108 bytes, fixed by the kernel, with
 no way to ask for more. In the step spool the address was
