@@ -174,8 +174,17 @@ no memory worth reading. It exists only to keep the namespace alive.
 The trusted step-broker, which does hold MUNGE and the route to slurmctld, is in neither
 namespace: a rank cannot see it, signal it, or read it (`cma.outside`).
 
-So a rank's reach over PID 1 is: signal it, and thereby tear down its own job's ranks.
-Self-harm, not escape.
+**A rank cannot kill it either.** Measured 2026-08-02: `kill -9 1` from inside the
+namespace is silently discarded — a PID namespace's init ignores every signal it has
+not installed a handler for, and that protection holds even against `SIGKILL` from a
+namespace member. An earlier version of this document said a rank could signal PID 1
+and take its own job's ranks down with it; that was wrong, and wrong in husk's favour.
+The `kill -0` probe it rested on tests *permission*, not *delivery*.
+
+(The same rule is why husk tears the holder down with `SIGKILL` rather than `SIGTERM`:
+from an ancestor namespace those two are the only signals a handler-less init cannot
+ignore. A `SIGTERM` — including one delivered by `PDEATHSIG` — is discarded, which
+left the holder outliving its parent on every job until it was measured.)
 
 *(Earlier note, corrected: `--pidns` was thought unusable because bwrap answered `Can't send
 pid: Invalid argument`. That was a holder with no uid map — the overflow-uid case. With the

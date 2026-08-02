@@ -45,8 +45,28 @@ use std::io::Write;
 const CLONE_NEWUSER: std::os::raw::c_int = 0x1000_0000;
 const CLONE_NEWPID: std::os::raw::c_int = 0x2000_0000;
 
+const PR_SET_PDEATHSIG: std::os::raw::c_int = 1;
+/// SIGKILL, not SIGTERM, and that is a kernel rule rather than bluntness.
+///
+/// A PID namespace's init ignores every signal it has not installed a handler for — the
+/// protection that stops a rank killing the holder from inside. It applies to ANCESTOR
+/// namespaces too, with SIGKILL and SIGSTOP the only exceptions. So a PDEATHSIG of SIGTERM
+/// is silently discarded and the holder outlives its parent anyway (measured 2026-08-02:
+/// both the clean and the SIGKILL path still leaked with SIGTERM). This process holds no
+/// state and has nothing to flush, so SIGKILL costs nothing.
+const SIGKILL: std::os::raw::c_ulong = 9;
+
 extern "C" {
     fn unshare(flags: std::os::raw::c_int) -> std::os::raw::c_int;
+    fn prctl(
+        option: std::os::raw::c_int,
+        arg2: std::os::raw::c_ulong,
+        arg3: std::os::raw::c_ulong,
+        arg4: std::os::raw::c_ulong,
+        arg5: std::os::raw::c_ulong,
+    ) -> std::os::raw::c_int;
+    #[link_name = "getppid"]
+    fn libc_getppid() -> std::os::raw::c_int;
     #[link_name = "getuid"]
     fn libc_getuid() -> u32;
     #[link_name = "getgid"]
@@ -152,9 +172,35 @@ pub fn create_shared_pidns() -> Result<u32, String> {
             std::io::Error::last_os_error()
         )),
         0 => {
-            // PID 1 of the new namespace. Sleep forever: the parent kills it on shutdown,
-            // and if the parent dies first the namespace is torn down with it anyway.
-            // `pause` rather than a sleep loop so it consumes nothing at all.
+            // PID 1 of the new namespace, and the process that actually HOLDS both
+            // namespaces — so it needs its own way to die.
+            //
+            // The parent has two shutdown paths (stdin EOF, PDEATHSIG) precisely so a
+            // namespace is never leaked per job. That intent used to stop at the parent:
+            // this child had neither, and the parent exited without killing it, so the
+            // process holding the namespaces was orphaned on EVERY job (measured
+            // 2026-08-02: ppid reparented to 1 while the child ran on). SLURM's cgroup
+            // teardown reaps it in practice, which is why nothing broke — but relying on
+            // that silently is not the same as saying so, and a proctrack plugin that is
+            // not cgroup-based would leak a namespace per job on a node that reboots
+            // rarely.
+            //
+            // So: PDEATHSIG here as well. Belt to the parent's braces, the same pairing
+            // the step-broker already uses.
+            // SAFETY: PR_SET_PDEATHSIG with a signal number; extra args are ignored.
+            unsafe { prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0) };
+            // The parent may already have died between fork and prctl, in which case the
+            // signal will never arrive.
+            // SAFETY: getppid takes no arguments and cannot fail.
+            if unsafe { libc_getppid() } == 1 {
+                std::process::exit(0);
+            }
+            // Sleep forever. `pause` rather than a sleep loop so it consumes nothing.
+            //
+            // NB it does not reap: orphaned ranks reparent to this PID 1 and their zombies
+            // accumulate for the job's lifetime. Harmless — the namespace and every zombie
+            // in it are destroyed when the job ends — and a subtly wrong reap loop would be
+            // worse than none.
             loop {
                 // SAFETY: pause takes no arguments and only returns on a signal.
                 unsafe { libc_pause() };

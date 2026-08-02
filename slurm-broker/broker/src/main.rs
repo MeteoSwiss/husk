@@ -87,6 +87,8 @@ fn die_with_parent() {
 extern "C" {
     #[link_name = "getppid"]
     fn libc_getppid() -> std::os::raw::c_int;
+    #[link_name = "kill"]
+    fn libc_kill(pid: std::os::raw::c_int, sig: std::os::raw::c_int) -> std::os::raw::c_int;
 }
 
 // ---- orderly shutdown, so the spool does not outlive the session -------------
@@ -250,6 +252,16 @@ fn hold_cage_mode() -> ! {
             Ok(_) => continue,       // nothing is expected on this channel; ignore it
         }
     }
+    // Take the namespace holder down explicitly. It has PDEATHSIG too, but that only fires
+    // when THIS process dies — and on the clean path we exit deliberately, so saying so is
+    // what makes the teardown deterministic rather than a race between exit() and the
+    // kernel's parent-death delivery.
+    //
+    // SIGKILL, not SIGTERM: the holder is PID 1 of its namespace, and a namespace init
+    // ignores any signal it has no handler for — even from an ancestor namespace, where
+    // SIGKILL and SIGSTOP are the only exceptions. SIGTERM here is silently discarded.
+    // SAFETY: kill(2) with a signal number; the child is ours and not yet reaped.
+    unsafe { libc_kill(held as i32, 9) };
     std::process::exit(0);
 }
 
