@@ -1556,42 +1556,105 @@ echo "===HUSK-PROBE-END==="
     # It looks for the KNOWN probe job's directory, never "any husk directory": another of
     # this user's jobs could legitimately be running on the same node with a live one, and
     # a check that cannot tell those apart would cry wolf.
+    #
+    # THIS ONE JOB IS DELIBERATELY *NOT* BROKERED, AND THAT IS THE WHOLE POINT.
+    # The first version of this arm went through the broker like every other probe, so it
+    # ran INSIDE the cage - and the cage mounts `--tmpfs /tmp`, with only the egress SOCKET
+    # bound back in, never the directory. A caged probe therefore looks for the previous
+    # job's directory in a fresh, empty tmpfs and cannot find it whether or not the leak is
+    # real: it reported PASS unconditionally. The observer has to be OUTSIDE the boundary
+    # whose leakage it is measuring, and the selftest is the trusted layer, so it submits
+    # this one with plain sbatch. Same reason the process check below can work at all.
     if [ -z "${PROBE_NODE:-}" ] || [ -z "${PROBE_JID:-}" ]; then
       check SKIP containment tmp.reclaimed "no probe node/job recorded - cannot pin the follow-up job"
     else
-      LEFT_BODY="echo ===HUSK-PROBE-BEGIN===
-if [ -d /tmp/husk-\$(id -u)-$PROBE_JID ]; then
-  echo \"RESULT FAIL containment tmp.reclaimed /tmp/husk-\$(id -u)-$PROBE_JID survived job $PROBE_JID on \$(hostname) - node-local scratch accumulates\"
+      LSCRIPT="$WORK/husk-leftover.sh"
+      # Quoted heredoc: nothing expands here, the job id travels in the ENVIRONMENT via
+      # --export. An unquoted heredoc has interpolated a value at file-creation time more
+      # than once in this suite.
+      cat > "$LSCRIPT" <<'HUSKLEFT'
+#!/bin/bash
+# Written by husk selftest.sh. Runs UNCAGED on purpose - see the call site.
+echo ===HUSK-PROBE-BEGIN===
+jid="${HUSK_PROBE_JID:-}"
+d="/tmp/husk-$(id -u)-$jid"
+if [ -d "$d" ]; then
+  echo "RESULT FAIL containment tmp.reclaimed $d survived job $jid on $(hostname) - node-local scratch accumulates"
 else
-  echo \"RESULT PASS containment tmp.reclaimed job $PROBE_JID left no /tmp directory behind on \$(hostname)\"
+  echo "RESULT PASS containment tmp.reclaimed job $jid left no /tmp directory behind on $(hostname)"
 fi
-echo ===HUSK-PROBE-END==="
-      reset_spool
-      mkreq leftover sbatch "[\"--partition=$PART\",\"--nodelist=$PROBE_NODE\",\"--time=00:02:00\"]" "$WORK" "$LEFT_BODY"
-      run_broker live "$SPOOL/out.leftover" "$WORK"
-      LJID="$(respfield leftover job_id)"
-      if [ "$(respfield leftover status)" != submitted ]; then
-        check SKIP containment tmp.reclaimed "follow-up job not submitted: $(respfield leftover message | head -c 70)"
-      else
-        # 30s cap: if someone else holds the node the job stays queued, and that says
-        # nothing about husk. Skipping beats a red arm nobody can act on.
-        _w=0
-        while squeue -h -j "$LJID" 2>/dev/null | grep -q . && [ "$_w" -lt 30 ]; do sleep 1; _w=$((_w+1)); done
-        if squeue -h -j "$LJID" 2>/dev/null | grep -q .; then
-          scancel "$LJID" >/dev/null 2>&1
-          check SKIP containment tmp.reclaimed "follow-up job did not start on $PROBE_NODE within 30s (node busy) - cancelled"
-        else
-          sleep 1
-          LOUT="$WORK/slurm-$LJID.out"
-          if [ -f "$LOUT" ]; then
-            while IFS= read -r line; do
-              case "$line" in "RESULT "*) read -r _kw v tt id rest <<<"$line"; check "$v" "$tt" "$id" "$rest" ;; esac
-            done < "$LOUT"
+# Stray PROCESSES from the finished job. The namespace holder child was orphaned on every
+# job until 9faad58, and what actually reaped it was SLURM cgroup proctrack - an unstated
+# dependency on site configuration. Assert the outcome instead of assuming it.
+# pgrep WITHOUT -f, so it matches comm and cannot match this script by its own text.
+# Each candidate is attributed by its OWN SLURM_JOB_ID, so a different live job of ours on
+# this node is not mistaken for a leak.
+stray=0
+for c in husk-slurm-brok socat; do
+  for p in $(pgrep -u "$(id -u)" "$c" 2>/dev/null); do
+    e="/proc/$p/environ"
+    [ -r "$e" ] || continue
+    if tr "\0" "\n" < "$e" 2>/dev/null | grep -qx "SLURM_JOB_ID=$jid"; then
+      stray=$((stray + 1))
+      echo "husk-selftest: leaked $c pid $p from job $jid"
+    fi
+  done
+done
+if [ "$stray" -gt 0 ]; then
+  echo "RESULT FAIL containment proc.reclaimed $stray husk process(es) from job $jid still alive on $(hostname)"
+else
+  echo "RESULT PASS containment proc.reclaimed job $jid left no husk process behind on $(hostname)"
+fi
+echo ===HUSK-PROBE-END===
+HUSKLEFT
+      chmod +x "$LSCRIPT"
+      LARGS=(--parsable --partition="$PART" --nodelist="$PROBE_NODE" --time=00:02:00
+             --nodes=1 --chdir="$WORK" --output="$WORK/slurm-%j.out"
+             --export="ALL,HUSK_PROBE_JID=$PROBE_JID")
+      [ -n "$ACCT" ] && LARGS+=(--account="$ACCT")
+      LJID="$(sbatch "${LARGS[@]}" "$LSCRIPT" 2>&1)"
+      LJID="${LJID%%;*}"
+      case "$LJID" in
+        ''|*[!0-9]*)
+          check SKIP containment tmp.reclaimed "follow-up job not submitted: $(printf '%s' "$LJID" | head -c 70)"
+          check SKIP containment proc.reclaimed "follow-up job not submitted"
+          ;;
+        *)
+          # 30s cap: if someone else holds the node the job stays queued, and that says
+          # nothing about husk. Skipping beats a red arm nobody can act on.
+          _w=0
+          while squeue -h -j "$LJID" 2>/dev/null | grep -q . && [ "$_w" -lt 30 ]; do sleep 1; _w=$((_w+1)); done
+          if squeue -h -j "$LJID" 2>/dev/null | grep -q .; then
+            scancel "$LJID" >/dev/null 2>&1
+            check SKIP containment tmp.reclaimed "follow-up job did not start on $PROBE_NODE within 30s (node busy) - cancelled"
+            check SKIP containment proc.reclaimed "follow-up job did not start on $PROBE_NODE within 30s (node busy)"
           else
-            check SKIP containment tmp.reclaimed "no output from the follow-up job at $LOUT"
+            sleep 1
+            LOUT="$WORK/slurm-$LJID.out"
+            if [ -f "$LOUT" ]; then
+              _seen_tmp=0; _seen_proc=0
+              while IFS= read -r line; do
+                case "$line" in
+                  "RESULT "*)
+                    read -r _kw v tt id rest <<<"$line"
+                    check "$v" "$tt" "$id" "$rest"
+                    [ "$id" = tmp.reclaimed ] && _seen_tmp=1
+                    [ "$id" = proc.reclaimed ] && _seen_proc=1
+                    ;;
+                esac
+              done < "$LOUT"
+              # An arm that never reported is not a pass. The uncaged follow-up can fail in
+              # ways the caged one could not (no such script, a site prolog killing it), and
+              # silence used to look like green.
+              [ "$_seen_tmp" = 1 ] || check SKIP containment tmp.reclaimed "follow-up job produced no tmp.reclaimed line"
+              [ "$_seen_proc" = 1 ] || check SKIP containment proc.reclaimed "follow-up job produced no proc.reclaimed line"
+            else
+              check SKIP containment tmp.reclaimed "no output from the follow-up job at $LOUT"
+              check SKIP containment proc.reclaimed "no output from the follow-up job at $LOUT"
+            fi
           fi
-        fi
-      fi
+          ;;
+      esac
     fi
 
     # The step pair, end to end, by SHELLING OUT to srun-probe.sh rather than

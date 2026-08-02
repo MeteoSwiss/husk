@@ -195,6 +195,7 @@ Arms worth reading rather than tallying, because each is the only witness to som
 |---|---|
 | `steps.egress` | a RANK can reach the proxy. `net.live` tests the job cage and cannot see this — ranks had no socat and no socket until 2026-08-02, silently |
 | `tmp.reclaimed` | the node-local egress directory really disappears. Runs a second job pinned to the first job's node; SKIPs if that node is busy |
+| `proc.reclaimed` | the finished job left no husk process on the node. Rides the same follow-up job, and is the only check on the holder's lifetime that does not assume the site runs cgroup proctrack |
 | `sbatch.partition_list` | a job may request the SECOND allowed partition. SKIPs unless `HUSK_SLURM_PARTITION` holds a list |
 | `uenv.mounted` | the session uenv reached the cage. SKIPs unless a uenv was active before husk started |
 | `guard.preempt_*` | a job cut short says its output is incomplete, and still cleans up |
@@ -202,6 +203,16 @@ Arms worth reading rather than tallying, because each is the only witness to som
 
 A SKIP is not a pass. Three of those skip unless you set something up first: start a uenv,
 install with a partition list, and leave the node free enough for the follow-up job.
+
+**And a PASS is not a pass either, if the probe could not have failed.** `tmp.reclaimed`
+first shipped as a brokered job like every other probe, which meant it ran *inside* the
+cage — and the cage mounts `--tmpfs /tmp`, binding back only the egress socket, never the
+directory. It looked for the previous job's directory in an empty tmpfs, so it reported
+PASS on its first hardware run without being able to observe a leak at all. The follow-up
+job is now submitted with plain `sbatch`, uncaged, because the selftest is the trusted
+layer and may do that. **The observer has to sit outside the boundary whose leakage it is
+measuring** — the same reason the caged agent never authors its own verdict. Both arms are
+checked against a planted directory and a planted process before being believed.
 
 ## Watch-outs
 - **Run from a bounded scratch project dir, not `/users` and not the scratch root
