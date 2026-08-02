@@ -1207,17 +1207,45 @@ fi
 # CPU/NUMA pinning must work in the cage — ICON (and every MPI/OpenMP job) pins via
 # sched_setaffinity (numactl --cpunodebind / srun --cpu-bind). If the seccomp filter
 # blocks it, the bound child dies with SIGSYS. Mirror ICON s numactl call.
-aff_cmd=""
-if command -v numactl >/dev/null 2>&1; then aff_cmd="numactl --cpunodebind=0 --membind=0 true"
-elif command -v taskset >/dev/null 2>&1; then aff_cmd="taskset -c 0 true"; fi
-if [ -n "$aff_cmd" ]; then
-  if $aff_cmd 2>/dev/null; then
-    echo "RESULT PASS functional cpu.affinity [$aff_cmd] works - sched_setaffinity allowed (ICON/MPI pinning ok)"
+# TWO different things can make a pinning call fail and ONLY ONE OF THEM IS OURS:
+#   - our seccomp filter refusing sched_setaffinity: the child dies with SIGSYS, which the
+#     shell reports as 128+31 = 159. That is a cage bug.
+#   - the node topology and the jobs cpuset: numactl --cpunodebind=0 needs NUMA node 0 to
+#     hold a CPU this job actually owns. On a CPU-only partition it may not. That says
+#     nothing about husk.
+# The old arm ran numactl, threw stderr away, and on any non-zero status announced
+# "sched_setaffinity likely blocked" - claiming a cause it could not know, which is exactly
+# what the teaching-message rules forbid. It failed on pp-short for, most likely, the second
+# reason. READ THE ERRNO BEFORE BLAMING THE FILTER.
+#
+# So: the primary arm is topology-INDEPENDENT - pin to a CPU we demonstrably own.
+# NO APOSTROPHES IN THIS BLOCK - single-quoted probe body. That rules out awk //{} here.
+aff_cpu="$(grep Cpus_allowed_list /proc/self/status 2>/dev/null | tr -s " \t" " " | cut -d" " -f2 | cut -d, -f1 | cut -d- -f1)"
+if command -v taskset >/dev/null 2>&1 && [ -n "$aff_cpu" ]; then
+  aff_err="$(taskset -c "$aff_cpu" true 2>&1)"; aff_rc=$?
+  if [ "$aff_rc" -eq 0 ]; then
+    echo "RESULT PASS functional cpu.affinity [taskset -c $aff_cpu] works - sched_setaffinity allowed (ICON/MPI pinning ok)"
+  elif [ "$aff_rc" -eq 159 ]; then
+    echo "RESULT FAIL functional cpu.affinity taskset died with SIGSYS - the seccomp filter blocks sched_setaffinity; ICON pinning would die"
   else
-    echo "RESULT FAIL functional cpu.affinity [$aff_cmd] FAILED - sched_setaffinity likely blocked; ICON numactl start would SIGSYS"
+    echo "RESULT FAIL functional cpu.affinity taskset -c $aff_cpu exited $aff_rc (not SIGSYS): ${aff_err:-no stderr}"
   fi
 else
-  echo "RESULT INFO functional cpu.affinity no numactl/taskset in cage - skipped"
+  echo "RESULT INFO functional cpu.affinity no taskset or no readable cpu list in cage - skipped"
+fi
+
+# Secondary, and deliberately NOT a FAIL when the topology is the reason: this mirrors the
+# exact numactl call ICON starts with, so a regression that only shows up under NUMA binding
+# is still visible - but a partition whose NUMA node 0 holds no CPU for us is not a finding.
+if command -v numactl >/dev/null 2>&1; then
+  numa_err="$(numactl --cpunodebind=0 --membind=0 true 2>&1)"; numa_rc=$?
+  if [ "$numa_rc" -eq 0 ]; then
+    echo "RESULT PASS functional cpu.numabind [numactl --cpunodebind=0 --membind=0] works - ICON numactl start ok"
+  elif [ "$numa_rc" -eq 159 ]; then
+    echo "RESULT FAIL functional cpu.numabind numactl died with SIGSYS - the seccomp filter blocks the NUMA bind"
+  else
+    echo "RESULT INFO functional cpu.numabind numactl declined (rc=$numa_rc, not SIGSYS): ${numa_err:-no stderr} - NUMA node 0 likely holds no CPU in this allocation; not a cage finding"
+  fi
 fi
 
 # Cross Memory Attach. The single-node profile EXEMPTS process_vm_readv from the
