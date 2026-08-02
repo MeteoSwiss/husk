@@ -42,13 +42,14 @@ submission error becomes a `rejected`/`error` response, never a silent pass.
 ## Policy
 
 ### Partition — reject and teach (no silent rewrite)
-Only **one** partition is permitted, and the broker both requires the agent to
-request it and forces it on the real CLI. The partition is **site-configurable**
-via `HUSK_SLURM_PARTITION` in the broker's trusted env (operator-set,
-agent-inaccessible), defaulting to `preemptible`. It is NOT hard-coded: Balfrin has
-`preemptible`; Santis does not (use `debug` or `shared`), so submitting there with
-the default fails at sbatch (`invalid partition "preemptible"`). Pick a
-low-priority/preemptible partition — every brokered job lands on it.
+A brokered job may use only the partitions the operator allowed, and the broker both
+requires the agent to name one and emits its own copy on the real CLI. The set is
+**site-configurable** via `HUSK_SLURM_PARTITION` in the broker's trusted env
+(operator-set, agent-inaccessible), defaulting to `preemptible`. It is NOT hard-coded:
+Balfrin has `preemptible`; Santis does not (use `debug` or `shared`), so submitting
+there with the default fails at sbatch (`invalid partition "preemptible"`). Prefer
+low-priority/preemptible partitions — every brokered job lands on one of them, and
+that is what makes the partition the resource-envelope control (see THREAT-MODEL.md).
 
 `HUSK_SLURM_PARTITION` is a **comma-separated list**, because a cluster is not
 homogeneous: on Balfrin `short` is the GPU partition and `pp-short` the CPU-only
