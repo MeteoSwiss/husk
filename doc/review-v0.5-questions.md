@@ -7,6 +7,25 @@ each item gets expanded into a full review request (scope, instrument, what evid
 Grouped by **instrument**, not by topic — grouping by topic is what overscoped the first
 attempt, because the same question then had to be asked three ways.
 
+## Two passes: discovery, then triage
+
+The v0.4 review ran as **propose-and-verify** and that is the shape to keep. Pass 1 produces
+*candidate findings*; pass 2 **triages** them — confirm with a reproducer, or refute. The
+reason this works is the **generator–verifier gap**: checking a specific claim is far cheaper
+and more reliable than producing it, so the expensive pass can afford to be speculative.
+
+Rules that made it work last time, and are not optional:
+
+- **Triage is INDEPENDENT.** A fresh agent gets the claim and the repo, *not* the finder's
+  reasoning. An agent handed its own argument agrees with itself; that is not a check.
+- **Refuted is a real outcome, and it gets recorded.** `doc/broker-security-review.md` has a
+  "What held up (refuted findings)" section. A refuted finding is evidence about the system.
+- **Every finding carries a verdict**: `CONFIRMED` (reproducer exists), `REFUTED`, or
+  `PLAUSIBLE` (argued but not reproduced — explicitly *not* the same as confirmed).
+- **For workstream A, the reproducer should be a selftest arm.** We already turn each bug into
+  an invariant test; doing it during triage means the pipeline is candidate →
+  confirmed-with-arm → fix, and the arm outlives the review and blocks the regression.
+
 ## Standing rules for every workstream
 
 - **Falsification only.** "Try to break X" beats "assess X".
