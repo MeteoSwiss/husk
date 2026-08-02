@@ -26,6 +26,33 @@ Rules that made it work last time, and are not optional:
   an invariant test; doing it during triage means the pipeline is candidate →
   confirmed-with-arm → fix, and the arm outlives the review and blocks the regression.
 
+## Run configuration (model and effort)
+
+Model: **Opus 5** throughout. Effort is **xhigh by default**, with `max` on four briefs only.
+
+| briefs | effort | why |
+|---|---|---|
+| A3, A5, A9, B5 | **max** | creative hypothesis generation — parser differentials, cross-hop laundering, quoting subtleties. The finding is by definition not on any list, so depth is the work. |
+| A1, A2, A4, A6, A7, A8 | xhigh | well-scoped surfaces; the briefs already name the starting points. |
+| B1, B2, B6 | xhigh | **enumeration tasks — completeness beats depth.** The deliverable is a table; max risks narrative instead of coverage. |
+| B3, B4, C1, C2, C3 | xhigh | bounded, largely mechanical. |
+| **every triage pass** | xhigh | verification is bounded. "Can I reproduce this" rewards skepticism, not depth. |
+| **the coordinator** | xhigh during the run, **max for synthesis and fixes** | most coordinator turns are dispatch and relay, where depth buys nothing and cost scales with turn count. Depth pays at the end: spotting that two findings share a root cause, and ordering the fixes. |
+
+Two reasons this is not "max everywhere":
+
+- **The two-pass design already absorbs false positives.** Discovery may be speculative because
+  triage demands a reproducer, so the cost of an over-eager finding is one triage step, not a
+  wrong fix. That makes high effort safe — but it does not make it free.
+- **The briefs substitute for reasoning budget.** Each one states what the code does today, so
+  the agent starts at the edge instead of rediscovering `confine_under_any`. A well-scoped
+  brief at xhigh generally beats a vague one at max.
+
+**Calibration, if you want evidence instead of this argument:** run **B2** at both levels and
+compare. It has an objectively checkable output — there are ~52 refusal sites, and either the
+agent enumerated them all or it did not. If max adds nothing there, that is evidence for xhigh
+across all the enumeration work.
+
 ## Rules of engagement (binding on the offensive workstream A)
 
 "Try to break it" is not a licence to cause harm on a shared cluster. A finding is
