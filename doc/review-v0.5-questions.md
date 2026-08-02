@@ -60,7 +60,17 @@ worth more than a detonated one.
   to its own containment.
 - **Exercise error paths, do not audit them.** Both cleanup bugs we found were found by
   *doing* — looking at the directory afterwards, sending the signal — not by reading code.
-- ≤4 concurrent agents, MAX account, **sequential** rather than wide fan-out.
+- **Concurrency: up to 5, but not uniformly.** B and C are code-only with no shared state and
+  can run 5-wide. **Workstream A is different, for a correctness reason rather than a billing
+  one:** its agents share one cluster and several observe global state. A6 tests "cancel a job
+  this session did not submit" — concurrent agents' jobs muddy that; A4 pins to a known job on
+  a known node; two agents submitting to the same partition contend for nodes and turn real
+  results into timeouts. **Run the cluster-touching A briefs one at a time**, or give each its
+  own partition and workdir and say so in the brief. The non-submitting parts of A (A7's
+  message collection, A8's analysis) can overlap freely.
+- A usage-limit hit costs whatever is in flight, so wide fan-out also loses more work per
+  interruption. That argues for width where the work is cheap to redo (B, C) and depth-first
+  where it is not (A, which holds cluster state).
 
 ---
 
