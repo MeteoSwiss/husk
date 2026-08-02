@@ -1667,6 +1667,23 @@ HUSKLEFT
     # Same shape, for the other place a second parser reads husk's input: slurmd's own
     # reading of the `#SBATCH` lines husk forwarded.
     run_directive_parity_probe
+
+    # THE STEP SPOOL, AFTER REAL JOBS. `guard.spool_removed` runs the guard on the LOGIN
+    # node, so it proves the cleanup code works - not that it ran after a job that SLURM
+    # started, signalled and tore down on a compute node. That gap is not hypothetical: a
+    # real ICON run left `.husk-step-spool-4992187` behind with a socat still in it, and
+    # nothing in the suite would have noticed.
+    #
+    # The spool lives in the WORKDIR, on the shared filesystem, so unlike the node-local
+    # /tmp directory it needs no second job - the login node can simply look. Every
+    # brokered job above has finished by now, and the uncaged follow-up job runs no guard,
+    # so anything still here is a leak.
+    SLEFT="$(ls -d "$WORK"/.husk-step-spool-* 2>/dev/null | tr '\n' ' ')"
+    if [ -z "$SLEFT" ]; then
+      check PASS containment job.spool_reclaimed "no step spool survived a real compute job in $WORK"
+    else
+      check FAIL containment job.spool_reclaimed "step spool(s) left by a real job: $SLEFT holding $(ls -A $SLEFT 2>/dev/null | tr '\n' ' ')"
+    fi
   fi
 else
   echo
