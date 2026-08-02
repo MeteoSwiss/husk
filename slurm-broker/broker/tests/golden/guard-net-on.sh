@@ -74,14 +74,20 @@ export HUSK_JOB_LOG="$_husk_log"
   _husk_socat=
   _husk_socat_src=$(command -v socat 2>/dev/null || true)
   [ -n "$_husk_socat_src" ] || _husk_socat_src='<HUSK_SOCAT>'
-  if [ -x "$_husk_socat_src" ] && [ -n "$_husk_spool" ]; then
-    if : >"$_husk_spool/socat" 2>/dev/null; then
-      _husk_socat="$_husk_spool/socat"
-      _husk_extra+=(--ro-bind "$_husk_socat_src" "$_husk_socat")
-    fi
+  if [ -x "$_husk_socat_src" ]; then
+    # Bound to a path in the cage's OWN tmpfs, never over a file on the host. The previous
+    # design created an empty placeholder in the step spool and bind-mounted socat over it,
+    # which left a file that could not be removed: a dentry that is still a mountpoint
+    # cannot be unlinked, so the cleanup rm failed with EBUSY (silently, under 2>/dev/null)
+    # and every job that ran a step kept its spool. bwrap creates this mountpoint inside its
+    # own namespace and it vanishes with the cage - nothing to clean up, so nothing to leak.
+    _husk_socat=/tmp/husk-socat
+    _husk_extra+=(--ro-bind "$_husk_socat_src" "$_husk_socat")
   fi
   if [ -n "$_husk_socat" ]; then
-    export HUSK_SOCAT="$_husk_socat"
+    # The HOST path, not the in-cage one: the step-broker hands this to each rank, and a
+    # rank must bind it into its own cage (bwrap namespaces do not propagate).
+    export HUSK_SOCAT="$_husk_socat_src"
   else
     echo "husk: no socat available, so this job gets no network." >&2
     echo "husk:   looked for '<HUSK_SOCAT>'" >&2
@@ -181,6 +187,7 @@ _husk_rc=$?
 # The egress proxy holds the one route out of this job, so it dies WITH the job for the
 # same reason the step-broker does. It sets PR_SET_PDEATHSIG too; this is the belt.
 [ -n "${_husk_net_pid:-}" ] && kill "$_husk_net_pid" 2>/dev/null
+# --- husk: cleanup ---
 # ...and the node-local directory its socket lived in. Same rule as the step spool:
 # by name, then rmdir, so anything else in there keeps the directory instead of being
 # deleted. /tmp is node-local, so this is the only chance to clean it up.
@@ -205,7 +212,6 @@ fi
 if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
 rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null
-rm -f "$_husk_spool/net.sock" "$_husk_spool/socat" 2>/dev/null
 if rmdir "$_husk_spool" 2>/dev/null; then
 echo "husk: step spool removed" >>"$_husk_log" 2>/dev/null
 else
@@ -264,8 +270,8 @@ fi
 exit "$_husk_rc"
 fi
 # --- injected by husk-slurm-broker: egress relay into the cage ---
-if [ -n "${HUSK_NET_SOCK:-}" ] && [ -x "${HUSK_SOCAT:-}" ]; then
-  "$HUSK_SOCAT" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK" \
+if [ -n "${HUSK_NET_SOCK:-}" ] && [ -x "/tmp/husk-socat" ]; then
+  "/tmp/husk-socat" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK" \
     >/dev/null 2>&1 &
   export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128
   export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128

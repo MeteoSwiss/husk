@@ -137,6 +137,20 @@ pub fn env_args(
     out
 }
 
+/// Where `socat` appears INSIDE any husk cage.
+///
+/// A fixed destination in the cage's own tmpfs (`--tmpfs /tmp` is already in the cage
+/// arguments), never a file on the host. bwrap creates the mountpoint in its own namespace,
+/// so the binary is usable inside and **nothing exists on the host afterwards** — which is
+/// the whole point: the previous design bind-mounted socat over a placeholder file in the
+/// step spool, and a dentry that is still a mountpoint cannot be unlinked, so the cleanup's
+/// `rm` failed with EBUSY and every job that ran a step left its spool behind.
+///
+/// Both cages bind it themselves, to the same path, from the same host source. A rank
+/// cannot inherit the job cage's mount — bwrap namespaces do not propagate — which is why
+/// ranks previously found an EMPTY placeholder here and silently ran with no egress.
+pub const CAGED_SOCAT: &str = "/tmp/husk-socat";
+
 /// Everything a rank needs to reach the egress proxy.
 ///
 /// Both values are INHERITED from the guard through the step-broker rather than rebuilt
@@ -168,15 +182,26 @@ pub struct Egress<'a> {
 /// cannot appear inside the single-quoted assignment.
 fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     let sec = profile.seccomp_profile();
-    let cage = format!(
-        "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
-         --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
-    );
+    let cage = match net {
+        None => format!(
+            "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
+             --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
+        ),
+        // The rank binds socat itself, from the host source, to the same in-cage path the
+        // job cage uses. Inheriting was never possible: bwrap mount namespaces do not
+        // propagate, so a rank saw the job cage's placeholder rather than its contents.
+        Some(e) => format!(
+            "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
+             --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" \
+             --ro-bind-try {src} {CAGED_SOCAT} --",
+            src = sh_quote(e.socat)
+        ),
+    };
     match net {
         None => format!("exec {cage} \"$@\"\n"),
         Some(e) => format!(
             "export _HUSK_NET_SOCK={sock}\n\
-             export _HUSK_SOCAT={socat}\n\
+             export _HUSK_SOCAT={caged}\n\
              _husk_inner='if [ -x \"$_HUSK_SOCAT\" ]; then\n\
              \"$_HUSK_SOCAT\" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 \
              UNIX-CONNECT:\"$_HUSK_NET_SOCK\" >/dev/null 2>&1 &\n\
@@ -188,7 +213,7 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
              exec \"$@\"'\n\
              exec {cage} /bin/sh -c \"$_husk_inner\" husk-rank \"$@\"\n",
             sock = sh_quote(e.sock),
-            socat = sh_quote(e.socat)
+            caged = CAGED_SOCAT
         ),
     }
 }

@@ -100,6 +100,7 @@ _husk_rc=$?
 # The egress proxy holds the one route out of this job, so it dies WITH the job for the
 # same reason the step-broker does. It sets PR_SET_PDEATHSIG too; this is the belt.
 [ -n "${_husk_net_pid:-}" ] && kill "$_husk_net_pid" 2>/dev/null
+# --- husk: cleanup ---
 # ...and the node-local directory its socket lived in. Same rule as the step spool:
 # by name, then rmdir, so anything else in there keeps the directory instead of being
 # deleted. /tmp is node-local, so this is the only chance to clean it up.
@@ -124,7 +125,6 @@ fi
 if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
 rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null
-rm -f "$_husk_spool/net.sock" "$_husk_spool/socat" 2>/dev/null
 if rmdir "$_husk_spool" 2>/dev/null; then
 echo "husk: step spool removed" >>"$_husk_log" 2>/dev/null
 else

@@ -628,14 +628,20 @@ fn wrap_script(
   _husk_socat=
   _husk_socat_src=$(command -v socat 2>/dev/null || true)
   [ -n "$_husk_socat_src" ] || _husk_socat_src={socat_q}
-  if [ -x "$_husk_socat_src" ] && [ -n "$_husk_spool" ]; then
-    if : >"$_husk_spool/socat" 2>/dev/null; then
-      _husk_socat="$_husk_spool/socat"
-      _husk_extra+=(--ro-bind "$_husk_socat_src" "$_husk_socat")
-    fi
+  if [ -x "$_husk_socat_src" ]; then
+    # Bound to a path in the cage's OWN tmpfs, never over a file on the host. The previous
+    # design created an empty placeholder in the step spool and bind-mounted socat over it,
+    # which left a file that could not be removed: a dentry that is still a mountpoint
+    # cannot be unlinked, so the cleanup rm failed with EBUSY (silently, under 2>/dev/null)
+    # and every job that ran a step kept its spool. bwrap creates this mountpoint inside its
+    # own namespace and it vanishes with the cage - nothing to clean up, so nothing to leak.
+    _husk_socat={caged_socat}
+    _husk_extra+=(--ro-bind "$_husk_socat_src" "$_husk_socat")
   fi
   if [ -n "$_husk_socat" ]; then
-    export HUSK_SOCAT="$_husk_socat"
+    # The HOST path, not the in-cage one: the step-broker hands this to each rank, and a
+    # rank must bind it into its own cage (bwrap namespaces do not propagate).
+    export HUSK_SOCAT="$_husk_socat_src"
   else
     echo "husk: no socat available, so this job gets no network." >&2
     echo "husk:   looked for {socat_q}" >&2
@@ -692,14 +698,15 @@ fn wrap_script(
     echo "husk:   route a job's egress through a directory it does not control." >&2
     _husk_net_dir=
   fi
-"#
+"#,
+                caged_socat = crate::rank::CAGED_SOCAT,
             ),
             // Inside the cage. The relay is a byte-shuffler with no policy in it — every
             // decision was made outside. It binds LOOPBACK ONLY, which is all the netns
             // has: bwrap brings `lo` up and there is no other route (both measured).
             r#"# --- injected by husk-slurm-broker: egress relay into the cage ---
-if [ -n "${HUSK_NET_SOCK:-}" ] && [ -x "${HUSK_SOCAT:-}" ]; then
-  "$HUSK_SOCAT" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK" \
+if [ -n "${HUSK_NET_SOCK:-}" ] && [ -x "{caged_socat}" ]; then
+  "{caged_socat}" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK" \
     >/dev/null 2>&1 &
   export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128
   export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
@@ -710,7 +717,10 @@ elif [ -n "${HUSK_NET_SOCK:-}" ]; then
   echo "husk: no network. The proxy outside the cage refused nothing." >&2
 fi
 "#
-            .to_string(),
+            // A plain replace rather than format!: this block is shell full of ${...}, and
+            // every one of them would need brace-doubling inside a format string. That is
+            // exactly how a literal `{socat_q}` once shipped into the guard.
+            .replace("{caged_socat}", crate::rank::CAGED_SOCAT),
         )
     } else {
         (String::new(), String::new())
@@ -830,6 +840,7 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   # The egress proxy holds the one route out of this job, so it dies WITH the job for the\n\
   # same reason the step-broker does. It sets PR_SET_PDEATHSIG too; this is the belt.\n\
   [ -n \"${{_husk_net_pid:-}}\" ] && kill \"$_husk_net_pid\" 2>/dev/null\n\
+  # --- husk: cleanup ---\n\
   # ...and the node-local directory its socket lived in. Same rule as the step spool:\n\
   # by name, then rmdir, so anything else in there keeps the directory instead of being\n\
   # deleted. /tmp is node-local, so this is the only chance to clean it up.\n\
@@ -854,7 +865,6 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
     rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
     rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* 2>/dev/null\n\
-    rm -f \"$_husk_spool/net.sock\" \"$_husk_spool/socat\" 2>/dev/null\n\
     if rmdir \"$_husk_spool\" 2>/dev/null; then\n\
       echo \"husk: step spool removed\" >>\"$_husk_log\" 2>/dev/null\n\
     else\n\
@@ -1643,7 +1653,7 @@ mod tests {
             // Everything from the cleanup marker to the end of the guard: the step spool
             // block and the egress-directory block both live in there.
             let block = script
-                .split_once("# --- husk: remove the step spool")
+                .split_once("# --- husk: cleanup ---")
                 .map(|(_, rest)| rest.split_once("if [ \"$_husk_rc\"").map(|(c, _)| c).unwrap_or(rest))
                 .unwrap_or_else(|| panic!("no marked cleanup block in the guard:\n{script}"));
             // CODE ONLY. The first version of this test searched the whole block, and the

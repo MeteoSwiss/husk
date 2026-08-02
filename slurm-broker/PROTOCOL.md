@@ -67,7 +67,7 @@ in* may be re-wired later (e.g. for `srun`/recursive brokering). Keep this versi
 ## The step spool (compute side)
 
 `<workdir>/.husk-step-spool-<jobid>/`, holding the srun request/response pair and
-the bind target for `socat`. Per-job by construction,
+the step-broker's captured stdout/stderr. Per-job by construction,
 and removed when the job ends — by name, then `rmdir`, never `rm -rf`: the cleanup
 runs with the user's rights in a directory the *job* can write, so a recursive
 delete would be a deletion primitive aimed at whatever else ended up there. If
@@ -82,20 +82,21 @@ script — and from `step.rs`, the *other* producer, which the first version of 
 test ignored: a completeness check has to cover the **directory**, not one writer of
 it.
 
-**Known open bug (2026-08-02):** a job that runs an `srun` step still leaves the
-empty `socat` placeholder behind, so the `rmdir` fails and the directory persists.
-The cleanup runs and the `rm` fails: `socat` is a **bind-mount target**, and a dentry
-that is still a mountpoint cannot be unlinked (`EBUSY`) while anything holds that
-mount — rank cages and their relays can outlive the job's own `bwrap` by moments. A
-later manual `rm` succeeds, which is what makes it look mysterious. Every path
-through the cleanup now reports itself, so the next occurrence names its own cause.
+**Fixed 2026-08-02.** A job that ran an `srun` step used to leave the empty `socat`
+placeholder behind, so the `rmdir` failed and the directory persisted. The cleanup
+ran and the `rm` failed: `socat` was a **bind-mount target**, and a dentry that is
+still a mountpoint cannot be unlinked (`EBUSY`) while anything holds that mount —
+rank cages and their relays can outlive the job's own `bwrap` by moments. A later
+manual `rm` succeeded, which is what made it look mysterious.
 
-The fix is structural rather than another filename: **stop creating a bind-mount
-target inside a directory we intend to delete.** `--ro-bind <socat> /tmp/husk-socat`
-places it in the cage's *own* tmpfs — measured: the binary is usable inside and
-nothing exists on the host afterwards — so there is no placeholder and no cleanup.
-The bind *source* is read in the host namespace before the cage is sealed, so this
-needs no re-exposure of `$HOME`.
+The fix was structural rather than another filename: **stop creating a bind-mount
+target inside a directory you intend to delete.** `socat` is now bound to
+`/tmp/husk-socat` in the cage's *own* tmpfs. bwrap creates that mountpoint inside its
+namespace, so the binary is usable inside and **nothing exists on the host** — no
+placeholder, nothing to clean up, nothing to leak. The bind *source* is read in the
+host namespace before the cage is sealed, so this needs no re-exposure of `$HOME`.
+
+The step spool now holds only `req-*.json`, `resp-*.json`, `out-*` and `err-*`.
 
 ## The egress socket is not in the step spool
 
