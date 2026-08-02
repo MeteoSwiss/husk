@@ -187,6 +187,22 @@ user's working directory and is removed when the job ends, so nothing accumulate
 there — and it never held the evidence, because a log inside a directory the job can
 write is one the job can rewrite.
 
+## What a green `--full` run looks like now
+
+Arms worth reading rather than tallying, because each is the only witness to something:
+
+| arm | what it alone proves |
+|---|---|
+| `steps.egress` | a RANK can reach the proxy. `net.live` tests the job cage and cannot see this — ranks had no socat and no socket until 2026-08-02, silently |
+| `tmp.reclaimed` | the node-local egress directory really disappears. Runs a second job pinned to the first job's node; SKIPs if that node is busy |
+| `sbatch.partition_list` | a job may request the SECOND allowed partition. SKIPs unless `HUSK_SLURM_PARTITION` holds a list |
+| `uenv.mounted` | the session uenv reached the cage. SKIPs unless a uenv was active before husk started |
+| `guard.preempt_*` | a job cut short says its output is incomplete, and still cleans up |
+| `cma.peers` / `cma.outside` | ranks can name each other (MPI works) while the step-broker is invisible to them |
+
+A SKIP is not a pass. Three of those skip unless you set something up first: start a uenv,
+install with a partition list, and leave the node free enough for the follow-up job.
+
 ## Watch-outs
 - **Run from a bounded scratch project dir, not `/users` and not the scratch root
   (CSCS):** the broker rejects a job whose workdir is under a hidden home (`/users/...`)
