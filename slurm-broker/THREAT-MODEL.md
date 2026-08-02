@@ -324,6 +324,38 @@ glued spelling) were all *visible holes* in it:
 | **node/resources** | `--nodes/--time/--mem/--gpus` … | parse → validate (per-option grammar) → re-emit canonically; reject unknown/invalid (`interpret_cli`) | allowlist by construction — **shape only, not magnitude**: see "The resource envelope" below |
 | **identity** | — (runs as you; MUNGE) | not settable via submission | n/a |
 
+### The second mutating verb: `scancel`, gated on provenance
+
+Everything above governs *creating* work. `scancel` is the only other mutating verb husk
+brokers, and it needs its own answer, because the harm is not confidentiality — it is
+**destroying work that is already running**. On a shared cluster that is the resource
+envelope again, pointed backwards: cancelling a colleague's 24-hour production run is worse
+than most reads an escaped agent could manage. And SLURM will not stop it, because the agent's
+jobs and the user's production jobs run under **the same uid** — the scheduler sees one
+person, correctly.
+
+So the gate cannot be permission (SLURM already grants it); it has to be **provenance**. The
+broker remembers the job ids *it* submitted this session and refuses every id that is not in
+that set — `Broker.submitted`, checked in `spool.rs::cancel`. Array tasks and steps
+(`4991406_3`, `4991406.0`) are mapped back to their base id first, so an agent cannot launder
+an id by decorating it.
+
+Three properties are worth naming, because each is the same discipline as the submission
+surface:
+- **Default-deny on the option surface, not a selector denylist.** Any argument starting with
+  `-` is refused outright. `-u`, `--me`, `--state=PENDING` are named in the *message* for
+  teaching, but the code never enumerates them — a future `--filter` fails closed too.
+- **Grammar, not sanitising.** An id must match `<digits>[_<digits>|.<digits>]`, ≤20 digits,
+  before it becomes an argument to the real `scancel`. Same rule as everywhere: this string
+  crosses into another program's parser.
+- **All-or-nothing.** If any id in a multi-id request is unowned, the *whole* request is
+  refused and nothing is cancelled — no partial effect, so the agent cannot discover ownership
+  by watching which of a batch died.
+
+**Residual, accepted:** the agent can still cancel jobs it submitted itself. That is the
+point — it is the same authority it already had by not submitting them. The refusal message
+lists this session's job ids, which discloses nothing: `squeue` shows them to this uid anyway.
+
 ### The resource envelope, and why the partition carries it
 
 On a shared cluster the realistic harm from a misbehaving agent is not reading

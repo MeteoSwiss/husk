@@ -16,6 +16,7 @@ are IMPLEMENTED; the rank-cage args arrive with the srun step-broker.**
 | broker refuses ptrace/CMA (`PR_SET_DUMPABLE`) | done — `df414ea` |
 | `process_vm_readv` for single-node (CMA) | done — `SINGLE_NODE_EXEMPT`, smoke 8-10 + selftest `cma.*`, **37/37 green on Balfrin** |
 | **shared user namespace per job** | **done** — `cage.rs` holder + `bwrap --userns` per rank; **ICON completed on Balfrin with CMA enabled**, no `MPICH_SMP_SINGLE_COPY_MODE=NONE` |
+| **shared PID namespace per job** | **done 2026-08-01** — job cage `--unshare-pid`, ranks JOIN via `--pidns`; selftest `pid.isolated`, `steps.pidns`, `steps.pidns_peers`, `cma.outside` |
 
 ## Why profiles exist
 
@@ -81,6 +82,15 @@ while each rank still builds its own cage. See "the unit of confinement" in
 boundary, only N copies of the same one, and one of those copies — the user namespace —
 was what blocked CMA. Joining must be **fail-closed**: a rank that cannot enter the
 shared namespace must die, never fall back to a private one.
+
+**The PID namespace follows the same rule, with one asymmetry.** The job cage creates its
+own (`--unshare-pid`); ranks **join** the job's (`bwrap --userns FD --pidns FD`) rather than
+creating one each. So ranks can see and signal each other — which MPI needs — while none of
+them can see the node: not the un-caged step-broker, not the egress proxy, not another user's
+work. Creating the namespace needs `CAP_SYS_ADMIN`, which is why the user namespace must come
+first, and a PID namespace dies with its PID 1, which is why the holder process is the thing
+that must outlive every rank. See "The PID namespace: the job cage has one, a rank cannot" in
+[THREAT-MODEL.md](THREAT-MODEL.md).
 
 Each profile is **floor + declared delta**, and every delta entry carries three fields:
 *what it opens*, *why the workload needs it*, *what compensating control bounds it*. A
