@@ -1,7 +1,6 @@
 # husk v0.5 review — pass 1 (discovery) index
 
-84 findings from 8 briefs, 3,395 lines. B5 still running at time of writing.
-Full text: `doc/review-v0.5/findings/<ID>-findings.md`. Briefs: `doc/review-v0.5/<ID>-*.md`.
+All 9 briefs complete. Full text: `doc/review-v0.5/findings/<ID>-findings.md`. Briefs: `doc/review-v0.5/<ID>-*.md`.
 
 **These are CANDIDATES.** Nothing here has been triaged. A verdict of CONFIRMED means the
 finder demonstrated it, not that an independent reviewer agreed.
@@ -68,6 +67,14 @@ finder demonstrated it, not that an independent reviewer agreed.
 - F6 — `settings.rs` states, twice, that a rank cannot do what `rank.rs` does · **CONFIRMED** (doc defect)
 - F7 — the rank script's fail-closed guarantee is shell-dependent · **CONFIRMED** (minor; bwrap covers it)
 - F8 — the namespace fds leak into the workload · **CONFIRMED** (hygiene, no impact found)
+
+## B5
+
+- F-B5-1 — An agent-chosen shebang bypasses the re-exec guard entirely — CONFIRMED
+- F-B5-2 — Head/tail split uses Rust whitespace rules, not the shell's, so lines run *above* the guard uncaged — CONFIRMED
+- F-B5-4 — The cleanup/partial-output trap covers too few signals and is installed too late — CONFIRMED
+- F-B5-3 — `cage_banner` un-quotes a non-constant value into a double-quoted `echo` — CONFIRMED (mechanism); trust-caveated
+- F-B5-5 — Cleanup enumerates spool files but misses the `.tmp` intermediates — CONFIRMED (omission); overlaps B1
 
 ## B6
 
