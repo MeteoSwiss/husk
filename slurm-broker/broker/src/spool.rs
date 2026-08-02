@@ -551,7 +551,7 @@ mod tests {
 
         let broker = Broker {
             spool: dir.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), account: None, limits: Default::default() },
+            session: Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], account: None, limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
@@ -590,7 +590,7 @@ mod tests {
 
         let broker = Broker {
             spool: spool.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), account: None, limits: Default::default() },
+            session: Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], account: None, limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
@@ -622,7 +622,7 @@ mod tests {
         let dir = scratch("cancel-own");
         let broker = Broker {
             spool: dir.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), account: None, limits: Default::default() },
+            session: Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], account: None, limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
@@ -660,7 +660,7 @@ mod tests {
         fs::write(dir.join("req-live.json"), b"{}").unwrap();
         let broker = Broker {
             spool: dir.clone(),
-            session: Session { uenv: None, view: None, required_partition: "preemptible".into(), account: None, limits: Default::default() },
+            session: Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], account: None, limits: Default::default() },
             dry_run: true,
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),

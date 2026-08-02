@@ -50,12 +50,23 @@ agent-inaccessible), defaulting to `preemptible`. It is NOT hard-coded: Balfrin 
 the default fails at sbatch (`invalid partition "preemptible"`). Pick a
 low-priority/preemptible partition — every brokered job lands on it.
 
+`HUSK_SLURM_PARTITION` is a **comma-separated list**, because a cluster is not
+homogeneous: on Balfrin `short` is the GPU partition and `pp-short` the CPU-only
+postprocessing one, and a workflow legitimately needs both. Which one a job needs is
+a hardware fact only the job knows, so husk bounds the **set** and the job picks from
+it.
+
 Resolve the effective partition from the agent's CLI args (`-p`/`--partition`) and
 `#SBATCH` directives. Then:
-- resolves to the required partition → accept
-- anything else, **or unspecified** → **reject** with a message that names the
-  required partition and tells the agent to resubmit with it (so it learns the
-  constraint and can reason about preemption).
+- resolves to one of the allowed partitions → accept, and **re-emit husk's own copy of
+  that entry** — the agent influences the value, the bytes that reach `sbatch` are
+  ours. Same construct-and-re-emit shape as `--chdir`, which is confined to the
+  writable set rather than forced to a constant.
+- names several at once (`--partition=a,b`, which real `sbatch` accepts and lets the
+  scheduler resolve) → **reject**: that would make the hardware choice implicit again,
+  and the wall-limit note describes one partition.
+- anything else, **or unspecified** → **reject** with a message naming every allowed
+  partition (so it learns the constraint and can reason about preemption).
 
 #### How that refusal is worded, and why
 

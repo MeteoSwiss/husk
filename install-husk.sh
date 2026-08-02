@@ -47,10 +47,14 @@ set -euo pipefail
 
 SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── Optional flag: --slurm-partition NAME ───────────────────────────────────────
-# The single partition the SLURM broker forces onto every agent job. Recorded for
-# husk to export as HUSK_SLURM_PARTITION. Site-specific: Balfrin uses the
-# built-in default `preemptible`; Santis has no such partition (use `debug` or `shared`).
+# ── Optional flag: --slurm-partition NAME[,NAME...] ─────────────────────────────
+# The partitions a brokered agent job may request. Recorded for husk to export as
+# HUSK_SLURM_PARTITION. Site-specific: Balfrin uses the built-in default `preemptible`;
+# Santis has no such partition (use `debug` or `shared`).
+# A COMMA-SEPARATED LIST is accepted, because a cluster is not homogeneous — on Balfrin
+# `short` is the GPU partition and `pp-short` the CPU-only postprocessing one, and a
+# workflow legitimately needs both:  --slurm-partition short,pp-short
+# The job picks one of them; husk refuses anything else and names the whole set.
 # Extracted first so the positional --help/--uninstall checks below still see $1.
 SLURM_PARTITION_ARG=""
 SLURM_ACCOUNT_ARG=""
@@ -461,10 +465,10 @@ if [[ -x "$SLURM_BROKER_SRC" && -x "$SLURM_WRAPPER_SRC" ]]; then
   SLURM_PARTITION="${SLURM_PARTITION_ARG:-${HUSK_SLURM_PARTITION:-}}"
   if [[ -n "$SLURM_PARTITION" ]]; then
     printf '%s\n' "$SLURM_PARTITION" > "$PREFIX/lib/husk/slurm-partition"
-    ok "SLURM partition → '$SLURM_PARTITION' (recorded in $PREFIX/lib/husk/slurm-partition)"
+    ok "SLURM partitions → '$SLURM_PARTITION' (recorded in $PREFIX/lib/husk/slurm-partition; a job may request any one of them)"
   else
     rm -f "$PREFIX/lib/husk/slurm-partition"
-    skip "SLURM partition not set — broker default 'preemptible' (set with --slurm-partition NAME; Santis has no preemptible, use debug or shared)"
+    skip "SLURM partition not set — broker default 'preemptible' (set with --slurm-partition NAME[,NAME...]; Santis has no preemptible, use debug or shared)"
   fi
   # The project account. Some sites refuse every submission without one: Santis's
   # cli_filter answers "you must specify a project account (-A <account>)". The broker

@@ -42,13 +42,14 @@ pub struct Submission {
 /// Deliberately hedged on the QOS: a site QOS can lower the effective limit below the
 /// partition's, and husk cannot see that from here. So this reports what it read, says
 /// where it read it, and gives the action that is right regardless - set `--time`.
-fn time_limit_note(session: &Session, submission_sets_time: bool) -> String {
-    if submission_sets_time || session.limits.is_empty() {
+fn time_limit_note(session: &Session, chosen: &str, submission_sets_time: bool) -> String {
+    let Some(limits) = session.limits.get(chosen) else { return String::new() };
+    if submission_sets_time || limits.is_empty() {
         return String::new();
     }
-    let p = &session.required_partition;
+    let p = chosen;
     let mut s = format!(" This job sets no --time, so it takes partition {p}'s");
-    match (&session.limits.default_time, &session.limits.max_time) {
+    match (&limits.default_time, &limits.max_time) {
         (Some(d), Some(m)) => s.push_str(&format!(" default limit of {d} (max {m})")),
         (Some(d), None) => s.push_str(&format!(" default limit of {d}")),
         (None, Some(m)) => s.push_str(&format!(" limit, at most {m}")),
@@ -109,7 +110,7 @@ pub fn decide(
     // ---- partition: must resolve to the site's forced partition, else reject + teach ----
     // The required partition is site-specific (HUSK_SLURM_PARTITION, default preemptible);
     // Balfrin has `preemptible`, Santis does not, so it is not hard-coded.
-    let required = session.required_partition.as_str();
+    let allowed = session.allowed_partitions.as_slice();
     let partition = sbatch::option_value(&cli, &["-p", "--partition"])
         .or_else(|| sbatch::option_value(&directives, &["-p", "--partition"]));
     // Whether the submission chose its own wall clock. Checked across CLI *and* #SBATCH,
@@ -117,31 +118,34 @@ pub fn decide(
     let sets_time = sbatch::option_value(&cli, &["-t", "--time"])
         .or_else(|| sbatch::option_value(&directives, &["-t", "--time"]))
         .is_some();
-    let time_note = time_limit_note(session, sets_time);
 
-    match partition.as_deref() {
-        Some(p) if p == required => {}
-        _ => {
-            // AUTHORIZATION, NOT AVAILABILITY. The previous wording was "Only
-            // --partition=X is permitted here", and a caged agent checked `sinfo`, saw
-            // `normal` up with 28 idle nodes, and read the contradiction as a possibly
-            // SPOOFED message - spending calls corroborating before it would act. Naming
-            // husk as the restricting party, and conceding that other partitions exist and
-            // may be idle, removes the contradiction instead of asking to be believed.
-            //
-            // The rest keeps what that agent reported worked: constraint, remedy and
-            // rationale in one line, and byte-identical on every retry - which is what let
-            // it conclude "standing policy" rather than "transient failure" and stop
-            // retrying blind.
+    // Resolve the requested partition against the allowed SET, and re-emit OUR entry.
+    //
+    // A list rather than one value because a real cluster is not homogeneous: Balfrin has
+    // GPU nodes (`short`) and CPU-only postprocessing nodes (`pp-short`), and which one a
+    // job needs is a hardware fact only the job knows. husk bounds the set; the job picks
+    // from it. Same construct-and-re-emit shape as --chdir: the agent influences the value,
+    // and the bytes that reach sbatch are ours.
+    //
+    // Exactly ONE. `--partition=a,b` is valid sbatch (the scheduler picks), but it would
+    // make the hardware choice implicit again, and the resolved value is what the wall-limit
+    // note describes - so a multi-valued request is refused rather than half-honoured.
+    let chosen = match partition.as_deref() {
+        Some(p) if p.contains(',') => {
             return Decision::Reject(format!(
-                "husk submits brokered jobs only to --partition={required}; resubmit with \
-                 --partition={required}. Other partitions may exist and be idle - this is \
-                 husk's restriction on brokered jobs, not the cluster's availability. \
-                 {required} is typically preemptible/low-priority, so checkpoint your \
-                 work.{time_note}"
+                "husk needs exactly one partition, not {p:?}. Pick the one this job's \
+                 hardware needs and resubmit with --partition=<name>. Allowed here: {}.",
+                allowed.join(", ")
             ));
         }
-    }
+        // Re-emit the ALLOWLIST entry, never the request's bytes.
+        Some(p) => match allowed.iter().find(|a| a.as_str() == p) {
+            Some(entry) => entry.clone(),
+            None => return Decision::Reject(partition_refusal(allowed, session, sets_time)),
+        },
+        None => return Decision::Reject(partition_refusal(allowed, session, sets_time)),
+    };
+    let time_note = time_limit_note(session, &chosen, sets_time);
 
     // ---- topology: pick the cage profile, and force it rather than infer it ----
     // Checked across CLI *and* #SBATCH, like the partition: a body directive would reach
@@ -207,7 +211,7 @@ pub fn decide(
 
     // ---- forced options (these outrank any #SBATCH directive: CLI > directive) ----
     let mut options: Vec<String> = Vec::new();
-    options.push(format!("--partition={required}"));
+    options.push(format!("--partition={chosen}"));
     // The billing account, where the site uses one. Forced from the operator's trusted
     // config for the same two reasons as the partition: it decides WHO IS BILLED, so an
     // agent-chosen value could charge another project's allocation; and on sites whose
@@ -416,6 +420,39 @@ fn husk_paths() -> (String, String, String) {
         .to_string_lossy()
         .to_string();
     (broker, stub, socat)
+}
+
+/// Why a submission's partition was refused, naming every partition it MAY use.
+///
+/// AUTHORIZATION, NOT AVAILABILITY. An earlier wording said "Only --partition=X is permitted
+/// here"; a caged agent checked `sinfo`, saw `normal` up with 28 idle nodes, and read the
+/// contradiction as a possibly SPOOFED message - spending calls corroborating before it
+/// would act. Naming husk as the restricting party, and conceding that other partitions
+/// exist and may be idle, removes the contradiction instead of asking to be believed.
+///
+/// The rest keeps what that agent reported worked: constraint, remedy and rationale
+/// together, and byte-identical on every retry - which is what let it conclude "standing
+/// policy" rather than "transient failure" and stop retrying blind. The wall-limit note is
+/// attached only when husk can name ONE partition, because with a set it cannot know which
+/// limits will apply until the job chooses.
+fn partition_refusal(allowed: &[String], session: &Session, sets_time: bool) -> String {
+    let list = allowed.join(", ");
+    let remedy = if allowed.len() == 1 {
+        format!("resubmit with --partition={}", allowed[0])
+    } else {
+        format!("resubmit with --partition=<one of: {list}>")
+    };
+    let note = if allowed.len() == 1 {
+        time_limit_note(session, &allowed[0], sets_time)
+    } else {
+        String::new()
+    };
+    format!(
+        "husk submits brokered jobs only to these partitions: {list}; {remedy}. Other \
+         partitions may exist and be idle - this is husk's restriction on brokered jobs, not \
+         the cluster's availability. These are typically preemptible/low-priority, so \
+         checkpoint your work.{note}"
+    )
 }
 
 /// First occurrence of an option across the CLI and the `#SBATCH` body, in that order.
@@ -1159,17 +1196,22 @@ mod tests {
     }
 
     fn no_uenv() -> Session {
-        Session { uenv: None, view: None, required_partition: "preemptible".into(), account: None, limits: Default::default() }
+        Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], account: None, limits: Default::default() }
     }
 
     /// A session that knows the partition's limits, as a real broker does after asking
     /// scontrol at startup.
     fn with_limits() -> Session {
         Session {
-            limits: crate::session::PartitionLimits {
-                default_time: Some("00:30:00".into()),
-                max_time: Some("01:00:00".into()),
-            },
+            limits: [(
+                "preemptible".to_string(),
+                crate::session::PartitionLimits {
+                    default_time: Some("00:30:00".into()),
+                    max_time: Some("01:00:00".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
             ..no_uenv()
         }
     }
@@ -1289,7 +1331,7 @@ mod tests {
         Session {
             uenv: Some("prgenv-gnu:v1".into()),
             view: Some("prgenv-gnu:default".into()),
-            required_partition: "preemptible".into(),
+            allowed_partitions: vec!["preemptible".into()],
             account: None,
             limits: Default::default(),
         }
@@ -1932,6 +1974,61 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&extra);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // A real cluster is not homogeneous: Balfrin has GPU nodes (`short`) and CPU-only
+    // postprocessing nodes (`pp-short`), and which one a job needs is a hardware fact only
+    // the job knows. husk bounds the SET; the job picks from it. The bytes that reach
+    // sbatch are still husk's — the allowlist entry, never the request's copy of it.
+    #[test]
+    fn a_job_may_choose_any_allowed_partition_and_nothing_else() {
+        let multi = Session {
+            allowed_partitions: vec!["short".into(), "pp-short".into()],
+            ..no_uenv()
+        };
+        for want in ["short", "pp-short"] {
+            let argv = opts(
+                req_in(work(), &[&format!("--partition={want}")], "echo hi\n"),
+                &multi,
+            );
+            assert!(
+                argv.contains(&format!("--partition={want}")),
+                "{want} is allowed here and must be honoured: {argv:?}"
+            );
+        }
+
+        // Not in the set: refused, and the message names every partition that IS.
+        let d = decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            &multi, &FsPolicy::default(), work(),
+        );
+        let Decision::Reject(why) = d else { panic!("an unlisted partition must be refused") };
+        assert!(why.contains("short") && why.contains("pp-short"), "name the whole set: {why}");
+        assert!(why.contains("husk"), "attribute the restriction: {why}");
+        assert!(why.contains("availability"), "authorization is not availability: {why}");
+
+        // Multi-valued is refused rather than half-honoured: `--partition=a,b` is valid
+        // sbatch (the scheduler picks), which would make the hardware choice implicit again.
+        let d = decide(
+            &req_in(work(), &["--partition=short,pp-short"], "echo hi\n"),
+            &multi, &FsPolicy::default(), work(),
+        );
+        let Decision::Reject(why) = d else { panic!("a multi-valued partition must be refused") };
+        assert!(why.contains("exactly one"), "{why}");
+
+        // Still byte-identical on retry — what makes a refusal read as standing policy.
+        let again = match decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            &multi, &FsPolicy::default(), work(),
+        ) { Decision::Reject(w) => w, _ => panic!("must reject") };
+        assert_eq!(why_of(&multi), again, "the refusal changed between identical requests");
+    }
+
+    fn why_of(s: &Session) -> String {
+        match decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            s, &FsPolicy::default(), work(),
+        ) { Decision::Reject(w) => w, _ => panic!("must reject") }
     }
 
     // Santis rejects EVERY submission without a project account (its cli_filter says so),

@@ -208,6 +208,12 @@ if [ -z "$PART" ]; then
 fi
 PART="${PART:-preemptible}"
 export HUSK_SLURM_PARTITION="$PART"
+# HUSK_SLURM_PARTITION may be a comma-separated LIST (Balfrin: GPU `short` plus CPU-only
+# `pp-short`). Every arm below submits ONE job, so it uses the FIRST entry; the broker
+# accepts any of them and refuses the rest.
+PART_LIST="$PART"
+PART="${PART%%,*}"
+PART="$(printf '%s' "$PART" | tr -d '[:space:]')"
 # The project account, resolved exactly as the launcher does. Sites whose cli_filter
 # requires one (Santis) reject EVERY live submission without it, which is what turned the
 # first Santis run into three identical containment failures.
@@ -221,7 +227,7 @@ if [ -z "$ACCT" ]; then
   done
 fi
 [ -n "$ACCT" ] && export HUSK_SLURM_ACCOUNT="$ACCT"
-echo "== policy tier (broker --dry-run; deterministic, no submission; partition=$PART) =="
+echo "== policy tier (broker --dry-run; deterministic, no submission; partition=$PART of [$PART_LIST]) =="
 
 expect_status() { # id expected humanid detail
   local got; got="$(respfield "$1" status)"
@@ -319,6 +325,23 @@ for sc_case in 'sc_sel:["-u","someone"]' 'sc_me:["--me"]' 'sc_state:["--state=PE
   fi
   check PASS policy "scancel.$sc_id" "refused: $(respfield "$sc_id" message | head -c 60)"
 done
+
+# P2g — every partition in the operator's list is accepted, not just the first. Clusters
+# are not homogeneous (Balfrin: GPU `short`, CPU-only `pp-short`), and a workflow needs both.
+# Skips where only one is configured, since there is nothing to distinguish.
+case "$PART_LIST" in
+  *,*)
+    PART_SECOND="$(printf '%s' "${PART_LIST#*,}" | cut -d, -f1 | tr -d '[:space:]')"
+    reset_spool
+    mkreq p2g sbatch "[\"--partition=$PART_SECOND\"]" "$PWORK" "$VALID_BODY"
+    run_broker dry "$SPOOL/out.p2g"
+    if [ "$(respfield p2g status)" = submitted ]; then
+      check PASS policy sbatch.partition_list "a job may also request '$PART_SECOND', the second allowed partition"
+    else
+      check FAIL policy sbatch.partition_list "'$PART_SECOND' is in HUSK_SLURM_PARTITION but was refused: $(respfield p2g message | head -c 70)"
+    fi ;;
+  *) check SKIP policy sbatch.partition_list "only one partition configured - set --slurm-partition a,b to exercise the list" ;;
+esac
 
 # P3 — a wrong partition is rejected.
 reset_spool

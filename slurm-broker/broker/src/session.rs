@@ -14,6 +14,30 @@ use std::env;
 /// sites (e.g. Santis) do not, so an operator overrides it via the env var.
 pub const DEFAULT_PARTITION: &str = "preemptible";
 
+/// Split the operator's `HUSK_SLURM_PARTITION` into the set a job may request.
+///
+/// A comma-separated LIST, because one partition is not enough on a real cluster: Balfrin
+/// has GPU nodes (`short`) and CPU-only postprocessing nodes (`pp-short`), and a workflow
+/// legitimately needs both. Which one a job wants is a HARDWARE choice only the job can
+/// make, so husk cannot pick for it — but it can bound the set.
+///
+/// Entries are trimmed and empties dropped, so `short, pp-short,` is three tokens and two
+/// partitions. An entry that is not a plausible partition name is DROPPED rather than
+/// carried: this string is operator config, but it becomes an argument to the real sbatch,
+/// and a name is never allowed to smuggle an option or a shell character.
+pub fn parse_partition_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 64
+                && !s.starts_with('-')
+                && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// What a job that sets no `--time` will get, and the ceiling it cannot exceed.
 ///
 /// husk forces every brokered job onto one partition, so it moves jobs somewhere with
@@ -79,11 +103,16 @@ pub struct Session {
     /// What to pass to `--uenv`. Prefer UENV_LABEL; fall back to UENV_MOUNT_LIST
     /// (its `file:mount-point` pairs are themselves a valid `--uenv` argument).
     pub uenv: Option<String>,
-    /// The single partition the broker forces onto every agent job (and requires the
-    /// agent to request). From HUSK_SLURM_PARTITION in the broker's TRUSTED env
-    /// (operator-set, agent-inaccessible), defaulting to DEFAULT_PARTITION. Choose a
-    /// low-priority/preemptible partition — every brokered job lands here.
-    pub required_partition: String,
+    /// The partitions a brokered job may request — from HUSK_SLURM_PARTITION in the
+    /// broker's TRUSTED env (operator-set, agent-inaccessible), defaulting to
+    /// DEFAULT_PARTITION. Never empty.
+    ///
+    /// The job chooses one and husk RE-EMITS the matching entry from this list, so no agent
+    /// byte reaches sbatch: same construct-and-re-emit shape as --chdir, which is confined
+    /// to the writable set rather than forced to a constant. Prefer low-priority/preemptible
+    /// partitions — see THREAT-MODEL.md on why the partition is the resource-envelope
+    /// control.
+    pub allowed_partitions: Vec<String>,
     /// `--account` forced onto every job, from `HUSK_SLURM_ACCOUNT` in the broker's TRUSTED
     /// environment (operator-set at install, agent-inaccessible). `None` where the site does
     /// not use accounts — Balfrin does not, Santis REQUIRES one and its cli_filter rejects
@@ -95,10 +124,10 @@ pub struct Session {
     /// The exported UENV_VIEW does not survive into the job, so this CLI flag is what
     /// restores the job's view to match the session (verified on Balfrin).
     pub view: Option<String>,
-    /// Time limits of `required_partition`, read from `scontrol` at startup. Empty when
-    /// unknown — husk then says nothing about limits rather than guessing. See
-    /// `PartitionLimits`.
-    pub limits: PartitionLimits,
+    /// Time limits PER allowed partition, read from `scontrol` at startup. A partition
+    /// absent from the map, or present with empty limits, means husk says nothing about
+    /// limits for it rather than guessing. See `PartitionLimits`.
+    pub limits: std::collections::BTreeMap<String, PartitionLimits>,
 }
 
 impl Session {
@@ -109,16 +138,22 @@ impl Session {
         Session {
             uenv: nonempty("UENV_LABEL").or_else(|| nonempty("UENV_MOUNT_LIST")),
             view: nonempty("UENV_VIEW").map(|v| normalize_view(&v)),
-            required_partition: nonempty("HUSK_SLURM_PARTITION")
-                .unwrap_or_else(|| DEFAULT_PARTITION.to_string()),
+            allowed_partitions: nonempty("HUSK_SLURM_PARTITION")
+                .map(|v| parse_partition_list(&v))
+                .filter(|v: &Vec<String>| !v.is_empty())
+                .unwrap_or_else(|| vec![DEFAULT_PARTITION.to_string()]),
             account: nonempty("HUSK_SLURM_ACCOUNT"),
-            limits: PartitionLimits::default(),
+            limits: Default::default(),
         }
     }
 
-    /// Ask SLURM about the forced partition, once, at broker startup.
+    /// Ask SLURM about every allowed partition, once, at broker startup.
     pub fn with_partition_limits(mut self) -> Self {
-        self.limits = query_partition_limits(&self.required_partition);
+        self.limits = self
+            .allowed_partitions
+            .iter()
+            .map(|p| (p.clone(), query_partition_limits(p)))
+            .collect();
         self
     }
 }
@@ -152,6 +187,29 @@ mod tests {
    Nodes=nid[001000-001030]
    State=UP TotalCPUs=3712 TotalNodes=29
 ";
+
+    // The operator's list. Balfrin needs two: `short` for GPU nodes, `pp-short` for the
+    // CPU-only postprocessing nodes.
+    #[test]
+    fn partition_lists_are_split_trimmed_and_sanitised() {
+        use super::parse_partition_list as split;
+        assert_eq!(split("short"), vec!["short"]);
+        assert_eq!(split("short,pp-short"), vec!["short", "pp-short"]);
+        // Humans put spaces and trailing commas in lists.
+        assert_eq!(split(" short , pp-short , "), vec!["short", "pp-short"]);
+        // These become ARGUMENTS to the real sbatch. A name that could be read as an option
+        // or carry shell syntax is dropped, not passed through — even from operator config,
+        // because "it is trusted" is how the last few bugs got in.
+        assert!(split("--partition=evil").is_empty());
+        assert!(split("-p").is_empty());
+        assert!(split("a b").is_empty());
+        assert!(split("$(id)").is_empty());
+        assert!(split("a;b").is_empty());
+        // A bad entry does not take the good ones with it.
+        assert_eq!(split("short,--evil,pp-short"), vec!["short", "pp-short"]);
+        assert!(split("").is_empty());
+        assert!(split(" , , ").is_empty());
+    }
 
     #[test]
     fn parses_default_and_max_time_from_scontrol() {
