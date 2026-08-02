@@ -1395,12 +1395,18 @@ else
   # ran `command -v socat` and reported "socat is not installed" while husk had bound one
   # at a path off PATH - true about PATH, wrong about the thing it was describing, and it
   # sent the diagnosis in the wrong direction for a round.
-  if [ -x "${HUSK_SOCAT:-}" ]; then
-    echo "RESULT PASS functional net.socat the relay binary is in the cage at $HUSK_SOCAT"
-  elif [ -n "${HUSK_SOCAT:-}" ]; then
-    echo "RESULT FAIL functional net.socat HUSK_SOCAT=$HUSK_SOCAT is not executable in the cage - the bind did not take, so this job has no network"
+  # Check the IN-CAGE path, which is a constant, not $HUSK_SOCAT. Since 2026-08-02
+  # HUSK_SOCAT carries the HOST SOURCE so the step-broker can hand it to ranks, which bind
+  # it into their own cages; the host path is under /users and is correctly INVISIBLE in
+  # the cage. This arm asserted the old contract and failed on a job whose egress was
+  # working - net.live fetched 21140 bytes in the same run. A test that pins a contract
+  # the code has moved past reports a breach where there is none.
+  if [ -x /tmp/husk-socat ]; then
+    echo "RESULT PASS functional net.socat the relay binary is bound into the cage at /tmp/husk-socat"
+  elif [ -n "${HUSK_NET_SOCK:-}" ]; then
+    echo "RESULT FAIL functional net.socat no relay binary at /tmp/husk-socat although egress is configured - the bind did not take, so this job has no network"
   else
-    echo "RESULT FAIL functional net.socat no relay binary in the cage (HUSK_SOCAT unset) - the guard found no socat to bind; see the job stderr for which path it looked at"
+    echo "RESULT INFO functional net.socat no egress configured for this job - no relay binary expected"
   fi
   # ...and the proxy variables should follow from it.
   if [ -n "${HTTPS_PROXY:-}" ]; then
