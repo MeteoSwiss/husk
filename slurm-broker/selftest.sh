@@ -1234,18 +1234,29 @@ else
   echo "RESULT INFO functional cpu.affinity no taskset or no readable cpu list in cage - skipped"
 fi
 
-# Secondary, and deliberately NOT a FAIL when the topology is the reason: this mirrors the
-# exact numactl call ICON starts with, so a regression that only shows up under NUMA binding
-# is still visible - but a partition whose NUMA node 0 holds no CPU for us is not a finding.
-if command -v numactl >/dev/null 2>&1; then
-  numa_err="$(numactl --cpunodebind=0 --membind=0 true 2>&1)"; numa_rc=$?
+# Secondary: the same syscall path ICON exercises when it starts under numactl. Bind to the
+# NUMA node that OWNS a CPU we hold, not to node 0. Hardcoding node 0 measured the
+# allocation, not the cage: on a Balfrin pp node (8 NUMA nodes, node 0 = cpus 0-15,128-143)
+# an allocation elsewhere makes --cpunodebind=0 an empty mask, so sched_setaffinity returns
+# EINVAL. Confirmed UNCAGED on nid001225: same failure with no husk in the picture. Binding
+# to a node we own tests NUMA binding on any topology instead of degrading to INFO exactly
+# where it would be most interesting.
+numa_node=""
+if [ -n "$aff_cpu" ]; then
+  numa_node="$(ls -d /sys/devices/system/cpu/cpu$aff_cpu/node* 2>/dev/null | head -1)"
+  numa_node="${numa_node##*/node}"
+fi
+if command -v numactl >/dev/null 2>&1 && [ -n "$numa_node" ]; then
+  numa_err="$(numactl --cpunodebind=$numa_node --membind=$numa_node true 2>&1)"; numa_rc=$?
   if [ "$numa_rc" -eq 0 ]; then
-    echo "RESULT PASS functional cpu.numabind [numactl --cpunodebind=0 --membind=0] works - ICON numactl start ok"
+    echo "RESULT PASS functional cpu.numabind [numactl --cpunodebind=$numa_node --membind=$numa_node] works - ICON numactl start ok"
   elif [ "$numa_rc" -eq 159 ]; then
     echo "RESULT FAIL functional cpu.numabind numactl died with SIGSYS - the seccomp filter blocks the NUMA bind"
   else
-    echo "RESULT INFO functional cpu.numabind numactl declined (rc=$numa_rc, not SIGSYS): ${numa_err:-no stderr} - NUMA node 0 likely holds no CPU in this allocation; not a cage finding"
+    echo "RESULT FAIL functional cpu.numabind numactl exited $numa_rc (not SIGSYS) binding to node $numa_node which owns cpu $aff_cpu: ${numa_err:-no stderr}"
   fi
+else
+  echo "RESULT INFO functional cpu.numabind no numactl in cage or no NUMA node for cpu ${aff_cpu:-unknown} - skipped"
 fi
 
 # Cross Memory Attach. The single-node profile EXEMPTS process_vm_readv from the
