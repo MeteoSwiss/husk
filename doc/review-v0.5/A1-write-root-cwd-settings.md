@@ -1,7 +1,8 @@
 # A1 — the write-root / `cwd` / `settings.json` family
 
 **Workstream A** (assumed-breach penetration test) · **runs in-cage on Balfrin** ·
-**verdict from outside the cage**
+**verdict from outside the cage** · bound by the **rules of engagement** in
+`review-v0.5-questions.md`
 
 ## The question
 

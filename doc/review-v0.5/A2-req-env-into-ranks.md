@@ -1,0 +1,82 @@
+# A2 — `req.env`, forwarded into rank cages
+
+**Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
+· bound by the **rules of engagement** in `review-v0.5-questions.md`
+
+## The question
+
+The job script's environment is carried into rank cages. Can the agent put something in it
+that changes what a rank *is*, rather than what it merely *knows*?
+
+## Why this is on the list
+
+Flagged as one of two unexamined candidates when the review plan was drawn. Nothing has tested
+it. It qualifies under the workstream's organising instruction — **any value the agent supplies
+that becomes a boundary, or the base for one** — because an environment variable can select a
+loader, a library path, or a runtime's own security branch.
+
+## What the code does today
+
+`rank::env_args` computes the **delta** between the job script's environment and what the ranks
+already inherit: added or modified names become `--setenv`, removed names become `--unsetenv`.
+Both directions, because a half-carried environment differs silently from the job's.
+
+Three existing defences to probe rather than re-derive:
+
+- **`RESERVED_ENV_PREFIXES`** — `SLURM_*` and friends are refused, because `SLURM_EXPORT_ENV`
+  would redirect propagation and others contradict the validated `--ntasks`.
+- **`is_valid_env_name`** — POSIX name grammar, enforced rather than assumed.
+- **`MAX_FORWARDED_ENV = 512`** — a bound, so an environment cannot become an enormous command
+  line in the trusted process.
+
+Two design decisions that are load-bearing, and worth attacking directly:
+
+1. **Applied through bwrap, not through srun's environment.** A brokered `srun` runs `sh` and
+   `bwrap` as the user *before any cage exists*, so an `LD_PRELOAD` in that environment would
+   execute in the trusted process. bwrap applies `--setenv` to the process it launches — inside
+   the cage. Test whether that separation actually holds on every path.
+2. **bwrap applies arguments in order**, so a `--setenv` after a credential `--unsetenv`
+   re-sets it. The credential mask and the forwarded delta therefore interact. **Ordering is
+   the control here** — try to invert it.
+
+## Starting points
+
+1. Names that survive the grammar and the prefix list but change execution:
+   `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `PATH`, `PYTHONPATH`, `PERL5LIB`,
+   `BASH_ENV`, `ENV`, `IFS`, `SHELL`, `TMPDIR`.
+2. A name that collides with the credential mask — can a forwarded value re-set a variable the
+   cage `--unsetenv`s? Order matters; find out which side wins.
+3. Values (not names) containing quotes, newlines, `NUL`, `=`, or shell metacharacters.
+4. Names differing only by case, or by Unicode that normalises onto a reserved prefix.
+5. The `MAX_FORWARDED_ENV` boundary: what happens at 511, 512, 513 — refusal, or silent
+   truncation? **Silent truncation would be the finding**, because a dropped `--unsetenv`
+   leaves a variable set that the job removed.
+6. `PROXY_ENV` — the proxy variables are set for the agent's benefit; can they be overridden to
+   point the rank's traffic somewhere else?
+
+## What counts as a finding
+
+- Any environment variable that reaches the **trusted** process (guard, `sh`, `bwrap`,
+  step-broker) rather than the caged one.
+- A credential the mask removes and the delta restores.
+- A forwarded value that changes which binary or library a rank executes.
+- Silent truncation or silent dropping at any bound.
+- A reserved prefix that can be smuggled past the check.
+
+## What a null result looks like
+
+An enumeration of what was tried — the names, the values, the boundary cases — and what each
+produced. A table of "sent X, rank saw Y, trusted process saw Z" is exactly the useful shape.
+
+## Out of scope for this item
+
+- The job script *body* itself (A3) and the step request path (A5).
+- Whether credential masking covers the right variables by default (that is a policy question,
+  not an escape).
+- Attacking `bwrap`'s own `--setenv` implementation.
+
+## Verdict
+
+Execution inside; verdict outside. The decisive evidence is what the **trusted** side saw — the
+broker log, an emitted argv, or a marker file written outside the cage — not what the rank
+reports about itself.
