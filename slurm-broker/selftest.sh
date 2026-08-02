@@ -1612,6 +1612,23 @@ HUSKLEFT
              --nodes=1 --chdir="$WORK" --output="$WORK/slurm-%j.out"
              --export="ALL,HUSK_PROBE_JID=$PROBE_JID")
       [ -n "$ACCT" ] && LARGS+=(--account="$ACCT")
+      # SANTIS: `sbatch` from inside a uenv session is refused outright unless the uenv is
+      # named explicitly — "Calling sbatch/salloc from inside a uenv session is disallowed".
+      # The BROKER never trips this because it always forces --uenv/--view from the trusted
+      # session; this job bypasses the broker on purpose, so it has to do the same thing
+      # itself. Same normalisation as `session.rs::normalize_view`: UENV_VIEW is
+      # mount-qualified (/user-environment:icon:default) and only the part after the first
+      # colon is a legal --view.
+      # UENV_LABEL with UENV_MOUNT_LIST as the fallback, because that is exactly what
+      # `session.rs` does — Balfrin reports no label but does set the mount list. One origin
+      # for the value, not two reconstructions that drift.
+      _lu="${UENV_LABEL:-${UENV_MOUNT_LIST:-}}"
+      if [ -n "$_lu" ]; then
+        LARGS+=(--uenv="$_lu")
+        _lv="${UENV_VIEW:-}"
+        case "$_lv" in /*:*) _lv="${_lv#*:}" ;; esac
+        [ -n "$_lv" ] && LARGS+=(--view="$_lv")
+      fi
       LJID="$(sbatch "${LARGS[@]}" "$LSCRIPT" 2>&1)"
       LJID="${LJID%%;*}"
       case "$LJID" in
