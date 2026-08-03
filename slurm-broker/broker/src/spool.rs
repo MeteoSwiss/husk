@@ -317,6 +317,12 @@ impl Broker {
 
 const MAX_QUERY_OUTPUT: usize = 1 << 20; // 1 MiB cap on captured query output
 const QUERY_TIMEOUT_SECS: u64 = 60; // wall-clock budget for a read-only query
+
+/// Wall-clock budget for a submission. Generous, because slurmctld under load can take a
+/// while and killing a submission that would have succeeded is its own failure — but not
+/// unbounded, because this broker is single-threaded and a submission that never returns
+/// takes `scancel` down with it.
+const SUBMIT_TIMEOUT_SECS: u64 = 120;
 const GC_MAX_AGE_SECS: u64 = 3600; // orphaned spool files older than this are reclaimed
 
 /// Run a validated read-only query with a wall-clock timeout, killing the child if it
@@ -418,29 +424,83 @@ const STRIPPED_SUBMIT_ENV: &[&str] = &[
 ];
 
 fn run_sbatch(argv: &[String], script: &str) -> Result<u64, String> {
+    run_sbatch_with(argv, script, std::time::Duration::from_secs(SUBMIT_TIMEOUT_SECS))
+}
+
+fn run_sbatch_with(
+    argv: &[String],
+    script: &str,
+    timeout: std::time::Duration,
+) -> Result<u64, String> {
     use std::io::Write;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     for k in STRIPPED_SUBMIT_ENV {
         cmd.env_remove(k);
     }
     // The script arrives on stdin, so no file exists for anyone to substitute. See `submit`.
+    //
+    // And it runs under a watchdog, in its own process group, exactly like `run_query_cmd`.
+    // This is a single-threaded broker: whatever blocks here blocks every later request,
+    // and the request that matters most is the one that stops a job. A submission that
+    // hangs used to take `scancel` down with it, so the agent could no longer cancel the
+    // very job whose submission was wedged.
     let mut child = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("failed to run sbatch: {e}"))?;
-    child
+    let pid = child.id() as i32;
+    let finished = Arc::new(AtomicBool::new(false));
+    let killed = Arc::new(AtomicBool::new(false));
+    let (f2, k2) = (finished.clone(), killed.clone());
+    let watchdog = std::thread::spawn(move || {
+        let step = std::time::Duration::from_millis(100);
+        let mut waited = std::time::Duration::ZERO;
+        while waited < timeout {
+            if f2.load(Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(step);
+            waited += step;
+        }
+        if !f2.load(Ordering::Relaxed) {
+            k2.store(true, Ordering::Relaxed);
+            // SAFETY: negative pid = the child's own process group, so a shell that spawned
+            // helpers goes too. Still unreaped here, so the pgid is valid and not reused.
+            unsafe { libc_kill(-pid, SIGKILL) };
+        }
+    });
+    // Small enough to fit the pipe buffer, so this cannot itself block for long; and if
+    // sbatch has already died the write fails rather than hanging.
+    let write_result = child
         .stdin
         .take()
-        .ok_or_else(|| "sbatch stdin unavailable".to_string())?
-        .write_all(script.as_bytes())
-        .map_err(|e| format!("failed to send the job script to sbatch: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("failed to run sbatch: {e}"))?;
+        .ok_or_else(|| "sbatch stdin unavailable".to_string())
+        .and_then(|mut si| {
+            si.write_all(script.as_bytes())
+                .map_err(|e| format!("failed to send the job script to sbatch: {e}"))
+        });
+    let out = child.wait_with_output();
+    finished.store(true, Ordering::Relaxed);
+    let _ = watchdog.join();
+    if killed.load(Ordering::Relaxed) {
+        return Err(format!(
+            "sbatch did not return within {}s and was killed. The job may or may not have \
+             been submitted — check with squeue before resubmitting, so you do not start it \
+             twice. This is usually the scheduler being unreachable or overloaded, not \
+             anything about this job.",
+            timeout.as_secs()
+        ));
+    }
+    write_result?;
+    let output = out.map_err(|e| format!("failed to run sbatch: {e}"))?;
     if !output.status.success() {
         return Err(format!(
             "sbatch failed: {}",
@@ -723,6 +783,30 @@ mod tests {
         let (_, timed_out) =
             run_query_cmd(&argv, std::time::Duration::from_millis(300)).unwrap();
         assert!(timed_out, "a query past the timeout must be killed");
+    }
+
+    /// The broker is single-threaded and serves one request at a time, so anything that
+    /// blocks in it blocks EVERYTHING. `run_query_cmd` has had a watchdog since F2/F16;
+    /// its sibling `run_sbatch` was a bare `output()` with no timeout and no process
+    /// group. A slurmctld that stops answering — or `#SBATCH --wait`, which the body gate
+    /// accepted — wedged the broker for as long as it lasted, and the thing that stops
+    /// working with it is `scancel`: the agent could no longer stop the job that did it.
+    #[test]
+    fn run_sbatch_kills_a_hanging_submission() {
+        let argv = vec!["sh".into(), "-c".into(), "sleep 30".into()];
+        let e = run_sbatch_with(&argv, "", std::time::Duration::from_millis(300))
+            .expect_err("a hanging sbatch must not block the broker forever");
+        assert!(e.contains("timed out") || e.contains("did not"), "{e}");
+    }
+
+    #[test]
+    fn run_sbatch_reads_the_script_from_stdin() {
+        // Also pins the Fix 1 property from the other side: the script reaches sbatch as
+        // bytes on a pipe, not as a path anyone could have swapped.
+        let argv = vec!["sh".into(), "-c".into(), "cat >/dev/null; printf 4242".into()];
+        let id = run_sbatch_with(&argv, "#!/bin/bash\necho hi\n", std::time::Duration::from_secs(5))
+            .expect("a fast submission must succeed");
+        assert_eq!(id, 4242);
     }
 
     #[test]
