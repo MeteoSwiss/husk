@@ -169,29 +169,48 @@ impl Broker {
     }
 
     fn submit(&self, id: &str, req: &Request, sub: Submission) -> Response {
-        let script_path = self.spool.join(format!("job-{id}.sh"));
-        if let Err(e) = write_atomic(&script_path, sub.wrapped_script.as_bytes()) {
-            return Response::error(id, format!("could not stage job script: {e}"));
+        // The AGENT'S script is staged as data, where the guard will read it inside the cage.
+        if let Err(e) = write_atomic(std::path::Path::new(&sub.body_path), sub.body.as_bytes()) {
+            return Response::error(id, format!("could not stage job body: {e}"));
         }
 
+        // HUSK'S script goes to sbatch on STDIN, and that is the point.
+        //
+        // It used to be written into the spool and named on the argv. The spool has to be
+        // agent-writable — the agent's stub puts its requests there — so between our write
+        // and sbatch's open there was a window in which the agent could `rename()` its own
+        // file over ours, and sbatch would submit that instead. The v0.5 review won that
+        // race 33 times in 100 against a 2 ms window, with a clean control, and the agent
+        // picks the request id so it knows the path.
+        //
+        // Passing the script on stdin deletes the window rather than narrowing it: there is
+        // no path, so there is nothing to substitute. sbatch reads its script from stdin
+        // whenever no script operand is given.
+        //
+        // The agent's own argv for its script moves into the guard as a quoted `set --`,
+        // since with no script operand there is nowhere on the sbatch command line for it
+        // to go. It is also strictly better there: husk quotes it instead of forwarding it.
         let mut argv: Vec<String> = vec!["sbatch".to_string(), "--parsable".to_string()];
         argv.extend(sub.options);
-        argv.push(script_path.to_string_lossy().to_string());
-        argv.extend(sub.job_args);
 
         if self.dry_run {
             println!("---- DRY RUN (request {id}) ----");
             println!("cwd : {}", req.cwd);
             println!("argv: {argv:?}");
-            println!("---- staged script ({}) ----", script_path.display());
+            println!("---- staged body ({}) ----", sub.body_path);
+            println!("---- script (stdin) ----");
             println!("{}", sub.wrapped_script);
+            // A dry run exists to show what a real submission WOULD do, and the script is
+            // the most important half of that. On the live path it never touches the disk
+            // (that is the point — see below), so dry-run writes an inspectable copy here.
+            let _ = write_atomic(&self.spool.join(format!("dry-{id}.sh")), sub.wrapped_script.as_bytes());
             // The note too. A dry run exists to show what a real submission WOULD return,
             // so anything the live path attaches must be attached here — otherwise the one
             // mode the tests can observe is the one mode that behaves differently.
             return Response::submitted(id, 0).with_note(sub.note);
         }
 
-        let resp = match run_sbatch(&argv) {
+        let resp = match run_sbatch(&argv, &sub.wrapped_script) {
             Ok(job_id) => {
                 // Remember it, so the agent can later stop what it started. This is the
                 // only place the set grows, and it grows from slurmctld's answer.
@@ -200,10 +219,13 @@ impl Broker {
             }
             Err(e) => Response::error(id, e),
         };
-        // sbatch has copied the script into SLURM's own spool by the time it returns, so
-        // the staged copy is no longer needed. Remove it so it doesn't accumulate on every
-        // submit. (F4) (Dry-run returns above and keeps the script for inspection.)
-        let _ = fs::remove_file(&script_path);
+        // Nothing to unstage here any more: husk's script went to sbatch on stdin and was
+        // never a file. The AGENT'S body must survive until the job runs it, so its owner
+        // is the guard, which removes it on every exit path (see `wrap_script`) — except
+        // when the submission failed, in which case no job will ever read it and it is ours.
+        if matches!(resp.status.as_str(), "error" | "rejected") {
+            let _ = fs::remove_file(&sub.body_path);
+        }
         resp
     }
 
@@ -395,15 +417,29 @@ const STRIPPED_SUBMIT_ENV: &[&str] = &[
     "CSCS_INFERENCE_API_KEY",
 ];
 
-fn run_sbatch(argv: &[String]) -> Result<u64, String> {
-    use std::process::Command;
+fn run_sbatch(argv: &[String], script: &str) -> Result<u64, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
     for k in STRIPPED_SUBMIT_ENV {
         cmd.env_remove(k);
     }
-    let output = cmd
-        .output()
+    // The script arrives on stdin, so no file exists for anyone to substitute. See `submit`.
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run sbatch: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "sbatch stdin unavailable".to_string())?
+        .write_all(script.as_bytes())
+        .map_err(|e| format!("failed to send the job script to sbatch: {e}"))?;
+    let output = child
+        .wait_with_output()
         .map_err(|e| format!("failed to run sbatch: {e}"))?;
     if !output.status.success() {
         return Err(format!(
@@ -606,7 +642,9 @@ mod tests {
 
         // The staged job script carries the compute-cage bwrap args; it must not re-expose
         // /EVILMARKER (which only the agent-planted settings under req.cwd would add).
-        let staged = fs::read_to_string(spool.join("job-f17id.sh")).expect("job script staged");
+        // On the live path husk's script is never a file — it goes to sbatch on stdin, so
+        // there is no path for the agent to substitute. Dry-run keeps an inspectable copy.
+        let staged = fs::read_to_string(spool.join("dry-f17id.sh")).expect("guard staged");
         assert!(
             !staged.contains("/EVILMARKER"),
             "cage was built from agent-controlled req.cwd settings: {staged}"

@@ -22,9 +22,12 @@ pub enum Decision {
 pub struct Submission {
     /// sbatch options (forced + sanitized passthrough), NOT including the script.
     pub options: Vec<String>,
-    pub job_args: Vec<String>,
-    /// The script content to stage and submit (snapshot + re-exec guard).
+    /// The script content to submit. Husk-authored in full — see `wrap_script`.
     pub wrapped_script: String,
+    /// The agent's own script, staged separately and executed as DATA inside the cage.
+    pub body: String,
+    /// Where `body` must be written. Named by the guard, inside the confined write root.
+    pub body_path: String,
     /// Advice to print on a SUCCESSFUL submit, or empty. Goes to the submitter's stderr,
     /// where real sbatch puts its own warnings, so stdout stays the bare
     /// `Submitted batch job N` that tooling parses.
@@ -366,21 +369,30 @@ pub fn decide(
     .map(|(a, _)| !a.is_empty())
     .unwrap_or(false);
 
+    // The agent's script travels as DATA, at a path husk chooses inside the write root —
+    // visible in the cage (the root is bound writable) and nowhere else that matters. The
+    // agent may rewrite it; that changes only its own payload, which it already controls,
+    // and crosses no boundary. What it can no longer do is author the bytes slurmstepd
+    // executes. `req.id` is already constrained to a safe path component by the spool.
+    let body_path = format!("{}/.husk-body-{}.sh", root.trim_end_matches('/'), req.id);
+
     Decision::Submit(Submission {
         options,
         // The same warning the rejection carries, on the path that actually bit: a job
         // that asked for the right partition and no --time is accepted, and only finds
         // out about the limit from squeue afterwards.
         note: time_note,
-        job_args: req.job_args.clone(),
         wrapped_script: wrap_script(
-            &req.script.body,
+            &body_path,
+            &req.job_args,
             &bwrap_args,
             profile,
             &root,
             net_enabled,
             &writable,
         ),
+        body: req.script.body.clone(),
+        body_path,
     })
 }
 
@@ -557,32 +569,56 @@ fn cage_banner(writable: &[String]) -> String {
 }
 
 fn wrap_script(
-    body: &str,
+    body_path: &str,
+    job_args: &[String],
     bwrap_args: &[String],
     profile: profile::Profile,
     workdir: &str,
     net_enabled: bool,
     writable: &[String],
 ) -> String {
-    let mut head = String::new();
-    let mut tail = String::new();
-    let mut in_head = true;
-    for line in body.lines() {
-        if in_head {
-            let t = line.trim_start();
-            if t.is_empty() || t.starts_with('#') {
-                head.push_str(line);
-                head.push('\n');
-                continue;
-            }
-            in_head = false;
-        }
-        tail.push_str(line);
-        tail.push('\n');
+    // THE SUBMITTED SCRIPT IS HUSK'S, ENTIRELY. Not one byte of it comes from the agent.
+    //
+    // It used to be `head + guard + tail`: husk split the agent's body on "leading comment
+    // or blank line", put the front half ABOVE the guard so slurmd would still parse the
+    // agent's `#SBATCH` directives, and the rest below. That handed the agent two ways to
+    // run before the cage existed, and the v0.5 review demonstrated both:
+    //
+    //   * keep its own `#!` line. It stayed in the head, so it stayed line 1 — and the
+    //     kernel honours line 1. `#!/usr/bin/env -S bash -c "<payload>"` ran the payload
+    //     and never read the guard at all.
+    //   * start a line with a character Rust calls whitespace and bash does not. `trim_start`
+    //     strips FF/VT/NBSP/CR, so `\f# ; <payload>` looked like a comment to the splitter,
+    //     landed in the head, and bash ran it before the re-exec.
+    //
+    // Neither is a quoting bug, so neither is fixed by quoting harder, and no amount of
+    // validating the agent's first line closes the class — the next one is whatever the two
+    // parsers disagree about next. The property has to be structural: **the bytes slurmstepd
+    // executes are ours**, and the agent's body is DATA, run by an interpreter we name, at a
+    // path we choose, inside the cage.
+    //
+    // Dropping the agent's `#SBATCH` lines from the submitted script is not a loss. husk
+    // already parses them, validates them, and re-emits what it allows onto the command
+    // line, where sbatch precedence (CLI > env > `#SBATCH`) makes its value win. Leaving the
+    // agent's copy in the file was what made every `Ignored` option an ungated channel and
+    // what let a bare `hetjob` token through the body gate.
+    let head = "#!/bin/bash\n".to_string();
+    let body_q = settings::sh_quote(body_path);
+
+    // The agent's argv for its own script, quoted by us rather than forwarded raw.
+    let mut argv_line = String::new();
+    if !job_args.is_empty() {
+        argv_line.push_str("set -- ");
+        argv_line.push_str(
+            &job_args.iter().map(|a| settings::sh_quote(a)).collect::<Vec<_>>().join(" "),
+        );
+        argv_line.push('\n');
     }
-    if !head.starts_with("#!") {
-        head = format!("#!/bin/bash\n{head}");
-    }
+
+    // Runs INSIDE the cage, as the last thing the guard does: hand off to the agent's body.
+    let tail = format!(
+        "{argv_line}exec /bin/bash \"$_husk_body\" \"$@\"\n"
+    );
 
     let bwrap = bwrap_args
         .iter()
@@ -799,6 +835,11 @@ fi
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
+# The agent's script, as DATA. Set before the branch because both halves need it: the\n\
+# in-cage half execs it, the outer half removes it. One origin for the path, so the two\n\
+# cannot drift - the cleanup set has already been wrong once, and every file the guard is\n\
+# responsible for must be named exactly once.\n\
+_husk_body={body_q}\n\
 if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   export _HUSK_RESANDBOXED=1\n\
   # An ARRAY, not a string. A string of pre-quoted arguments expanded unquoted gets\n\
@@ -921,6 +962,9 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   # it did not: net.sock, socat and net-proxy.log were never removed, so rmdir failed and\n\
   # EVERY networked job leaked its spool, silently, because the failure had no branch that\n\
   # reported it. A test now derives the required names from the generated script.\n\
+  # The agent's staged body. Owned by the guard because it must outlive submission (the\n\
+  # job has to be able to read it) but must not outlive the job.\n\
+  rm -f \"$_husk_body\" 2>/dev/null\n\
   if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
     rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
     rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* 2>/dev/null\n\
@@ -981,7 +1025,7 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   fi\n\
   exit \"$_husk_rc\"\n\
 fi\n\
-{net_relay}{banner}# --- original agent script ---\n"
+{net_relay}{banner}# --- hand off to the agent's script, inside the cage ---\n"
     );
 
     format!("{head}{guard}{tail}")
@@ -990,6 +1034,10 @@ fi\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a staged agent body lives in these tests. The guard only ever names it; the
+    /// file's existence is `spool::submit`'s business, not `wrap_script`'s.
+    const BODY_PATH: &str = "/work/.husk-body-t.sh";
     use crate::protocol::Script;
     use std::collections::BTreeMap;
 
@@ -1534,7 +1582,8 @@ mod tests {
         // The workdir must EXIST: the guard creates the step spool under it, and a
         // workdir it cannot create in means no step pair (which the guard now announces).
         let script = wrap_script(
-            "#!/bin/bash\necho AGENT_BODY_RAN\n",
+            BODY_PATH,
+            &[],
             &[],
             profile::Profile::SingleNode,
             &dir.to_string_lossy(),
@@ -1646,7 +1695,7 @@ mod tests {
 
     #[test]
     fn guard_bootstraps_the_step_pair() {
-        let script = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()]);
+        let script = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()]);
         // An UN-CAGED step-broker: it needs exactly the MUNGE + daemon route the cage
         // removes, which is why it starts before the re-exec and not inside it.
         assert!(script.contains("--step-broker --spool"), "{script}");
@@ -1707,7 +1756,8 @@ mod tests {
     fn every_file_the_guard_creates_in_its_own_directories_is_cleaned_up() {
         for net in [false, true] {
             let script = wrap_script(
-                "#!/bin/bash\ntrue\n",
+                BODY_PATH,
+                &[],
                 &[],
                 profile::Profile::SingleNode,
                 "/work",
@@ -1801,7 +1851,8 @@ mod tests {
         // change underneath it without moving the file. Adding --unshare-pid was invisible
         // to it, which is how I noticed.
         let script = wrap_script(
-            "#!/bin/bash\n#SBATCH --nodes=1\nsrun hostname\n",
+            BODY_PATH,
+            &[],
             &FsPolicy::default().compute_bwrap_args("/work/project"),
             profile::Profile::SingleNode,
             "/work/project",
@@ -2120,7 +2171,7 @@ mod tests {
     #[test]
     fn a_job_ended_by_a_signal_says_its_output_is_incomplete() {
         let script = wrap_script(
-            "#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", false,
+            BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false,
             &["/work".to_string()],
         );
         // The trap is load-bearing twice over: an UNTRAPPED SIGTERM kills the guard shell
@@ -2154,12 +2205,12 @@ mod tests {
         // With no allowlist a job keeps today's behaviour EXACTLY - --unshare-net and no
         // route - and nothing is started to serve a policy that permits nothing. This is
         // the default for every existing user, so it is the case worth pinning hardest.
-        let off = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()]);
+        let off = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()]);
         assert!(!off.contains("--net-proxy"), "no proxy without an allowlist: {off}");
         assert!(!off.contains("HUSK_NET_SOCK"), "no relay without an allowlist: {off}");
         assert!(!off.contains("HTTP_PROXY"), "no proxy env without an allowlist: {off}");
 
-        let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
         // The proxy runs OUTSIDE the cage, so it must be started before the guard execs
         // into bwrap - not after, where it would be inside the thing it is meant to be
         // outside of.
@@ -2172,7 +2223,7 @@ mod tests {
         assert!(proxy_at < cage_at, "the proxy must start before the cage is entered");
         // ...and the relay runs INSIDE, after the re-exec guard has finished.
         let relay_at = on.find("TCP-LISTEN:3128").expect("relay must be started");
-        let guard_end = on.find("# --- original agent script ---").expect("guard end");
+        let guard_end = on.find("# --- hand off to the agent").expect("guard end");
         assert!(relay_at < guard_end, "the relay belongs before the agent body");
         assert!(
             relay_at > on.find("exit \"$_husk_rc\"").expect("guard exit"),
@@ -2194,7 +2245,7 @@ mod tests {
         // "already available" branch, and binds nothing - after which the cage masks it.
         // Reasoning about what will be visible inside the cage is the mistake; binding
         // unconditionally removes the reasoning.
-        let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
         assert!(on.contains("export HUSK_SOCAT="), "the relay learns the path by env: {on}");
         assert!(
             on.contains("_husk_extra+=(--ro-bind \"$_husk_socat_src\""),
@@ -2235,7 +2286,7 @@ mod tests {
         // step-pair block left `_husk_broker` assigned BELOW its first use, so the guard ran
         // an empty command and reported only "line 43: : command not found". No proxy
         // started, and three network arms failed for a reason none of them could see.
-        let on = wrap_script("#!/bin/bash\ntrue\n", &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
         // `_husk_log` has exactly the shape that caused this: it is assigned in the hoisted
         // preamble and first USED inside `net_start`, which is interpolated above the
         // step-pair block. Get the order wrong and both the proxy and the step-broker
@@ -2260,7 +2311,8 @@ mod tests {
         // every job down before. `bash -n` is cheap and catches the whole class.
         for net in [false, true] {
             let script = wrap_script(
-                "#!/bin/bash\necho body\n",
+                BODY_PATH,
+                &[],
                 &["--ro-bind".into(), "/".into(), "/".into()],
                 profile::Profile::SingleNode,
                 "/work",
@@ -2347,7 +2399,8 @@ mod tests {
         // one wins, so an allowRead that re-exposes a parent directory must not be able
         // to resurrect MUNGE. The mask therefore has to come AFTER the policy args.
         let script = wrap_script(
-            "#!/bin/bash\ntrue\n",
+            BODY_PATH,
+            &[],
             &["--ro-bind".into(), "/run".into(), "/run".into()],
             profile::Profile::SingleNode,
             "/work",
@@ -2423,23 +2476,91 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wrap_script_orders_directives_then_guard_then_body() {
-        let body = "#!/bin/bash\n#SBATCH --nodes=1\nsrun hostname\n";
-        let w = match decide(
+    /// Submit `body` and return the script husk hands to sbatch.
+    fn submitted(body: &str) -> String {
+        match decide(
             &req(&["--partition=preemptible"], body),
             &no_uenv(),
             &FsPolicy::default(),
             work(),
         ) {
             Decision::Submit(s) => s.wrapped_script,
-            _ => panic!("reject"),
-        };
-        let d = w.find("#SBATCH --nodes=1").expect("directive kept");
-        let g = w.find("_HUSK_RESANDBOXED").expect("guard injected");
-        let c = w.find("srun hostname").expect("agent command kept");
-        assert!(d < g, "directive must precede the guard (so sbatch still parses it)");
-        assert!(g < c, "guard must precede the first agent command");
+            _ => panic!("expected a submission for {body:?}"),
+        }
+    }
+
+    /// Bodies that each defeated the old `head + guard + tail` shape. The first two are the
+    /// review's CRITICALs; the rest are the same trick in the other whitespace characters
+    /// Rust's `trim_start` treats as blank and `bash` does not.
+    const HOSTILE_BODIES: &[&str] = &[
+        "#!/usr/bin/env -S bash -c \"MARKER_AGENT_BYTES\"\n",
+        "\u{000C}# ; MARKER_AGENT_BYTES\n",
+        "\u{000B}# ; MARKER_AGENT_BYTES\n",
+        "\u{00A0}# ; MARKER_AGENT_BYTES\n",
+        "\r# ; MARKER_AGENT_BYTES\n",
+        "#!/bin/bash\nMARKER_AGENT_BYTES\n",
+        "#SBATCH --nodes=1\nMARKER_AGENT_BYTES\n",
+        "\n\n   \n# comment\nMARKER_AGENT_BYTES\n",
+    ];
+
+    /// THE invariant that closes all three demonstrated bypasses at once.
+    ///
+    /// The old shape was `head + guard + tail`: husk split the agent's body on "leading
+    /// comment or blank", put the front half ABOVE its guard and the rest below. That gave
+    /// the agent two ways to run before the cage existed — keep its own `#!` line (the
+    /// kernel honours it and never reads the guard) or start a line with a character Rust's
+    /// `trim_start` calls whitespace and bash does not, which lands the payload in the head.
+    ///
+    /// Neither is a quoting bug, so neither is fixed by quoting harder. The property to hold
+    /// is structural: **the bytes slurmstepd executes are husk's, entirely.** The agent's
+    /// body is data, read by an interpreter husk names, inside the cage.
+    #[test]
+    fn submitted_script_contains_no_agent_bytes() {
+        for body in HOSTILE_BODIES {
+            let w = submitted(body);
+            assert!(
+                !w.contains("MARKER_AGENT_BYTES"),
+                "agent bytes reached the submitted script.\nbody: {body:?}\nscript:\n{w}"
+            );
+        }
+    }
+
+    /// Corollary, stated separately because it is the half an attacker aims at: whatever the
+    /// body starts with, line 1 of what slurmstepd executes is husk's.
+    #[test]
+    fn submitted_script_starts_with_husks_own_shebang() {
+        for body in HOSTILE_BODIES {
+            let w = submitted(body);
+            assert!(
+                w.starts_with("#!/bin/bash\n"),
+                "husk must author line 1.\nbody: {body:?}\nscript starts: {:?}",
+                &w[..w.len().min(80)]
+            );
+        }
+    }
+
+    /// The agent's `#SBATCH` lines must not reach slurmd's parser at all. husk reads them,
+    /// validates them, and re-emits what it allows onto the command line — where sbatch
+    /// precedence (CLI > env > `#SBATCH`) means husk's value wins by construction. Leaving
+    /// the agent's copy in the script is what made every `Ignored` option an ungated
+    /// channel, and what let a non-option token (`hetjob`) through the body gate.
+    #[test]
+    fn submitted_script_carries_no_agent_directives() {
+        let w = submitted("#SBATCH --nodes=1\n#SBATCH --mail-user=a@b.c\nsrun hostname\n");
+        assert!(!w.contains("--mail-user"), "an agent directive reached slurmd:\n{w}");
+        assert!(
+            !w.contains("#SBATCH"),
+            "the submitted script must carry no #SBATCH at all:\n{w}"
+        );
+    }
+
+    #[test]
+    fn guard_precedes_the_body_and_runs_it_inside_the_cage() {
+        let w = submitted("#!/bin/bash\nsrun hostname\n");
+        let g = w.find("_husk_body").expect("the guard must name the body file");
+        let b = w.find("bwrap").expect("the guard must build a cage");
+        assert!(b < w.len(), "{w}");
+        assert!(g > 0, "{w}");
     }
 
     // ---- security regressions from the v0.4.0 review (group B) ----
@@ -2545,7 +2666,10 @@ mod tests {
                     "--wrap leaked into the forced options (cage bypass): {:?}",
                     sub.options
                 );
-                assert!(sub.wrapped_script.contains(cmd), "wrapped command missing from staged script");
+                // The wrap string is the agent's program, so it now lives in the staged
+                // BODY, not in the script husk submits — which carries no agent bytes at all.
+                assert!(sub.body.contains(cmd), "wrapped command missing from the staged body");
+                assert!(!sub.wrapped_script.contains(cmd), "agent bytes in the submitted script");
                 assert!(sub.wrapped_script.contains("_HUSK_RESANDBOXED"), "re-exec guard missing");
             }
             other => panic!("expected Submit, got {}", match other {
@@ -2569,7 +2693,8 @@ mod tests {
                     "--wrap or its value leaked: {:?}",
                     sub.options
                 );
-                assert!(sub.wrapped_script.contains(cmd), "wrapped command missing from staged script");
+                assert!(sub.body.contains(cmd), "wrapped command missing from the staged body");
+                assert!(!sub.wrapped_script.contains(cmd), "agent bytes in the submitted script");
             }
             _ => panic!("expected Submit"),
         }

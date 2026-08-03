@@ -867,7 +867,7 @@ JSON
 # --dry-run keeps the staged script on disk, so read that rather than parsing stdout.
 ( cd "$GJOB/work" && HOME="$GJOB/home" "$BROKER" --dry-run --once --spool "$GJOB/spool" ) \
   >"$GJOB/dryrun.out" 2>>"$BROKER_LOG"
-GSCRIPT="$GJOB/spool/job-guard.sh"
+GSCRIPT="$GJOB/spool/dry-guard.sh"
 if [ ! -s "$GSCRIPT" ]; then
   check FAIL lifecycle guard.staged "the broker staged no job script to run (see $GJOB/dryrun.out)"
 else
@@ -939,11 +939,11 @@ else
 JSON
   ( cd "$GJOB/work" && HOME="$GJOB/home" "$BROKER" --dry-run --once --spool "$GJOB/spool" ) \
     >>"$GJOB/dryrun.out" 2>>"$BROKER_LOG"
-  if [ ! -s "$GJOB/spool/job-sig.sh" ]; then
+  if [ ! -s "$GJOB/spool/dry-sig.sh" ]; then
     check FAIL lifecycle guard.preempt_warned "the broker staged no script for the signal probe"
   else
     ( cd "$GJOB/work" && PATH="$GJOB/bin:$PATH" HOME="$GJOB/home" SLURM_JOB_ID=990003 \
-        timeout -s TERM 3 bash "$GJOB/spool/job-sig.sh" ) >"$GJOB/sig.out" 2>"$GJOB/sig.err"
+        timeout -s TERM 3 bash "$GJOB/spool/dry-sig.sh" ) >"$GJOB/sig.out" 2>"$GJOB/sig.err"
     SIGLOG="$GJOB/home/.husk/log/job-990003.log"
     if grep -q "TERMINATED EARLY" "$GJOB/sig.err" && grep -q "TERMINATED EARLY" "$SIGLOG" 2>/dev/null; then
       check PASS lifecycle guard.preempt_warned "a signalled job warns that its output is incomplete, in the job output AND the husk log"
@@ -986,11 +986,11 @@ EOF
 JSON
   ( cd "$GDEEP" && HOME="$GD/home" "$BROKER" --dry-run --once --spool "$GD/spool" ) \
     >"$GD/dryrun.out" 2>>"$BROKER_LOG"
-  if [ ! -s "$GD/spool/job-deep.sh" ]; then
+  if [ ! -s "$GD/spool/dry-deep.sh" ]; then
     check FAIL lifecycle guard.sock_deep "the broker staged no script for the deep workdir"
   else
     ( export PATH="$GD/bin:$PATH" HOME="$GD/home" SLURM_JOB_ID=990002
-      cd "$GDEEP" && bash "$GD/spool/job-deep.sh" ) >"$GD/job.out" 2>"$GD/job.err"
+      cd "$GDEEP" && bash "$GD/spool/dry-deep.sh" ) >"$GD/job.out" 2>"$GD/job.err"
     OLDLEN=$(( ${#GDEEP} + 34 ))   # what <workdir>/.husk-step-spool-<jobid>/net.sock would be
     if grep -q "husk-proxy: listening on" "$GD/home/.husk/log/job-990002.log" 2>/dev/null; then
       check PASS lifecycle guard.sock_deep "egress came up from a ${#GDEEP}-byte workdir (old layout would have needed $OLDLEN of 107)"

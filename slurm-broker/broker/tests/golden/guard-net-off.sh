@@ -1,6 +1,10 @@
 #!/bin/bash
-#SBATCH --nodes=1
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---
+# The agent's script, as DATA. Set before the branch because both halves need it: the
+# in-cage half execs it, the outer half removes it. One origin for the path, so the two
+# cannot drift - the cleanup set has already been wrong once, and every file the guard is
+# responsible for must be named exactly once.
+_husk_body='/work/.husk-body-t.sh'
 if [ -z "${_HUSK_RESANDBOXED:-}" ]; then
 export _HUSK_RESANDBOXED=1
 # An ARRAY, not a string. A string of pre-quoted arguments expanded unquoted gets
@@ -122,6 +126,9 @@ fi
 # it did not: net.sock, socat and net-proxy.log were never removed, so rmdir failed and
 # EVERY networked job leaked its spool, silently, because the failure had no branch that
 # reported it. A test now derives the required names from the generated script.
+# The agent's staged body. Owned by the guard because it must outlive submission (the
+# job has to be able to read it) but must not outlive the job.
+rm -f "$_husk_body" 2>/dev/null
 if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
 rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null
@@ -189,5 +196,5 @@ echo "husk:   /scratch/shared" >&2
 echo "husk: reads are unrestricted. A write outside the list above fails" >&2
 echo "husk: with 'Read-only file system' - that is husk, not the filesystem." >&2
 echo "husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}" >&2
-# --- original agent script ---
-srun hostname
+# --- hand off to the agent's script, inside the cage ---
+exec /bin/bash "$_husk_body" "$@"
