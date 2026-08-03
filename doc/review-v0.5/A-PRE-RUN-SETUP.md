@@ -86,6 +86,24 @@ fresh-cage, checked-between design bounds the blast radius but does not replace 
 
 ---
 
+## Your job during the run, once setup is done
+
+The orchestrator sequences reviewers and invokes the check; you are the out-of-cage watchdog.
+Concretely, during the run you:
+
+- **Read `~/.husk-review-state/history.tsv`**, not the orchestrator's summary. The check writes
+  that file itself, at the moment it decides — one line per cycle, `CLEAN`/`DRIFT`, count,
+  reviewer label. If a cycle is missing from it, the check did not run, whatever you were told.
+- **Own every DRIFT.** Capture the evidence before cleaning; the runbook's DRIFT section is
+  written for you as much as for the orchestrator.
+- **Take any live-process escalation immediately.** That is the one outcome the orchestrator is
+  told to stop dead on rather than handle.
+- **Run the final `--deep` pass** yourself, once, before calling the run clean.
+
+You do not need to type `--check` nine times. You do need the history file to be the thing you
+trust, because the orchestrator reads reviewer-authored text and is therefore a soft target for
+exactly one sentence: "the check already passed."
+
 ## Optional, but each earns its cost
 
 None of these is required; all three are cheap and remove a way the run can mislead you.

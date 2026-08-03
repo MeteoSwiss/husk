@@ -13,6 +13,9 @@
 #
 #   --baseline   snapshot the current (known-good) state. Run ONCE, after setup, before any
 #                reviewer. See A-PRE-RUN-SETUP.md.
+#   Set HUSK_REVIEW_LABEL=<brief-id> before --check so the history line says which reviewer
+#   it followed. Optional, and worth it: an unlabelled history is hard to read afterwards.
+#
 #   --check      compare now against the baseline. Prints STATE: CLEAN or STATE: DRIFT and
 #                exits 0 / nonzero. This is what the orchestrator runs after each reviewer.
 #   --deep       additionally probe the compute nodes used this session for /tmp and /dev/shm
@@ -195,10 +198,32 @@ if [ "${2:-}" = --deep ]; then
   done
 fi
 
+# THE RECORD IS WRITTEN HERE, BY THIS SCRIPT, NOT BY WHOEVER RAN IT.
+#
+# The orchestrator may invoke this check — that is fine and saves the human nine invocations.
+# What must not happen is the human learning the result only through the orchestrator's own
+# account of it. The orchestrator is uncaged and it READS FINDINGS.md, a file authored by an
+# adversarial-by-role caged agent: that is a prompt-injection channel into the component
+# sequencing the whole run, and "the check said CLEAN" is exactly the sentence an escaped
+# reviewer would want it to believe.
+#
+# So the verdict lands in an append-only log the human owns, outside REVIEW_ROOT, written by
+# this script at the moment it decides. husk's own rule, one level up: the audited party does
+# not author the audit trail. Read this file, not the summary you are given.
+log_verdict() {
+  printf '%s\t%s\t%s\t%s\n' \
+    "$(date -u +%FT%TZ)" "$1" "${2:-0}" "${HUSK_REVIEW_LABEL:-<unlabelled>}" \
+    >> "$STATE_DIR/history.tsv"
+}
+
 if [ "$drift" -eq 0 ]; then
+  log_verdict CLEAN 0
   echo "STATE: CLEAN"
+  echo "       recorded in $STATE_DIR/history.tsv — that file, not this output, is the record."
   exit 0
 else
+  log_verdict DRIFT "$drift"
   echo "STATE: DRIFT ($drift item(s)) — see A-ORCHESTRATOR-RUNBOOK.md 'When the check reports DRIFT'"
+  echo "       recorded in $STATE_DIR/history.tsv"
   exit 1
 fi
