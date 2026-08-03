@@ -291,6 +291,29 @@ pub fn decide(
     // relative paths behave as they would uncaged. Only the boundary moved, and it moved
     // to something the agent cannot influence and the human chose by launching husk there.
     let root = project_dir.to_string_lossy().to_string();
+
+    // ...and the root is checked TOO, not just the agent's cwd.
+    //
+    // This is the value bound read-WRITE into every job. `is_workdir_allowed` has always
+    // existed and has always rejected exactly this, but it was only ever applied to
+    // `req.cwd` — so husk validated the value it distrusted and took its own on faith.
+    // Launch husk from a home and every brokered job got that home bound writable, through
+    // the `--tmpfs /users` floor that exists to hide it: `~/.ssh` readable, `~/.bashrc`
+    // writable, and `~/.husk/log/job-*.log` — the audit trail put there BECAUSE the home is
+    // masked — writable by the job it records.
+    //
+    // Refuse at the top, before `root` reaches anything else. Cheaper than unpicking which
+    // downstream check happens to catch it, and it stops the writable-set message from
+    // announcing a home as writable on its way out.
+    if !settings::is_workdir_allowed(&root) {
+        return Decision::Reject(format!(
+            "husk will not run a job whose working directory is {root:?}: that is a home \
+             directory (or the filesystem root), and husk binds the directory it was \
+             launched from into the job read-write. Launch husk from a scratch or project \
+             path instead — e.g. $SCRATCH/my-run — and submit from there."
+        ));
+    }
+
     let cwd = req.cwd.clone();
     let pick = |names: &[&str]| {
         sbatch::option_value(&cli, names).or_else(|| sbatch::option_value(&directives, names))
@@ -754,7 +777,13 @@ fn wrap_script(
     chmod 700 "$_husk_net_dir" 2>/dev/null
     rm -f "$_husk_net_dir/net.sock" 2>/dev/null
     _husk_net_sock="$_husk_net_dir/net.sock"
-    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD" \
+    # --workdir is where the proxy READS ITS ALLOWLIST FROM, so it must be the trusted
+    # project dir and not "$PWD". $PWD here is the job's --chdir, which is confined to the
+    # writable set but chosen by the agent within it — so the confined side got to pick
+    # which settings files decided its own egress policy. The submit-time half already
+    # resolved the allowlist from the project dir; the two halves disagreed, and main.rs
+    # says out loud that the policy comes from "files the agent cannot write".
+    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir {workdir_q} \
       >>"$_husk_log" 2>&1 &
     _husk_net_pid=$!
     export HUSK_NET_SOCK="$_husk_net_sock"
@@ -2215,6 +2244,21 @@ mod tests {
         // into bwrap - not after, where it would be inside the thing it is meant to be
         // outside of.
         let proxy_at = on.find("--net-proxy").expect("proxy must be started");
+        // The proxy resolves its ALLOWLIST from --workdir, so that argument decides which
+        // settings files govern this job's egress. It must be the trusted project dir. It
+        // used to be "$PWD" — the job's --chdir, which the agent picks within the writable
+        // set — so the confined side chose the policy that confined it, while the
+        // submit-time half of the same decision used the project dir. One boundary, two
+        // origins, is the shape of the bug this whole fix is about.
+        assert!(
+            !on.contains("--workdir \"$PWD\""),
+            "the proxy must not take its allowlist from the agent-influenced cwd: {on}"
+        );
+        assert!(
+            on.contains("--workdir '/work'"),
+            "the proxy must read its allowlist from a husk-quoted literal path, not a \
+             variable resolved inside the job: {on}"
+        );
         // Anchor on the actual exec line, not the first mention of bwrap: the guard talks
         // about bwrap in its comments long before it runs it. No leading spaces - the
         // `\n\` continuations in the Rust literal strip the indentation, so the emitted
@@ -2473,6 +2517,46 @@ mod tests {
                 "exactly one --nodes must be emitted for {argv:?}: {o:?}"
             );
             assert!(has(&o, "--nodes=1"), "{argv:?} -> {o:?}");
+        }
+    }
+
+    /// The cage's writable root is `project_dir` — where the human launched husk. It is the
+    /// one value that is bound read-WRITE into every job, and it was the one value nothing
+    /// checked: `is_workdir_allowed` existed, rejected exactly this, and was only ever
+    /// applied to `req.cwd`. Launch husk from a home and every brokered job gets that home
+    /// bound writable, straight through the `--tmpfs /users` floor that exists to hide it —
+    /// `~/.ssh` readable, `~/.bashrc` writable, and the job log the guard keeps there
+    /// precisely BECAUSE the home is masked becomes writable by the job it audits.
+    ///
+    /// Checking the agent's value and not our own is the same mistake in mirror image: the
+    /// boundary must be validated wherever it comes from, including from us.
+    #[test]
+    fn a_write_root_under_the_floor_is_refused() {
+        for root in ["/users", "/users/victim", "//users/victim", "/users/victim/proj"] {
+            let d = decide(
+                &req(&["--partition=preemptible"], "echo hi\n"),
+                &no_uenv(),
+                &FsPolicy::default(),
+                std::path::Path::new(root),
+            );
+            let msg = match d {
+                Decision::Reject(m) => m,
+                _ => panic!("a job whose write root is {root:?} must be refused"),
+            };
+            assert!(msg.contains("husk"), "the refusal must name husk: {msg}");
+            // The reason has to be THE reason. Before the root was checked this already
+            // "failed", but for an unrelated one — the request cwd was not inside the
+            // writable set — and the message helpfully announced the victim's home AS the
+            // writable set. A refusal that arrives for the wrong reason is a test that
+            // cannot fail, and a message that leaks what it is refusing to protect.
+            assert!(
+                msg.contains("home") || msg.contains("scratch"),
+                "the refusal must say the root is a home and where to run instead: {msg}"
+            );
+            assert!(
+                !msg.contains("Writable here"),
+                "a refused root must not be announced as writable: {msg}"
+            );
         }
     }
 

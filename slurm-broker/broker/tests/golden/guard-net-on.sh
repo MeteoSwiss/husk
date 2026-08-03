@@ -131,7 +131,13 @@ export HUSK_JOB_LOG="$_husk_log"
     chmod 700 "$_husk_net_dir" 2>/dev/null
     rm -f "$_husk_net_dir/net.sock" 2>/dev/null
     _husk_net_sock="$_husk_net_dir/net.sock"
-    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir "$PWD" \
+    # --workdir is where the proxy READS ITS ALLOWLIST FROM, so it must be the trusted
+    # project dir and not "$PWD". $PWD here is the job's --chdir, which is confined to the
+    # writable set but chosen by the agent within it — so the confined side got to pick
+    # which settings files decided its own egress policy. The submit-time half already
+    # resolved the allowlist from the project dir; the two halves disagreed, and main.rs
+    # says out loud that the policy comes from "files the agent cannot write".
+    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir '/work/project' \
       >>"$_husk_log" 2>&1 &
     _husk_net_pid=$!
     export HUSK_NET_SOCK="$_husk_net_sock"

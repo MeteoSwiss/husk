@@ -288,20 +288,51 @@ pub const SETTINGS_SOURCES: [(bool, &str); 3] = [
 /// or empty, `/`, any path with a `..` component, and any path equal to or under a
 /// HIDDEN_FLOOR. Jobs must run from a scratch/project path. (F15/F19)
 pub fn is_workdir_allowed(cwd: &str) -> bool {
-    if cwd.is_empty() || !cwd.starts_with('/') || cwd == "/" {
-        return false;
+    match normalize_abs(cwd) {
+        None => false,
+        Some(n) => n != "/" && !path_under_floor(&n),
     }
-    if cwd.split('/').any(|c| c == "..") {
-        return false;
+}
+
+/// Collapse an absolute path to one spelling, so a comparison against it means something.
+///
+/// `//users/me`, `/users//me`, `/users/./me` and `/users/me/` are all the same directory to
+/// the kernel and to bwrap, and every one of them used to defeat a `starts_with` against the
+/// hidden floor. Returns `None` for anything that is not a usable absolute path — empty,
+/// relative, or containing a `..` component, which is refused rather than resolved because
+/// resolving it here would disagree with what the filesystem does about symlinks.
+///
+/// This is textual normalisation only. It is the *floor* check, which must work on paths
+/// that need not exist yet; `confine_under_workdir` still canonicalises on disk, and that is
+/// what catches a symlink pointing somewhere else.
+fn normalize_abs(p: &str) -> Option<String> {
+    if p.is_empty() || !p.starts_with('/') {
+        return None;
     }
-    !path_under_floor(cwd)
+    let mut out = String::new();
+    for part in p.split('/') {
+        match part {
+            "" | "." => continue, // repeated or trailing slash, or a no-op component
+            ".." => return None,
+            c => {
+                out.push('/');
+                out.push_str(c);
+            }
+        }
+    }
+    Some(if out.is_empty() { "/".to_string() } else { out })
 }
 
 /// True if `p` equals or is nested under a HIDDEN_FLOOR path. Such a path must never be
 /// re-exposed by an allow carve-out (the floor must hold regardless of config) and is not
 /// an acceptable writable workdir. (F18/F15)
 fn path_under_floor(p: &str) -> bool {
-    let norm = p.trim_end_matches('/');
+    // A path that will not normalise (relative, or containing `..`) is not a path we can
+    // vouch for, so it counts as under the floor: the caller's question is always "may I
+    // expose this?", and the safe answer to an unresolvable path is no.
+    let Some(norm) = normalize_abs(p) else {
+        return true;
+    };
     HIDDEN_FLOOR
         .iter()
         .any(|floor| norm == *floor || norm.starts_with(&format!("{floor}/")))
@@ -1068,6 +1099,42 @@ mod tests {
         assert!(!is_workdir_allowed("relative/path")); // not absolute
         assert!(!is_workdir_allowed("")); // empty
         assert!(!is_workdir_allowed("/scratch/../users/victim")); // traversal
+    }
+
+    /// The floor predicates were raw string comparisons, so any spelling of a floor path
+    /// that is not byte-identical walked straight through them. `//users/me` is the same
+    /// directory as `/users/me` to the kernel and to bwrap — POSIX collapses the leading
+    /// double slash — but `"//users/me".starts_with("/users/")` is false, so husk called it
+    /// safe. That one character was the difference between a rejected submission and a
+    /// job with the victim's home bound writable.
+    ///
+    /// The lesson is the same one that produced `confine_under_workdir`: **compare paths
+    /// after normalising them, never as strings**, because the thing that will act on the
+    /// path does not share your spelling.
+    #[test]
+    fn floor_predicates_normalise_before_comparing() {
+        for spelling in [
+            "//users",
+            "//users/victim",
+            "///users/victim",
+            "/./users/victim",
+            "/users/./victim",
+            "/users//victim",
+            "/users/victim/",
+            "/users/victim//",
+            "/scratch/../users/victim",
+            "/users/other/../victim",
+        ] {
+            assert!(
+                !is_workdir_allowed(spelling),
+                "{spelling:?} names a home and must be refused as a workdir"
+            );
+        }
+        // ...without becoming superstitious about slashes that mean nothing.
+        assert!(is_workdir_allowed("//scratch/proj"));
+        assert!(is_workdir_allowed("/scratch//proj"));
+        assert!(is_workdir_allowed("/scratch/./proj"));
+        assert!(is_workdir_allowed("/scratch/proj/"));
     }
 
     #[test]
