@@ -563,6 +563,12 @@ fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<Str
 /// refusal names what this verb does accept, so an agent adapts in one step instead of
 /// probing. Widening it is an operator decision with a man page open.
 ///
+/// **The table must be the INTERSECTION of the SLURM versions husk runs on, not the union.**
+/// Balfrin is 23.02.7 and Santis is 25.05.4, two major versions apart, so an option added
+/// after 23.02 works on one cluster and is an unrecognised-option error on the other. The
+/// older cluster is the floor. `query-parity-probe.sh` must therefore be run on BOTH, and it
+/// prints the version it tested so a green run cannot be mistaken for a general one.
+///
 /// NOT VERIFIED against real SLURM binaries — there is no SLURM on the development machine.
 /// `query-parity-probe` on a cluster should diff these tables against each tool's own
 /// `--help`, the same instrument shape `sbatch.directive_parity` already uses for `#SBATCH`.
