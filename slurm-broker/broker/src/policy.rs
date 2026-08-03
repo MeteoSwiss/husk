@@ -624,6 +624,24 @@ fn query_spec(tool: &str) -> Option<QuerySpec> {
     })
 }
 
+/// Emit husk's query tables so a probe can check them against the real SLURM binaries.
+///
+/// The table is printed BY THE BROKER rather than restated in the probe script, for the same
+/// reason every other probe is driven from the trusted layer: a second copy is a copy that
+/// drifts, and the copy that drifts is the one that reports green.
+pub fn print_query_options() {
+    for tool in husk_slurm_broker::READONLY_SLURM {
+        if let Some(spec) = query_spec(tool) {
+            for o in spec.flag {
+                println!("{tool}\tflag\t{o}");
+            }
+            for o in spec.value {
+                println!("{tool}\tvalue\t{o}");
+            }
+        }
+    }
+}
+
 fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
     let Some(spec) = query_spec(tool) else {
         return Err(format!("husk does not broker {tool}"));
@@ -2865,6 +2883,64 @@ mod tests {
         match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
             Decision::Query(a) => assert_eq!(a, vec!["squeue", "-p", "short"], "{a:?}"),
             other => panic!("squeue -p short must work: {}", matches!(other, Decision::Reject(_))),
+        }
+    }
+
+    /// Every option husk claims to accept must actually survive husk's own vetting, for
+    /// every verb, in both spellings. Cheap and complete: the table is the only source, so
+    /// this cannot drift from it, and it catches an option listed under `value` that should
+    /// be a `flag` (or the reverse) — the class that made `sacct -p` mangle its own argv.
+    ///
+    /// What it CANNOT catch is whether the real tool has that option at all. There is no
+    /// SLURM here, so a typo in the table looks identical to a correct entry. That is what
+    /// `query.parity` on a cluster is for.
+    #[test]
+    fn every_allowed_query_option_is_accepted() {
+        for tool in husk_slurm_broker::READONLY_SLURM {
+            let spec = query_spec(tool).expect("every brokered read-only verb needs a spec");
+            for opt in spec.flag {
+                let got = vet_query_argv(tool, &[opt.to_string()])
+                    .unwrap_or_else(|e| panic!("{tool} {opt} is on its own flag list: {e}"));
+                assert_eq!(got, vec![tool.to_string(), opt.to_string()]);
+            }
+            for opt in spec.value {
+                // separated form
+                let got = vet_query_argv(tool, &[opt.to_string(), "x".into()])
+                    .unwrap_or_else(|e| panic!("{tool} {opt} <value>: {e}"));
+                assert_eq!(got, vec![tool.to_string(), opt.to_string(), "x".to_string()]);
+                // and `--opt=value`, which only the long spellings have
+                if opt.starts_with("--") {
+                    vet_query_argv(tool, &[format!("{opt}=x")])
+                        .unwrap_or_else(|e| panic!("{tool} {opt}=x: {e}"));
+                }
+            }
+            // No option may be on both lists: that is the arity confusion in miniature.
+            for opt in spec.value {
+                assert!(!spec.flag.contains(opt), "{tool} {opt} is both a flag and a value");
+            }
+        }
+    }
+
+    /// The other half, and the one with teeth: anything that names a FILE must be refused,
+    /// on every verb, whatever husk otherwise allows.
+    #[test]
+    fn no_query_option_can_carry_a_path() {
+        for tool in husk_slurm_broker::READONLY_SLURM {
+            for argv in [
+                vec!["--file=/etc/passwd"],
+                vec!["--completion"],
+                vec!["--batch-script"],
+                vec!["-o", "/tmp/x"],
+                vec!["--format=/tmp/x"],
+                vec!["/etc/passwd"],
+                vec!["-j", "../../etc/passwd"],
+            ] {
+                let a: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+                assert!(
+                    vet_query_argv(tool, &a).is_err(),
+                    "{tool} {argv:?} must be refused - it can name a path"
+                );
+            }
         }
     }
 

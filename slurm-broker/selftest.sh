@@ -678,6 +678,32 @@ run_srun_probe() {
 # REJECT, a spelling it cannot see is an ungated channel. Which spellings those are is
 # site- and version-specific, so it is measured rather than assumed — same reasoning, and
 # the same shell-out shape, as the srun probe above.
+# The same question for the read-only verbs: does the real SLURM have the options husk
+# allows? husk's per-verb tables were written on a machine with no SLURM, so every entry is
+# a claim that could not be checked where it was made — and a typo is indistinguishable from
+# a correct entry until a user hits it. The probe reads the table FROM THE BROKER and runs
+# each option against the real binary. All of them return instantly and select nothing.
+run_query_parity_probe() {
+  local script="$HERE/query-parity-probe.sh"
+  if [ ! -x "$script" ]; then
+    check SKIP containment query.parity "query-parity-probe.sh not found beside selftest.sh"
+    return
+  fi
+  local out="$PWORK/query-parity.out"
+  # Clear HUSK_SLURM_SPOOL: with it set, squeue and friends are husk's own stub, and the
+  # probe would be asking husk whether husk agrees with itself.
+  ( unset HUSK_SLURM_SPOOL; "$script" "$BROKER" ) >"$out" 2>&1
+  local line
+  line=$(tail -1 "$out" 2>/dev/null)
+  case "$line" in
+    "parity: all "*)  check PASS containment query.parity "${line#parity: }" ;;
+    "parity: no SLURM"*) check SKIP containment query.parity "no SLURM on this host" ;;
+    "parity: nothing checked"*) check INFO containment query.parity "the broker printed no query table" ;;
+    *"do not exist"*) check FAIL containment query.parity "${line#parity: } — see $out" ;;
+    *) check INFO containment query.parity "unrecognised probe output: ${line:-<none>}" ;;
+  esac
+}
+
 run_directive_parity_probe() {
   local script="$HERE/directive-parity-probe.sh"
   if [ ! -x "$script" ]; then
@@ -1728,6 +1754,7 @@ HUSKLEFT
     # Same shape, for the other place a second parser reads husk's input: slurmd's own
     # reading of the `#SBATCH` lines husk forwarded.
     run_directive_parity_probe
+    run_query_parity_probe
 
     # THE STEP SPOOL, AFTER REAL JOBS. `guard.spool_removed` runs the guard on the LOGIN
     # node, so it proves the cleanup code works - not that it ran after a job that SLURM

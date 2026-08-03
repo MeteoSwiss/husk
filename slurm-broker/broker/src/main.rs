@@ -360,6 +360,12 @@ fn main() {
     if argv.first().map(String::as_str) == Some("--hold-cage") {
         hold_cage_mode();
     }
+    // Emit the read-only query tables for query-parity-probe.sh. Diagnostic only: it reads
+    // no spool, touches no policy, and exits.
+    if argv.first().map(String::as_str) == Some("--query-options") {
+        policy::print_query_options();
+        std::process::exit(0);
+    }
     if argv.first().map(String::as_str) == Some("--net-proxy") {
         net_proxy_mode(&argv[1..]);
     }
