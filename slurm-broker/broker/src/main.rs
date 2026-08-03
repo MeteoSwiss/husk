@@ -498,12 +498,25 @@ fn main() {
     // A configuration error belongs in the terminal of the person who wrote the
     // configuration. The submit-time check stays as a backstop, because these files can be
     // edited while a session is running.
+    // ...but a broken allowlist does NOT stop husk, and the asymmetry is the point.
+    //
+    // The two failures move the boundary in opposite directions. An unreadable filesystem
+    // policy loses its DENIES, so continuing would run a weaker cage than the human asked
+    // for — refuse. An unreadable allowlist loses its ALLOWS, so continuing runs with no
+    // egress at all, which is tighter than asked for and is exactly husk's default. Refusing
+    // to start would deny the same network AND all the work that never needed it.
+    //
+    // So the bug was never that egress got switched off. It was that it got switched off in
+    // silence: the generated script for a broken allowlist and for no allowlist were
+    // byte-identical, and nothing told anyone. Say it here, and the guard says it in the job.
     if let Err(e) = netallow::Allowlist::resolve(&home, &project_dir) {
-        eprintln!("husk: refusing to start - network allowlist: {e}");
-        eprintln!("husk: every job would be refused until this is fixed, so husk stops here \
-                   rather than letting the agent find out one submission at a time. Note \
-                   that SLURM daemon ports are refused outright and cannot be allowlisted.");
-        std::process::exit(2);
+        eprintln!("husk: WARNING - this session has NO NETWORK for any job.");
+        eprintln!("husk: the network allowlist could not be read: {e}");
+        eprintln!("husk: everything else works normally. Jobs will run with --unshare-net, \
+                   as they do when no allowlist is configured at all. Fix that entry and \
+                   restart husk to get egress back. SLURM daemon ports are refused outright \
+                   and cannot be allowlisted, so if a refusal suggested adding one, it was \
+                   wrong.");
     }
 
     // Open the session log by saying what session this is. An append-only log shared by

@@ -394,19 +394,28 @@ pub fn decide(
     // scheduler port told them to ask for the entry to be added; adding it makes the whole
     // allowlist refuse to parse; and every job then silently loses egress, valid entries
     // included, with no message anywhere. Refuse the submission instead and say which file.
+    // A broken allowlist means NO EGRESS, not a refused job: losing the allows makes the
+    // cage tighter, and refusing would deny the same network plus all the work that never
+    // needed it. What must not happen is what used to — the error swallowed with
+    // `.unwrap_or(false)` and the job running netless with nobody told. The script for a
+    // broken allowlist and for no allowlist were byte-identical.
+    //
+    // So the job is submitted, and the agent is TOLD, on the accepted path, where it will
+    // actually read it. `curl: (7) Failed to connect` is not a diagnosis.
+    let mut net_note = String::new();
     let net_enabled = match crate::netallow::Allowlist::resolve(
         &std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default(),
         project_dir,
     ) {
         Ok((a, _)) => !a.is_empty(),
         Err(e) => {
-            return Decision::Reject(format!(
-                "husk cannot read this project's network allowlist, so it will not submit \
-                 a job that would silently have no network: {e}. Fix that entry and \
-                 resubmit. Note that husk refuses SLURM daemon ports outright — if a \
-                 refusal suggested adding one, that suggestion was wrong and adding it \
-                 breaks the whole allowlist."
-            ));
+            net_note = format!(
+                "husk: this job has NO NETWORK. The network allowlist could not be read \
+                 ({e}), so husk fell back to its default of no egress. This is a \
+                 configuration problem, not a transient failure — retrying will not help, \
+                 and it is not something you can fix from in here. Tell the human."
+            );
+            false
         }
     };
 
@@ -422,7 +431,13 @@ pub fn decide(
         // The same warning the rejection carries, on the path that actually bit: a job
         // that asked for the right partition and no --time is accepted, and only finds
         // out about the limit from squeue afterwards.
-        note: time_note,
+        // Both advisories ride the same channel, since both are things the agent learns
+        // only by being told: the wall limit it inherited, and whether it has a network.
+        note: match (time_note.is_empty(), net_note.is_empty()) {
+            (_, true) => time_note,
+            (true, false) => net_note,
+            (false, false) => format!("{net_note}\n{time_note}"),
+        },
         wrapped_script: wrap_script(
             &body_path,
             &req.job_args,
