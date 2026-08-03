@@ -130,7 +130,8 @@ pub(crate) const CREDENTIAL_SOCKET_DIRS: &[&str] = &["/run/munge", "/var/run/mun
 /// job ends and never reach the real filesystem.
 const AUTO_EXEC_DIRS: &[&str] = &[
     ".claude",   // settings*, hooks, commands, agents, skills, workflows, routines, …
-    ".git/hooks",
+    // `.git/hooks` is NOT here: `.git` is masked by shape below, because masking a path
+    // inside it is what fabricated a repository when there was none.
     ".vscode",
     ".idea",
 ];
@@ -795,6 +796,39 @@ impl FsPolicy {
                 a.push("--tmpfs".into());
                 a.push(format!("{root}/{rel}"));
             }
+            // `.git` is masked according to what it actually IS, because bwrap creates the
+            // mountpoints it is given and the old rule created a repository that was not
+            // there. See `git_masking_handles_every_shape_of_dot_git` for the chain this
+            // closes; the short version is that `--tmpfs <root>/.git/hooks` conjured a real
+            // `.git/` on the host, into which the job then wrote a `core.hooksPath` that
+            // `--ro-bind-try .git/config` had already declined to protect because, at the
+            // moment bwrap looked, it did not exist.
+            match std::fs::symlink_metadata(format!("{root}/.git")) {
+                // A repository. Mask the hooks; `.git/config` is protected below and is
+                // guaranteed to exist here, which is where that assumption is actually true.
+                Ok(m) if m.is_dir() => {
+                    a.push("--tmpfs".into());
+                    a.push(format!("{root}/.git/hooks"));
+                }
+                // A `git worktree` or submodule checkout: `.git` is a FILE pointing at the
+                // real repository. A tmpfs cannot go under a file, so the old rule made
+                // bwrap fail and took the whole cage with it, reporting a bare bwrap error
+                // that never mentioned husk. Bind it read-only instead — the pointer is
+                // what must not be rewritten, and the repo it names is outside the root.
+                Ok(m) if m.is_file() => {
+                    let p = format!("{root}/.git");
+                    a.push("--ro-bind".into());
+                    a.push(p.clone());
+                    a.push(p);
+                }
+                // Absent, or something stranger. Mask the whole `.git` rather than a path
+                // inside it: the job can write there and read back its own writes, and none
+                // of it survives. What it can no longer do is leave a repository behind.
+                _ => {
+                    a.push("--tmpfs".into());
+                    a.push(format!("{root}/.git"));
+                }
+            }
             for rel in AUTO_EXEC_RO_FILES {
                 let path = format!("{root}/{rel}");
                 a.push("--ro-bind-try".into());
@@ -811,7 +845,11 @@ impl FsPolicy {
                 a.push(path.clone());
                 a.push(path);
             };
-            if !self.allow_git_config {
+            // Only meaningful when `.git` is a real repository — and only then is the
+            // "config always exists wherever .git does" premise a true one.
+            if !self.allow_git_config
+                && matches!(std::fs::symlink_metadata(format!("{root}/.git")), Ok(m) if m.is_dir())
+            {
                 protect(".git/config");
             }
         }
@@ -1087,6 +1125,67 @@ mod tests {
         // Floor-overlapping entries are gone; unrelated ones stay.
         assert_eq!(p.allow_read, vec!["/scratch/x".to_string()]);
         assert_eq!(p.allow_write, vec!["/data".to_string()]);
+    }
+
+    /// The auto-exec mask assumed `.git` is always a directory that already exists. All
+    /// three of its shapes were wrong in a different way, and the middle one was executed
+    /// end to end by the review: a job planted `.git/config` with `core.hooksPath`, it
+    /// persisted to the host, `git init` preserved it, and the next `git commit` ran the
+    /// payload as the user.
+    ///
+    /// The chain needed three defects at once. `--tmpfs <root>/.git/hooks` CREATES the
+    /// mountpoint, so with `.git` absent bwrap fabricated a real `.git/` on the host.
+    /// `.git/config` was protected with `--ro-bind-try`, which silently skips a file that
+    /// does not exist — and it did not exist, because the `.git` it would have lived in had
+    /// just been invented. And masking `.git/hooks` is irrelevant once `core.hooksPath`
+    /// points somewhere else entirely.
+    ///
+    /// The premise in the source — "`.git/config` always exists wherever `.git` does" — was
+    /// true of repositories and false of the directory husk itself conjured.
+    #[test]
+    fn git_masking_handles_every_shape_of_dot_git() {
+        let base = std::env::temp_dir().join(format!("husk-git-shapes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let p = FsPolicy::default();
+
+        // 1. A real repository: mask the hooks, keep config readable.
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/config"), "[core]\n").unwrap();
+        let a = p.compute_bwrap_args(&repo.to_string_lossy()).join(" ");
+        assert!(a.contains(&format!("--tmpfs {}/.git/hooks", repo.display())), "{a}");
+        assert!(a.contains(&format!("{}/.git/config", repo.display())), "{a}");
+
+        // 2. No repository at all. husk must NOT mask a path *inside* `.git`, because
+        //    creating that mountpoint is what fabricates the repository the plant needs.
+        //    Mask the whole `.git` instead: the job may write there and see its own writes,
+        //    and none of it survives the job.
+        let bare = base.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let a = p.compute_bwrap_args(&bare.to_string_lossy()).join(" ");
+        assert!(
+            !a.contains(&format!("{}/.git/hooks", bare.display())),
+            "must not fabricate a repository by masking inside a .git that is not there: {a}"
+        );
+        assert!(a.contains(&format!("--tmpfs {}/.git ", bare.display())), "{a}");
+
+        // 3. `.git` is a FILE — an ordinary `git worktree` or a submodule checkout. A tmpfs
+        //    under a file is not a thing, so bwrap refused and took the whole cage down with
+        //    a diagnostic that never mentioned husk.
+        let wt = base.join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere/.git/worktrees/x\n").unwrap();
+        let a = p.compute_bwrap_args(&wt.to_string_lossy()).join(" ");
+        assert!(
+            !a.contains(&format!("--tmpfs {}/.git", wt.display())),
+            "a .git FILE must not be masked as a directory - that kills the cage: {a}"
+        );
+        assert!(
+            a.contains(&format!("--ro-bind {}/.git {}/.git", wt.display(), wt.display())),
+            "a .git file is a pointer to a real repo and must be read-only: {a}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1656,18 +1755,21 @@ mod tests {
         let cmd = joined(&p, "/proj");
         // Whole agent-config / auto-exec DIRS -> fresh tmpfs (absent-safe; writes land
         // in the tmpfs and are discarded, so nothing persists into a later session).
-        for rel in [".claude", ".git/hooks", ".vscode", ".idea"] {
+        for rel in [".claude", ".vscode", ".idea"] {
             assert!(
                 cmd.contains(&format!("--tmpfs /proj/{rel}")),
                 "auto-exec dir {rel} not masked: {cmd}"
             );
         }
-        // .mcp.json and .git/config stay READABLE but read-only.
+        // `.git` is masked by SHAPE. These roots do not exist, so husk cannot see a
+        // repository and masks the whole thing — stronger than masking the hooks, and it
+        // does not invent a `.git/` on the host the way masking a path inside one did.
+        assert!(cmd.contains("--tmpfs /proj/.git "), "{cmd}");
+        assert!(cmd.contains("--tmpfs /scratch/run/.git "), "{cmd}");
+        // .mcp.json stays READABLE but read-only.
         assert!(cmd.contains("--ro-bind-try /proj/.mcp.json /proj/.mcp.json"));
-        assert!(cmd.contains("--ro-bind-try /proj/.git/config /proj/.git/config"));
         // and the same protections on the allowWrite root:
         assert!(cmd.contains("--tmpfs /scratch/run/.claude"));
-        assert!(cmd.contains("--tmpfs /scratch/run/.git/hooks"));
     }
 
     #[test]
@@ -1687,13 +1789,26 @@ mod tests {
 
     #[test]
     fn allow_git_config_frees_config_but_still_protects_hooks() {
+        // Needs a REAL repository, because `.git/config` is only protected — and only
+        // needs to be — where a `.git` directory actually exists.
+        let d = std::env::temp_dir().join(format!("husk-agc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join(".git/config"), "[core]\n").unwrap();
+        let root = d.to_string_lossy().to_string();
+
         let p = FsPolicy { allow_git_config: true, ..Default::default() };
-        let cmd = joined(&p, "/proj");
-        assert!(!cmd.contains("/proj/.git/config"), "git/config writable when allowGitConfig");
+        let cmd = joined(&p, &root);
+        assert!(!cmd.contains(&format!("{root}/.git/config")), "config writable: {cmd}");
+        assert!(cmd.contains(&format!("--tmpfs {root}/.git/hooks")), "hooks protected: {cmd}");
+
+        let p = FsPolicy::default();
+        let cmd = joined(&p, &root);
         assert!(
-            cmd.contains("--tmpfs /proj/.git/hooks"),
-            "hooks are protected regardless"
+            cmd.contains(&format!("--ro-bind-try {root}/.git/config {root}/.git/config")),
+            "config read-only by default in a real repo: {cmd}"
         );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -1701,7 +1816,7 @@ mod tests {
         // the ro-bind-try must come AFTER the workdir --bind so it overrides.
         let args = FsPolicy::default().compute_bwrap_args("/proj");
         let wbind = args.iter().position(|a| a == "/proj").unwrap();
-        let hooks = args.iter().position(|a| a == "/proj/.git/hooks").unwrap();
+        let hooks = args.iter().position(|a| a == "/proj/.git").unwrap();
         assert!(wbind < hooks, "auto-exec protection must follow the workdir bind");
     }
 
