@@ -488,6 +488,24 @@ fn main() {
         }
     };
 
+    // The network allowlist lives in the same files and gets the same treatment, at the same
+    // moment. It is validated here as well as at submit time, and the difference matters for
+    // WHO FINDS OUT. A bad entry is valid JSON — `*.com` parses fine and is refused for being
+    // vague — so the filesystem check above sails past it. Without this, husk started
+    // cleanly, said nothing, and the agent discovered it by having every single submission
+    // rejected, then had to relay a configuration problem back to the human in prose.
+    //
+    // A configuration error belongs in the terminal of the person who wrote the
+    // configuration. The submit-time check stays as a backstop, because these files can be
+    // edited while a session is running.
+    if let Err(e) = netallow::Allowlist::resolve(&home, &project_dir) {
+        eprintln!("husk: refusing to start - network allowlist: {e}");
+        eprintln!("husk: every job would be refused until this is fixed, so husk stops here \
+                   rather than letting the agent find out one submission at a time. Note \
+                   that SLURM daemon ports are refused outright and cannot be allowlisted.");
+        std::process::exit(2);
+    }
+
     // Open the session log by saying what session this is. An append-only log shared by
     // every launch in a directory gave a reader no way to tell a live session's lines
     // from a dead one's; one file per session, headed by this, does.
