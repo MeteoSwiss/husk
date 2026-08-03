@@ -145,6 +145,14 @@ const AUTO_EXEC_DIRS: &[&str] = &[
 /// at all, and always exists wherever `.git` does, so absence is not a hole there.
 const AUTO_EXEC_RO_FILES: &[&str] = &[".mcp.json"];
 
+/// Auto-exec files that are masked with an EMPTY file when absent, not merely protected
+/// when present. The difference matters: "read-only if it exists" leaves the plant open for
+/// anything that does not normally exist, which is exactly how `.git/config` was planted.
+/// Everything here must be harmless when empty — that is what makes the stronger form safe.
+const AUTO_EXEC_RO_OR_EMPTY: &[&str] = &[
+    ".Rprofile", // R sources it from cwd at startup unless --vanilla. No trust prompt.
+];
+
 /// SLURM filename specifiers we allow in an `--output`/`--error` pattern.
 ///
 /// `%x` (job name) is deliberately ABSENT. slurmd expands these AFTER husk has validated
@@ -803,30 +811,40 @@ impl FsPolicy {
             // `.git/` on the host, into which the job then wrote a `core.hooksPath` that
             // `--ro-bind-try .git/config` had already declined to protect because, at the
             // moment bwrap looked, it did not exist.
-            match std::fs::symlink_metadata(format!("{root}/.git")) {
-                // A repository. Mask the hooks; `.git/config` is protected below and is
-                // guaranteed to exist here, which is where that assumption is actually true.
-                Ok(m) if m.is_dir() => {
-                    a.push("--tmpfs".into());
-                    a.push(format!("{root}/.git/hooks"));
-                }
-                // A `git worktree` or submodule checkout: `.git` is a FILE pointing at the
-                // real repository. A tmpfs cannot go under a file, so the old rule made
-                // bwrap fail and took the whole cage with it, reporting a bare bwrap error
-                // that never mentioned husk. Bind it read-only instead — the pointer is
-                // what must not be rewritten, and the repo it names is outside the root.
-                Ok(m) if m.is_file() => {
-                    let p = format!("{root}/.git");
-                    a.push("--ro-bind".into());
-                    a.push(p.clone());
-                    a.push(p);
-                }
-                // Absent, or something stranger. Mask the whole `.git` rather than a path
-                // inside it: the job can write there and read back its own writes, and none
-                // of it survives. What it can no longer do is leave a repository behind.
-                _ => {
-                    a.push("--tmpfs".into());
-                    a.push(format!("{root}/.git"));
+            // Version-control metadata directories hold executable configuration: git has
+            // `core.hooksPath` in `.git/config`, Mercurial has a `[hooks]` section in
+            // `.hg/hgrc` and trusts an hgrc owned by the user running it — which a brokered
+            // job is. Both are masked by SHAPE, because masking a path INSIDE one is what
+            // fabricated a repository when none was there.
+            for (dir, inner) in [(".git", "hooks"), (".hg", "")] {
+                match std::fs::symlink_metadata(format!("{root}/{dir}")) {
+                    // A real repository. Mask the hooks directory where git keeps them;
+                    // Mercurial has no hooks directory, only the hgrc protected below.
+                    Ok(m) if m.is_dir() => {
+                        if !inner.is_empty() {
+                            a.push("--tmpfs".into());
+                            a.push(format!("{root}/{dir}/{inner}"));
+                        }
+                    }
+                    // A `git worktree` or submodule checkout: the metadata entry is a FILE
+                    // pointing at the real repository. A tmpfs cannot go under a file, so
+                    // the old rule made bwrap fail and took the whole cage with it, with a
+                    // bare bwrap error that never mentioned husk. Bind it read-only: the
+                    // pointer is what must not be rewritten, and what it names is outside.
+                    Ok(m) if m.is_file() => {
+                        let p = format!("{root}/{dir}");
+                        a.push("--ro-bind".into());
+                        a.push(p.clone());
+                        a.push(p);
+                    }
+                    // Absent, or something stranger. Mask the whole thing rather than a
+                    // path inside it: the job may write there and read back its own writes,
+                    // and none of it survives. What it can no longer do is leave a
+                    // repository behind for the next `git`/`hg` the human runs.
+                    _ => {
+                        a.push("--tmpfs".into());
+                        a.push(format!("{root}/{dir}"));
+                    }
                 }
             }
             for rel in AUTO_EXEC_RO_FILES {
@@ -851,6 +869,31 @@ impl FsPolicy {
                 && matches!(std::fs::symlink_metadata(format!("{root}/.git")), Ok(m) if m.is_dir())
             {
                 protect(".git/config");
+            }
+            // `.hg/hgrc` — only where a real `.hg` exists; otherwise the whole `.hg` is
+            // already masked above and binding into it would recreate the fabrication bug.
+            // Unlike `.git/config`, an hgrc very often does NOT exist in a real repo, so
+            // "read-only if present" would leave the plant open. Bind an EMPTY file over it
+            // instead: an empty hgrc is valid, so nothing breaks, and it cannot be created.
+            if matches!(std::fs::symlink_metadata(format!("{root}/.hg")), Ok(m) if m.is_dir()) {
+                let path = format!("{root}/.hg/hgrc");
+                let src = if std::path::Path::new(&path).exists() { path.clone() } else { "/dev/null".to_string() };
+                a.push("--ro-bind".into());
+                a.push(src);
+                a.push(path);
+            }
+            // Auto-exec files that need no repository at all. `.Rprofile` is the one that
+            // matters on a cluster: R sources it from the working directory at startup
+            // unless you pass --vanilla, there is no trust prompt, and a one-line plant runs
+            // the next time a scientist opens R in their own project. Same rule — the real
+            // file read-only if it is there, an empty one if it is not — so a legitimate
+            // config still works inside the job and a planted one cannot persist.
+            for rel in AUTO_EXEC_RO_OR_EMPTY {
+                let path = format!("{root}/{rel}");
+                let src = if std::path::Path::new(&path).exists() { path.clone() } else { "/dev/null".to_string() };
+                a.push("--ro-bind".into());
+                a.push(src);
+                a.push(path);
             }
         }
 
@@ -1183,6 +1226,36 @@ mod tests {
         assert!(
             a.contains(&format!("--ro-bind {}/.git {}/.git", wt.display(), wt.display())),
             "a .git file is a pointer to a real repo and must be read-only: {a}"
+        );
+
+        // 4. Mercurial gets the identical treatment, and `.Rprofile` — which needs no
+        //    repository at all — is masked with an EMPTY file when absent rather than
+        //    merely protected when present. "Read-only if it exists" is what left
+        //    `.git/config` plantable, and it would leave every not-normally-present
+        //    auto-exec file plantable too.
+        let a = p.compute_bwrap_args(&bare.to_string_lossy()).join(" ");
+        assert!(a.contains(&format!("--tmpfs {}/.hg ", bare.display())), "{a}");
+        assert!(
+            a.contains(&format!("--ro-bind /dev/null {}/.Rprofile", bare.display())),
+            "an absent .Rprofile must be masked empty, not left creatable: {a}"
+        );
+
+        let hg = base.join("hg");
+        std::fs::create_dir_all(hg.join(".hg")).unwrap();
+        let a = p.compute_bwrap_args(&hg.to_string_lossy()).join(" ");
+        assert!(
+            a.contains(&format!("--ro-bind /dev/null {}/.hg/hgrc", hg.display())),
+            "an hgrc that does not exist yet must not be creatable: {a}"
+        );
+
+        // A real .Rprofile keeps working inside the job — read-only, not blanked.
+        let with_r = base.join("withr");
+        std::fs::create_dir_all(&with_r).unwrap();
+        std::fs::write(with_r.join(".Rprofile"), "options(digits=7)\n").unwrap();
+        let a = p.compute_bwrap_args(&with_r.to_string_lossy()).join(" ");
+        assert!(
+            a.contains(&format!("--ro-bind {}/.Rprofile {}/.Rprofile", with_r.display(), with_r.display())),
+            "a legitimate .Rprofile must stay readable: {a}"
         );
 
         let _ = std::fs::remove_dir_all(&base);

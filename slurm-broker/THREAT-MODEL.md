@@ -492,6 +492,66 @@ cooperative gates disappear, and the sentence still reads correctly.
 5. **Never open-internet on compute.** Go straight to allowlisted socat — demotes
    AV6 to LOW and lets you keep `slurmctld` off the list to blunt AV8.
 
+## Residual: the auto-exec mask is a denylist, and denylists are bug lists
+
+**AV2, deferred execution.** The job writes something into the writable project directory
+that a program the *human* later runs treats as executable configuration. It fires outside
+the cage, as the user, at a time husk has no say over. The v0.5 review demonstrated the git
+version end to end: a planted `core.hooksPath` survived the job, `git init` preserved it, and
+the next `git commit` ran the payload.
+
+husk masks the ones it knows about. **That list can never be complete, and pretending
+otherwise would be the more dangerous error.** What is covered today:
+
+| path | why it executes | how it is handled |
+|---|---|---|
+| `.claude`, `.vscode`, `.idea` | agent/editor config, hooks, tasks | `--tmpfs` per writable root |
+| `.git` | `core.hooksPath` in `.git/config` | masked *by shape* — see below |
+| `.hg` | `[hooks]` in `.hg/hgrc`; hg trusts an hgrc owned by the running user | same shape rule; hgrc masked empty when absent |
+| `.Rprofile` | R sources it from the cwd at startup unless `--vanilla`. No trust prompt. | real file read-only, empty file when absent |
+| `.mcp.json` | an MCP server entry is a command the runtime runs | read-only when present, backstopped by `enableAllProjectMcpServers: false` |
+
+**Masking by shape** means husk looks at what `.git`/`.hg` actually *is* before deciding. A
+real repository gets its hooks masked and its config protected; a `.git` *file* (an ordinary
+`git worktree`) gets bound read-only, because putting a tmpfs under a file made bwrap fail
+and took the whole cage down; anything absent gets masked whole, because masking a path
+*inside* a `.git` that was not there is what created the repository the plant needed.
+
+**Two rules were learned the expensive way and generalise beyond git:**
+
+1. *Protected-if-present is not protection.* `--ro-bind-try` silently skips a file that does
+   not exist, so every auto-exec file that is not normally present stayed plantable. Anything
+   harmless when empty is now masked with an empty file instead.
+2. *Do not create the thing you are defending.* bwrap creates the mountpoints it is given, so
+   a mask aimed inside a directory brings that directory into existence.
+
+**Known-and-not-covered**, with reasons rather than silence:
+
+- **`.gdbinit`** — modern gdb gates local auto-load behind `auto-load safe-path`, so it is
+  usually inert. Not masked; revisit if a site loosens that.
+- **`.envrc` (direnv)**, **`.dir-locals.el` (emacs)** — both require an explicit human
+  approval step before they run. The approval is the control.
+- **Anything not yet on the list.** Subversion is *not* on it, deliberately: SVN has no
+  client-side hooks, so a `.svn` working copy executes nothing.
+- **Nested config directories.** The mask applies at the top level of each writable root.
+  `<root>/sub/.claude` is not masked, because finding it would mean walking the project tree
+  — the in-process directory walk that is the documented cause of the Lustre stalls, and a
+  thing this project has a standing rule against. Bounded instead by making the *readers*
+  use trusted paths: the egress proxy now resolves its allowlist from the project dir rather
+  than from the job's `--chdir`.
+
+**The by-construction version of this control would be "the job may write outputs but may not
+create or modify dot-entries at the root of a writable directory."** bwrap cannot express
+that — it masks paths, not classes of future creation — so it would mean staging job output
+and filtering on the way out. That is real work and a change to how husk feels to use, and it
+is the honest direction if this list keeps growing.
+
+**What keeps this survivable meanwhile** is that the writable root is chosen by a human who
+knows what is in it. That is why husk refuses to run with a home directory as its write root
+(a home is full of auto-exec files nobody enumerated) and announces the writable set on every
+job. A user who points husk at a directory they do not understand has a weaker boundary than
+one who does, and no mask list changes that.
+
 ## Residual / accepted risks
 - **A caged job can write to its own per-step `apinfo` directory** inside `SlurmdSpoolDir`
   (`<spool>/mpi_cray_shasta/<job>.<step>`). Cray MPICH opens `apinfo` `O_RDWR` although it
