@@ -202,14 +202,18 @@ Discovering what each profile needs is the tedious part. Four things bound it:
     first run.
 
 - **Whether the cage holder should clear `PR_SET_DUMPABLE`.** It *can*: measured on
-  kernel 6.8, a holder with the flag cleared is still openable and still joinable with
-  `bwrap --userns` by a sibling — which corrects an earlier claim here that it could not.
+  kernel 6.8, a holder with the flag cleared is NOT openable and every rank then fails at
+  its own fail-closed gate — which corrects the correction: an earlier note here claimed it
+  stayed joinable, and the v0.5 review measured the opposite for husk's ACTUAL holder. The
+  earlier measurement holds for a process that `exec`s inside the new userns, which the
+  holder never does. `cage.rs:89-97` was right all along.
   Left off deliberately. The gain is a third layer on a process that a rank measurably
   cannot read anyway, and which holds no credentials, no daemon route and no memory worth
   reading; the risk is kernel-dependent, since that measurement is from 6.8 while Balfrin
   runs 5.14 Cray Shasta, and if joining broke there every step would die. **Revisit if**
   the holder ever comes to hold something worth reading, or once the behaviour has been
-  measured on the target — it is a two-minute check now that the holder exists.
+  measured on the target. **Not a "cheap win": it fails CLOSED, taking every rank with it.**
+  Anyone acting on the old wording would have broken all steps and blamed something else.
 
 - Whether SLURM's device cgroup constrains a job to its *allocated* GPUs (it is the same
   exposure uncaged either way, so not a husk regression).

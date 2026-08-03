@@ -28,6 +28,11 @@
 # that built without them will report them missing, and that is a true result about that
 # site rather than a typo in husk's table — the distinction to draw when reading a failure.
 #
+# Before editing husk's table in response to a failure here, CHECK THE MAN PAGE. SchedMD
+# publish every version: https://slurm.schedmd.com/archive/slurm-<version>/<tool>.html —
+# e.g. .../slurm-23.02.7/sacct.html. The docs say what a VERSION defines; this probe says
+# what a SITE built. They answer different questions and you usually want both.
+#
 # Usage: query-parity-probe.sh /path/to/husk-slurm-broker
 set -u
 

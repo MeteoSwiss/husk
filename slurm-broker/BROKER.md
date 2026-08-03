@@ -211,10 +211,29 @@ F13/F14/F24/F26/F27 class rather than patching instances. Extending the allowlis
 real job scripts need it is an operator task; rejections surface as "unsupported option
 X" (fail-closed + visible), never as a silent escape.
 
-### Script — inline snapshot (TOCTOU)
-The stub already snapshots the script **body** inline. The broker writes that
-immutable snapshot to a broker-controlled path and submits *that* — never a path
-the agent can rewrite between validation and slurmd reading it.
+### Script — husk's own, on stdin (TOCTOU)
+The stub snapshots the script **body** inline, and the broker submits **its own
+wrapper on sbatch's stdin**. Not one byte of the submitted script comes from the
+agent, and there is no file for anyone to substitute.
+
+Both halves of that were learned the hard way. The script used to be `head + guard
++ tail`, with the agent's leading comments above husk's guard — so keeping your own
+`#!` line meant the kernel ran it and never read the guard at all, and a form feed,
+which Rust's `trim_start` calls whitespace and bash does not, put a live command in
+the "comments". And the file was staged in the spool, which **must** be
+agent-writable, and named on sbatch's command line — so a `rename()` between the
+write and sbatch's open substituted the whole thing. That race was won 33 times in
+100 against a 2 ms window.
+
+The agent's script now travels as **data**: written to a path husk chooses inside
+the confined write root, and run by an interpreter husk names, **inside** the cage.
+The agent may rewrite that file — it is its own payload, which it already controls,
+and no boundary is crossed. What it can no longer do is author the bytes slurmstepd
+executes.
+
+A consequence worth stating: the agent's `#SBATCH` directives never reach slurmd.
+husk parses them, validates them, and re-emits what it allows on the command line,
+where sbatch precedence (CLI > env > `#SBATCH`) makes its value win by construction.
 
 ### Re-sandbox — prepended re-exec guard
 The submitted job must run under `seccomp-wrapper + bwrap` on the compute node.

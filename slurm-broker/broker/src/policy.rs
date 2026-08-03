@@ -569,7 +569,17 @@ fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<Str
 /// older cluster is the floor. `query-parity-probe.sh` must therefore be run on BOTH, and it
 /// prints the version it tested so a green run cannot be mistaken for a general one.
 ///
-/// NOT VERIFIED against real SLURM binaries — there is no SLURM on the development machine.
+/// **SchedMD publish versioned man pages, and they settle this without a cluster:**
+/// `https://slurm.schedmd.com/archive/slurm-<version>/<tool>.html` — e.g.
+/// `.../slurm-23.02.7/sacct.html`. Consult them whenever this table is touched. Reading
+/// them found four errors in the first draft that guessing had not: `--json`/`--yaml` are
+/// absent from `sstat`, `sprio` and `sshare` in 23.02, and `sshare`'s noheader is `-n`
+/// (`-h` is `--help` there). They also showed that several options gained OPTIONAL
+/// arguments by 25.05, which is why values are re-emitted as `--long=value`.
+///
+/// The parity probe still earns its keep after that: it checks the site's ACTUAL BUILD,
+/// and `--json`/`--yaml` are compile-time optional. Docs answer "does this version define
+/// it", the probe answers "did this site build it".
 /// `query-parity-probe` on a cluster should diff these tables against each tool's own
 /// `--help`, the same instrument shape `sbatch.directive_parity` already uses for `#SBATCH`.
 struct QuerySpec {

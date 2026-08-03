@@ -46,11 +46,16 @@ in* may be re-wired later (e.g. for `srun`/recursive brokering). Keep this versi
 - **Atomicity:** every file is written to `.<name>.tmp` in the same directory
   and then `rename()`d into place, so a reader never sees a partial file.
 - **Lifecycle (per request):** the stub owns its pair — it deletes both `req-`
-  and `resp-` after reading the response. The broker removes the staged
-  `job-<id>.sh` right after `sbatch` returns (sbatch has copied the script into
-  SLURM's own spool by then), and, at the start of each scan, GCs orphaned
-  `resp-*.json`/`job-*.sh`/`.*.tmp` older than a cutoff (a stub or broker that
-  died before cleanup) — it never touches `req-*.json`.
+  and `resp-` after reading the response. There is no staged `job-<id>.sh` any
+  more: husk's script goes to `sbatch` on **stdin**, so it is never a file and
+  never has a path (a path in an agent-writable spool was a TOCTOU the review won
+  33 times in 100). What *is* staged is the AGENT's own script, as data, at
+  `<write-root>/.husk-body-<id>.sh`; it must outlive submission because the job
+  reads it, so its owner is the guard, which removes it on every exit path. If a
+  submission fails, no job will ever read it and the broker removes it instead.
+  A dry run additionally writes `dry-<id>.sh` so the guard stays inspectable.
+  At the start of each scan the broker GCs orphaned `resp-*.json`/`.*.tmp` older
+  than a cutoff — it never touches `req-*.json`.
 - **Lifecycle (per session):** the spool is a directory husk creates in someone
   else's source tree, so it cleans up after itself, by two independent paths
   because neither alone is sufficient:

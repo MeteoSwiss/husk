@@ -10,9 +10,16 @@ compute node (`seccomp-wrapper bwrap …`):
   directory the agent happened to be in when it ran `sbatch`. `req.cwd` is agent-supplied,
   so deriving the write boundary from it would let the confined side choose its own
   confinement (see "announce the boundary" below).
-- **Reads outside the cage are unrestricted** (`--ro-bind / /`), deliberately: shared input
-  data and the software stack live outside any project directory. Confidentiality rests on
-  the `/users` mask, the credential denies and env masking, not on read scoping.
+- **Reads outside the cage are broadly unrestricted** (`--ro-bind / /`), deliberately:
+  shared input data and the software stack live outside any project directory.
+  Confidentiality rests on the `/users` mask, the credential denies and env masking, not on
+  read scoping. **"Unrestricted" is not literally true and the job banner used to say it
+  was** — there are three deliberate gaps, and each FAILS IN A DIFFERENT SHAPE, which is
+  what made the false claim expensive: a masked home or `denyRead` path is an EMPTY
+  DIRECTORY, a credential file reads empty or `EACCES` depending on how it was bound, and a
+  path under a hidden home is `ENOENT`. An agent promised unrestricted reads diagnoses all
+  three as "the file is not there" and goes looking elsewhere. The banner now names the
+  gaps and the shape of each.
 - `--ro-bind <allowRead carve-outs>` — specific re-exposed reads
 - credential file denies, env masking, symlink guard (features below)
 - `--dev-bind-try /dev/nvidia*` — GPUs
@@ -315,14 +322,21 @@ glued spelling) were all *visible holes* in it:
 
 | slurmd decision | channels that can set it | broker control today | must dominate → |
 |---|---|---|---|
-| **what code runs** (→ whether it's caged) | script file · `--wrap` · stdin | snapshot all three into `body`, stage one guarded script; `--wrap` stripped so only the staged script executes (F27) | the *one* thing slurmd executes is the broker's guarded script — no submission spelling yields an unguarded job |
+| **what code runs** (→ whether it's caged) | script file · `--wrap` · stdin · **the script's own first line** | snapshot all three into `body`; husk submits **its own wrapper on stdin** and runs the agent's body as DATA inside the cage. `--wrap` stripped (F27) | the bytes slurmd executes are husk's, entirely — the agent authors none of them, and there is no staged path to substitute |
 | **stdout/stderr path** | `-o/-e` (4 spellings) · `#SBATCH` · `SBATCH_OUTPUT/ERROR` | husk always EMITS `--output/--error` on the CLI (outranks `#SBATCH`); glued shorts split first (F13); env stripped. The *value* may come from the request but is **confined to the job working directory subtree** — canonicalised, symlinks resolved, `%` specifiers allowlisted with `%x` excluded | an emitted-by-construction value wins over every channel, and can only name a file inside the subtree the job could already write |
 | **working dir** | `-D/--chdir` · `#SBATCH` · `SBATCH_CHDIR` · `req.cwd` | emit `--chdir`; confine `req.cwd` (reject `/`, floors, traversal) (F15/F19); a requested `--chdir` must resolve inside the `req.cwd` subtree | emitted + confined; `cwd` treated as adversarial, not metadata. The writable bind is still `req.cwd`, so `--chdir` changes where the job STARTS, never what is writable |
-| **partition/account/qos** | `-p` (4 spellings) · `#SBATCH` · `SBATCH_PARTITION` | require+force exact partition; glued split (F14) | forced value wins; mismatch rejected |
+| **partition/account/qos/reservation** | `-p` (4 spellings) · `#SBATCH` · `SBATCH_PARTITION` | require+force a partition from the operator's allowed SET; glued split (F14); force `--account`; **`--qos` and `--reservation` REJECTED** on CLI and in the body | forced value wins; mismatch rejected. The set makes the guarantee the WEAKEST member's, so an operator adding a partition widens the envelope — see below |
 | **uenv/repo mount** (root, via slurmstepd) | `--uenv/--view/--repo` · `#SBATCH` · `SBATCH_UENV*` | strip CLI; **reject** body/env selection that differs from session or names `--repo` (F26) | reject dominates (never rewrite the body) |
 | **inherited env** | `--export` · `#SBATCH` · `SBATCH_EXPORT` | force `--export=ALL` on CLI in both branches (F24) | forced value wins; residual = env-secret masking (AV7) |
 | **node/resources** | `--nodes/--time/--mem/--gpus` … | parse → validate (per-option grammar) → re-emit canonically; reject unknown/invalid (`interpret_cli`) | allowlist by construction — **shape only, not magnitude**: see "The resource envelope" below |
 | **identity** | — (runs as you; MUNGE) | not settable via submission | n/a |
+
+Two verbs the matrix did not cover, added after the v0.5 review found both:
+
+| verb | decision | channels | control |
+|---|---|---|---|
+| **`scancel`** | which jobs die | the argument list | **provenance, not permission** — only ids this broker submitted (`Broker.submitted`); any `-` prefixed argument refused; ids matched against a grammar; all-or-nothing so ownership cannot be probed. See "The second mutating verb" above. |
+| **read-only queries** | what husk reads OUT of the cluster, as you, outside the cage | the whole argv | per-verb option allowlist (`policy::query_spec`), values charset-checked with **no slash**, re-emitted as canonical `--long=value`. "Read-only" is a property of what a command does to the SCHEDULER; `sacct --completion --file=X` reads X, and `--batch-script` prints any job's stored script. Forwarding the agent's argv made husk a read oracle. |
 
 ### The second mutating verb: `scancel`, gated on provenance
 
@@ -551,6 +565,24 @@ knows what is in it. That is why husk refuses to run with a home directory as it
 (a home is full of auto-exec files nobody enumerated) and announces the writable set on every
 job. A user who points husk at a directory they do not understand has a weaker boundary than
 one who does, and no mask list changes that.
+
+## Closed by the v0.5 security review
+
+Recorded because a residual list that never shrinks stops being read, and because two of
+these were things this document previously asserted were already safe.
+
+| was | now |
+|---|---|
+| The submitted script was `head + guard + tail`, so an agent shebang or a Unicode-whitespace line ran BEFORE the cage; and it was staged at an agent-writable path that could be `rename()`d between write and open (race won 33/100 at 2 ms) | husk submits **its own wrapper on stdin**; the agent's script is data, run inside the cage. Three demonstrated bypasses, one defect. |
+| `is_workdir_allowed` was applied to `req.cwd` but never to the value that became the writable BIND, and the floor predicates were raw string compares (`//users/me` walked through) | the write root is checked too, and paths are normalised before any floor comparison |
+| A `denyWrite` under the floor was emitted as a `--ro-bind`, which exposes its source — `denyWrite: ["/users"]` re-exposed every home | floor-filtered; `allowWrite: ["/"]` refused with a message saying what it would have cost |
+| `--tmpfs <root>/.git/hooks` CREATED a `.git` that was not there, and `--ro-bind-try .git/config` then skipped the file it had just made creatable — a `core.hooksPath` plant that ran on the next `git commit` | `.git`/`.hg` masked by SHAPE; anything harmless-when-empty is masked with an empty file rather than protected-only-if-present |
+| A malformed settings file resolved to an EMPTY policy, silently dropping every `denyRead` and credential mask | policy parse failures refuse to start; a bad allowlist warns loudly and runs with no egress (tighter, not weaker) |
+| `[ -O "$_d" ]` followed symlinks, so a co-tenant could redirect a rank's `/dev/shm` bind into a directory of ours | symlink-safe; and the directory is now released |
+| The cage outlived its guard on a group SIGTERM; the holder's orphans became node-global zombies | `--die-with-parent`; holder reaps by disposition |
+| `--qos`/`--reservation` were agent-settable while this document claimed the family was forced | both rejected, on the CLI and in the body |
+| Read-only verbs forwarded the agent's whole argv into another SLURM binary running outside the cage | per-verb allowlist, no slashes in values, canonical re-emission |
+| `run_sbatch` had no timeout, so a hung submission wedged the single-threaded broker — including `scancel` | watchdog and process group, as its sibling already had |
 
 ## Residual / accepted risks
 - **A caged job can write to its own per-step `apinfo` directory** inside `SlurmdSpoolDir`
