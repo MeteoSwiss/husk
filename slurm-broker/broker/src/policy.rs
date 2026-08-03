@@ -382,15 +382,33 @@ pub fn decide(
     // Does this job get an egress proxy at all? Only if the operator configured an
     // allowlist. Resolved at SUBMIT time so the guard carries no policy of its own - the
     // proxy re-reads the same files on the compute node, and this only decides whether to
-    // start one. An unparseable allowlist is treated as "no network" here rather than
-    // failing the submission: the proxy reports the error where an operator will see it,
-    // and a job that runs without egress is better than a job that will not run at all.
-    let net_enabled = crate::netallow::Allowlist::resolve(
+    // start one.
+    //
+    // This used to swallow the error and carry on with net_enabled=false, justified by "the
+    // proxy reports the error where an operator will see it". It does not: with the error
+    // swallowed here, the guard is generated with no network block at all and the proxy is
+    // never started, so there is nobody left to report anything. The generated script for a
+    // BROKEN allowlist and for NO allowlist were byte-identical.
+    //
+    // The operator's path to that state is the worst part. husk's own 403 for a blocked
+    // scheduler port told them to ask for the entry to be added; adding it makes the whole
+    // allowlist refuse to parse; and every job then silently loses egress, valid entries
+    // included, with no message anywhere. Refuse the submission instead and say which file.
+    let net_enabled = match crate::netallow::Allowlist::resolve(
         &std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default(),
         project_dir,
-    )
-    .map(|(a, _)| !a.is_empty())
-    .unwrap_or(false);
+    ) {
+        Ok((a, _)) => !a.is_empty(),
+        Err(e) => {
+            return Decision::Reject(format!(
+                "husk cannot read this project's network allowlist, so it will not submit \
+                 a job that would silently have no network: {e}. Fix that entry and \
+                 resubmit. Note that husk refuses SLURM daemon ports outright — if a \
+                 refusal suggested adding one, that suggestion was wrong and adding it \
+                 breaks the whole allowlist."
+            ));
+        }
+    };
 
     // The agent's script travels as DATA, at a path husk chooses inside the write root —
     // visible in the cage (the root is bound writable) and nowhere else that matters. The

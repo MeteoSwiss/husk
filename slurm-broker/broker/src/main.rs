@@ -424,7 +424,19 @@ fn main() {
         let workdir = workdir_arg.unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_default().to_string_lossy().to_string()
         });
-        let fs_policy = settings::FsPolicy::resolve(&home, &PathBuf::from(&workdir));
+        // Fail CLOSED, and loudly. A settings file that exists but does not parse used to
+        // resolve to an empty policy, so a typo removed the denies rather than reporting
+        // them. The step broker is the compute-node half; refusing to start it is refusing
+        // to run steps, which is the safe direction.
+        let fs_policy = match settings::FsPolicy::resolve(&home, &PathBuf::from(&workdir)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("husk: refusing to start the step broker - {e}");
+                eprintln!("husk: that file configures what this job may read and write, so \
+                           husk will not run steps while it cannot be read. Fix the JSON.");
+                std::process::exit(2);
+            }
+        };
         let mut sb = step::StepBroker::new(
             spool.clone(),
             fs_policy,
@@ -462,7 +474,19 @@ fn main() {
     // agent cannot tamper with the settings files the cage is built from. (F17)
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     let project_dir = std::env::current_dir().unwrap_or_default();
-    let fs_policy = settings::FsPolicy::resolve(&home, &project_dir);
+    // Same rule on the login side, and this is the one that matters most: this policy
+    // carries denyRead and the credential masks, so resolving a broken file to "no denies"
+    // is resolving it to "the job reads your secrets".
+    let fs_policy = match settings::FsPolicy::resolve(&home, &project_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("husk: refusing to start - {e}");
+            eprintln!("husk: that file configures what jobs may read and write, including \
+                       which credentials are masked. husk will not run with a policy it \
+                       cannot read. Fix the JSON and start husk again.");
+            std::process::exit(2);
+        }
+    };
 
     // Open the session log by saying what session this is. An append-only log shared by
     // every launch in a directory gave a reader no way to tell a live session's lines

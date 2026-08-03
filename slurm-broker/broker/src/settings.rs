@@ -460,8 +460,9 @@ struct CredEnvVar {
 impl FsPolicy {
     /// Parse one settings file. Unknown keys are ignored; malformed JSON or an
     /// absent `sandbox.filesystem` block -> empty policy (fail-safe: no carve-outs).
-    pub fn parse(json: &str) -> FsPolicy {
-        let s: Settings = serde_json::from_str(json).unwrap_or_default();
+    pub fn parse(json: &str) -> Result<FsPolicy, String> {
+        let s: Settings = serde_json::from_str(json)
+            .map_err(|e| format!("not valid JSON: {e}"))?;
         let deny_files = s
             .sandbox
             .credentials
@@ -478,7 +479,7 @@ impl FsPolicy {
             .map(|e| e.name)
             .filter(|n| !n.is_empty())
             .collect();
-        FsPolicy {
+        Ok(FsPolicy {
             allow_read: s.sandbox.filesystem.allow_read,
             deny_read: s.sandbox.filesystem.deny_read,
             allow_write: s.sandbox.filesystem.allow_write,
@@ -486,7 +487,7 @@ impl FsPolicy {
             allow_git_config: s.sandbox.filesystem.allow_git_config,
             deny_files,
             unset_env,
-        }
+        })
     }
 
     /// Union another layer in (dedup). All layers are trusted and carve-outs are
@@ -531,14 +532,22 @@ impl FsPolicy {
     /// project's `settings.json`, then `settings.local.json` (where the CLI
     /// `/sandbox` toggle and permission grants land). Missing/unreadable files
     /// are skipped — fail-safe.
-    pub fn resolve(home: &Path, project_dir: &Path) -> FsPolicy {
+    pub fn resolve(home: &Path, project_dir: &Path) -> Result<FsPolicy, String> {
         let mut pol = FsPolicy::default();
         let files = SETTINGS_SOURCES.map(|(from_home, rel)| {
             if from_home { home.join(rel) } else { project_dir.join(rel) }
         });
         for f in files {
+            // A file that is not THERE contributes nothing, which is correct: the human
+            // made no claims in a file they did not write. A file that IS there and does
+            // not parse is a different thing entirely, and used to be treated the same —
+            // so a stray comma silently dropped that layer's denyRead, denyWrite and
+            // credential masks, and husk carried on with a weaker cage and said nothing.
+            // Deny that cannot be read must never resolve to deny nothing.
             if let Ok(text) = std::fs::read_to_string(&f) {
-                pol.union(FsPolicy::parse(&text));
+                let layer = FsPolicy::parse(&text)
+                    .map_err(|e| format!("{}: {e}", f.display()))?;
+                pol.union(layer);
             }
         }
         // Route denyRead entries that are regular FILES to /dev/null binds:
@@ -581,7 +590,7 @@ impl FsPolicy {
                 SCAN_MAX_ENTRIES
             );
         }
-        pol
+        Ok(pol)
     }
 
     /// Drop allow carve-outs (`allowRead`/`allowWrite`) whose leaf is a symlink.
@@ -1316,16 +1325,24 @@ mod tests {
             "permissions": { "deny": ["Bash(curl *)"] },
             "sandbox": { "filesystem": { "denyRead": ["/users"], "allowRead": ["./"] } }
         }"#;
-        let p = FsPolicy::parse(json);
+        let p = FsPolicy::parse(json).unwrap();
         assert_eq!(p.deny_read, vec!["/users"]);
         assert_eq!(p.allow_read, vec!["./"]);
     }
 
     #[test]
     fn parse_failsafe_on_garbage_or_missing_block() {
-        assert_eq!(FsPolicy::parse("not json at all"), FsPolicy::default());
-        assert_eq!(FsPolicy::parse("{}"), FsPolicy::default());
-        assert_eq!(FsPolicy::parse(r#"{"sandbox":{}}"#), FsPolicy::default());
+        // A settings file that is not JSON is an ERROR, not an empty policy. It used to
+        // return the default — so a stray comma in settings.json silently removed every
+        // denyRead and every credential mask, and the job read the real secrets. The
+        // failure direction matters more than the failure: an unreadable DENY must never
+        // resolve to "deny nothing".
+        assert!(FsPolicy::parse("not json at all").is_err());
+        assert!(FsPolicy::parse(r#"{"sandbox": {"filesystem": {"denyRead": ["/x""#).is_err());
+        // Valid JSON that simply says nothing is still an empty policy, which is correct:
+        // the file parsed, it just made no claims.
+        assert_eq!(FsPolicy::parse("{}").unwrap(), FsPolicy::default());
+        assert_eq!(FsPolicy::parse(r#"{"sandbox":{}}"#).unwrap(), FsPolicy::default());
     }
 
     #[test]
@@ -1517,7 +1534,7 @@ mod tests {
                 ] }
             }
         }"#;
-        let p = FsPolicy::parse(json);
+        let p = FsPolicy::parse(json).unwrap();
         // mask and deny alike land in deny_files (mask degrades to deny).
         assert_eq!(p.deny_files, vec!["/proj/.env", "/proj/key.pem"]);
     }
@@ -1525,10 +1542,10 @@ mod tests {
     #[test]
     fn parse_no_credentials_block_means_no_deny_files() {
         let json = r#"{ "sandbox": { "filesystem": { "denyRead": ["/users"] } } }"#;
-        assert!(FsPolicy::parse(json).deny_files.is_empty());
+        assert!(FsPolicy::parse(json).unwrap().deny_files.is_empty());
         // empty-path entries are dropped, not emitted as a bind over "/".
         let empty = r#"{ "sandbox": { "credentials": { "files": [ { "path": "" } ] } } }"#;
-        assert!(FsPolicy::parse(empty).deny_files.is_empty());
+        assert!(FsPolicy::parse(empty).unwrap().deny_files.is_empty());
     }
 
     #[test]
@@ -1597,7 +1614,7 @@ mod tests {
             { "name": "AWS_SECRET_ACCESS_KEY", "mode": "deny" },
             { "name": "GH_TOKEN", "mode": "mask" }
         ] } } }"#;
-        let p = FsPolicy::parse(json);
+        let p = FsPolicy::parse(json).unwrap();
         assert_eq!(p.unset_env, vec!["AWS_SECRET_ACCESS_KEY", "GH_TOKEN"]);
     }
 
@@ -1620,7 +1637,7 @@ mod tests {
         let json = r#"{ "sandbox": { "filesystem": {
             "allowWrite": ["/capstor/scratch/x"], "denyWrite": ["/capstor/scratch/x/.git"]
         } } }"#;
-        let p = FsPolicy::parse(json);
+        let p = FsPolicy::parse(json).unwrap();
         assert_eq!(p.allow_write, vec!["/capstor/scratch/x"]);
         assert_eq!(p.deny_write, vec!["/capstor/scratch/x/.git"]);
     }
@@ -1893,10 +1910,45 @@ mod tests {
         assert!(wbind < hooks, "auto-exec protection must follow the workdir bind");
     }
 
+    /// The whole point of Fix 4, at the layer that actually reads the disk. A settings file
+    /// that is ABSENT contributes nothing, which is right — the human made no claims in a
+    /// file they never wrote. A settings file that EXISTS and does not parse is a different
+    /// thing, and used to be treated identically: the layer was dropped, husk carried on
+    /// with a weaker cage, and nothing anywhere said so. Since that layer carries denyRead
+    /// and the credential masks, "cannot read the denies" resolved to "there are no denies".
+    #[test]
+    fn resolve_fails_closed_on_a_settings_file_it_cannot_read() {
+        let d = std::env::temp_dir().join(format!("husk-resolve-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let home = d.join("home");
+        let proj = d.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Nothing configured anywhere: an empty policy, and no error.
+        assert!(FsPolicy::resolve(&home, &proj).is_ok());
+
+        // A real policy, well formed: resolves.
+        let dotdir = proj.join(".claude");
+        std::fs::create_dir_all(&dotdir).unwrap();
+        let f = dotdir.join("settings.json");
+        std::fs::write(&f, r#"{"sandbox":{"filesystem":{"denyRead":["/secret"]}}}"#).unwrap();
+        let ok = FsPolicy::resolve(&home, &proj).expect("valid settings must resolve");
+        assert!(ok.deny_read.iter().any(|p| p == "/secret"), "{ok:?}");
+
+        // The same file with a typo must ERROR, and the error must name the file — the
+        // operator has three candidates and no reason to guess.
+        std::fs::write(&f, r#"{"sandbox":{"filesystem":{"denyRead":["/secret"]}}"#).unwrap();
+        let e = FsPolicy::resolve(&home, &proj).expect_err("a broken settings file must fail");
+        assert!(e.contains("settings.json"), "the error must name the file: {e}");
+
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn parse_reads_allow_git_config_flag() {
         let json = r#"{ "sandbox": { "filesystem": { "allowGitConfig": true } } }"#;
-        assert!(FsPolicy::parse(json).allow_git_config);
-        assert!(!FsPolicy::parse("{}").allow_git_config); // default false
+        assert!(FsPolicy::parse(json).unwrap().allow_git_config);
+        assert!(!FsPolicy::parse("{}").unwrap().allow_git_config); // default false
     }
 }
