@@ -185,6 +185,7 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     let cage = match net {
         None => format!(
             "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
+             $_m \
              --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
         ),
         // The rank binds socat itself, from the host source, to the same in-cage path the
@@ -192,6 +193,7 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
         // propagate, so a rank saw the job cage's placeholder rather than its contents.
         Some(e) => format!(
             "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
+             $_m \
              --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" \
              --ro-bind-try {src} {CAGED_SOCAT} --ro-bind-try {sock} {sock} --",
             src = sh_quote(e.socat),
@@ -283,11 +285,38 @@ pub fn wrap_command(
          echo \"husk: by this user. Another user on this node may have created it first.\" >&2\n\
          exit 1\n\
          fi\n\
+         # The MUNGE socket, masked per rank. bwrap mount namespaces do not propagate, so\n\
+         # a rank building a fresh --ro-bind / / saw the real one however carefully the\n\
+         # job guard had masked it. That gap sat directly under profile.rs, which justifies\n\
+         # the single-node seccomp profile by saying the MOUNT mask is what keeps the\n\
+         # escape-relevant destination unreachable - and ranks are the side that will lose\n\
+         # --unshare-net first when multi-node MPI arrives.\n\
+         #\n\
+         # Resolved HERE and not in the static args, for the reason the job guard gives:\n\
+         # --tmpfs DEST kills bwrap when DEST is absent under a read-only root, and kills\n\
+         # it again when two entries resolve to the same directory (/var/run -> /run).\n\
+         # Both shipped once and took the whole cage down. Only this node knows.\n\
+         # POSIX sh, so a string rather than an array - this script is validated with\n\
+         # /bin/sh and dash has no arrays. That means the value is expanded UNQUOTED and\n\
+         # word-split, which is the trap the srun bind fell into once (word-split but not\n\
+         # quote-removed, so bwrap got literal quotes). It is safe here only because a\n\
+         # path containing whitespace is REFUSED rather than mis-split.\n\
+         _m=\n\
+         _seen=\n\
+         for _c in {mask_paths}; do\n\
+         [ -d \"$_c\" ] || continue\n\
+         _r=$(readlink -f \"$_c\" 2>/dev/null || echo \"$_c\")\n\
+         case \"$_r\" in *[[:space:]]*) continue ;; esac\n\
+         case \" $_seen \" in *\" $_r \"*) continue ;; esac\n\
+         _seen=\"$_seen $_r\"\n\
+         _m=\"$_m --tmpfs $_r\"\n\
+         done\n\
          _s={spool}/mpi_cray_shasta/${{SLURM_JOB_ID}}.${{SLURM_STEP_ID}}\n\
          {exec_line}",
         userns = sh_quote(&userns),
         pidns = sh_quote(&crate::cage::pidns_path(holder_pid)),
         spool = sh_quote(spool_dir),
+        mask_paths = crate::settings::CREDENTIAL_SOCKET_DIRS.join(" "),
         exec_line = exec_line(profile, &bwrap, net),
     );
 
@@ -483,6 +512,13 @@ mod tests {
         assert!(script.contains("${SLURM_JOB_ID}"), "{script}");
         assert!(script.contains("--bind-try"), "apinfo bind must tolerate absence: {script}");
         assert!(script.contains("--bind \"$_d\" /dev/shm"), "{script}");
+        // The MUNGE mask, resolved on the node like the job guard does it. It cannot be a
+        // static arg: --tmpfs on an absent DEST under a read-only root kills bwrap, and so
+        // does masking /run and /var/run when they are the same directory. Both shipped
+        // once and took the cage down, which is why a sibling test forbids the static form.
+        assert!(script.contains("for _c in /run/munge /var/run/munge"), "{script}");
+        assert!(script.contains("_m=\"$_m --tmpfs $_r\""), "{script}");
+        assert!(script.contains("$_m "), "the mask must reach bwrap: {script}");
     }
 
     #[test]

@@ -335,6 +335,17 @@ fn normalize_abs(p: &str) -> Option<String> {
 /// True if `p` equals or is nested under a HIDDEN_FLOOR path. Such a path must never be
 /// re-exposed by an allow carve-out (the floor must hold regardless of config) and is not
 /// an acceptable writable workdir. (F18/F15)
+/// May this configured path become an allow carve-out at all?
+///
+/// No if it is under the hidden floor (the floor must hold regardless of config, F18), and
+/// no if it is the filesystem ROOT. The root is not "under" the floor but it dissolves the
+/// whole cage: `--bind / /` is emitted after every mask and re-covers the floor, `--dev`,
+/// `--proc` and both tmpfs mounts, so the job sees the host's real /dev and /proc despite
+/// `--unshare-pid`. Measured: 280 device nodes instead of 14.
+fn usable_carveout(p: &str) -> bool {
+    !path_under_floor(p) && !matches!(normalize_abs(p).as_deref(), None | Some("/"))
+}
+
 fn path_under_floor(p: &str) -> bool {
     // A path that will not normalise (relative, or containing `..`) is not a path we can
     // vouch for, so it counts as under the floor: the caller's question is always "may I
@@ -605,8 +616,14 @@ impl FsPolicy {
     /// Drop allow carve-outs that equal or nest under a HIDDEN_FLOOR path, so a config
     /// `allowRead:["/users"]` can never re-expose the floor inside the cage. (F18)
     fn drop_floor_overlapping_allows(&mut self) {
-        self.allow_read.retain(|p| !path_under_floor(p));
-        self.allow_write.retain(|p| !path_under_floor(p));
+        // ...and the filesystem ROOT, which is not "under" the floor but dissolves the
+        // entire cage. `allowWrite: ["/"]` emits `--bind / /` LAST, so it re-covers not
+        // just the floor but `--dev`, `--proc`, `--tmpfs /tmp` and `--tmpfs /dev/shm` as
+        // well: measured, the job then saw 280 host device nodes instead of 14, and read
+        // host PID 1 through the real /proc despite `--unshare-pid`. One config entry
+        // undoing every mount that came before it is not a carve-out, it is an off switch.
+        self.allow_read.retain(|p| usable_carveout(p));
+        self.allow_write.retain(|p| usable_carveout(p));
     }
 
     /// Move denyRead entries that are regular FILES into `deny_files` (bound with
@@ -774,7 +791,11 @@ impl FsPolicy {
         // for writes (root is --ro-bind), so each allowed root is bound read-write.
         // The workdir above is always writable (job output); these add scratch etc.
         for p in &self.allow_write {
-            if p.starts_with('/') {
+            // `usable_carveout` here as well as in `resolve`, deliberately. `FsPolicy` is
+            // public and built directly in several places, and this is the function that
+            // decides what bwrap is actually asked for — a boundary check belongs at the
+            // point the boundary is emitted, not only where the policy happens to be read.
+            if p.starts_with('/') && usable_carveout(p) {
                 a.push("--bind".into());
                 a.push(p.clone());
                 a.push(p.clone());
@@ -784,7 +805,16 @@ impl FsPolicy {
         // (reads still allowed, writes blocked). Emitted after the write binds so
         // it wins over a writable ancestor.
         for p in &self.deny_write {
-            if p.starts_with('/') {
+            // A denyWrite is emitted as `--ro-bind p p`, and a bind EXPOSES ITS SOURCE.
+            // For a path already visible in the cage that is exactly the intent: make it
+            // read-only. For a path the FLOOR HIDES it is the opposite — `denyWrite:
+            // ["/users"]` bound every home back over the `--tmpfs /users` that exists to
+            // remove them. A deny that grants, and the most plausible of the four fields to
+            // get wrong, because the name promises the safe direction.
+            //
+            // Under the floor there is nothing to make read-only anyway: it is already
+            // invisible and already unwritable. Dropping the entry loses nothing.
+            if p.starts_with('/') && !path_under_floor(p) {
                 a.push("--ro-bind".into());
                 a.push(p.clone());
                 a.push(p.clone());
@@ -1280,6 +1310,41 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Two config values that became mount arguments without being checked against the
+    /// floor, and one of them is a deny that GRANTS.
+    ///
+    /// `denyWrite` is emitted as `--ro-bind p p`, and a bind EXPOSES ITS SOURCE. For a path
+    /// that is already visible that is exactly right — it makes it read-only. For a path the
+    /// floor HIDES, it un-hides it: `denyWrite: ["/users"]` bound every home back over the
+    /// `--tmpfs /users` that exists to remove them, read-only but readable. The most
+    /// plausible misconfiguration of the four fields, and it does the opposite of its name.
+    ///
+    /// `allowWrite: ["/"]` is worse than "the floor is undone": `--bind / /` is emitted last
+    /// and re-covers `--dev`, `--proc`, `--tmpfs /tmp` and `--tmpfs /dev/shm` as well, so
+    /// the job sees the host's real /dev and /proc despite --unshare-pid.
+    #[test]
+    fn config_paths_are_filtered_before_they_become_mounts() {
+        let p = FsPolicy { deny_write: vec!["/users".into(), "/scratch/x".into()], ..Default::default() };
+        let a = p.compute_bwrap_args("/proj").join(" ");
+        assert!(
+            !a.contains("--ro-bind /users /users"),
+            "a denyWrite under the floor must not bind the floor back into the cage: {a}"
+        );
+        assert!(a.contains("--ro-bind /scratch/x /scratch/x"), "ordinary denyWrite still works: {a}");
+
+        for bad in ["/", "//", "/."] {
+            let p = FsPolicy { allow_write: vec![bad.into()], ..Default::default() };
+            let a = p.compute_bwrap_args("/proj").join(" ");
+            assert!(
+                !a.contains(&format!("--bind {bad} {bad}")) && !a.contains("--bind / /"),
+                "allowWrite {bad:?} would rebind the host root over the whole cage: {a}"
+            );
+            // allowRead of the root is deliberately NOT asserted against: the base cage
+            // already opens with `--ro-bind / /`, so re-stating it changes nothing. Only
+            // the WRITE case is a hole, which is the asymmetry worth remembering.
+        }
     }
 
     #[test]
