@@ -33,8 +33,17 @@ PROTOCOL_VERSION = 1
 POLL_INTERVAL = 0.05  # seconds; also the output-streaming granularity
 
 
-def die(msg, code=1):
-    sys.stderr.write(f"srun: error: {msg}\n")
+def die(msg, code=1, from_husk=False):
+    """Fail, and be honest about WHO refused — see the same function in sbatch-stub.py.
+
+    `srun: error: ...` is byte-for-byte what real srun prints, so husk's own refusals were
+    indistinguishable from the scheduler's. An agent routes around a scheduler failure and
+    complies with a stated rule; it can only tell them apart if we say which this is.
+    """
+    if from_husk:
+        sys.stderr.write(f"husk: {msg}\n")
+    else:
+        sys.stderr.write(f"srun: error: {msg}\n")
     sys.exit(code)
 
 
@@ -152,7 +161,7 @@ def main():
         sys.exit(int(resp.get("exit_code", 0)))
     # Rejected by the step allowlist, or the launch failed. The message is written
     # for whoever wrote the job script, so pass it through unedited.
-    die(resp.get("message", "step rejected by the husk step-broker"),
+    die(resp.get("message", "step rejected by the husk step-broker"), from_husk=True,
         code=int(resp.get("exit_code", 1)))
 
 

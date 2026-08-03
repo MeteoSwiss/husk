@@ -698,8 +698,25 @@ fn cage_banner(writable: &[String]) -> String {
             settings::sh_quote(p).trim_matches('\'')
         ));
     }
-    b.push_str("echo \"husk: reads are unrestricted. A write outside the list above fails\" >&2\n");
-    b.push_str("echo \"husk: with 'Read-only file system' - that is husk, not the filesystem.\" >&2\n");
+    // "Reads are unrestricted" was false, and false in the direction that matters. The cage
+    // tmpfs-masks /users, masks every configured denyRead, and binds /dev/null over every
+    // credential file — so a read CAN fail, and husk's most load-bearing announcement told
+    // the agent not to suspect husk when it did. The three failures do not even look alike:
+    // a masked directory is an empty directory, a masked credential file reads EACCES or
+    // empty depending on how it was bound, and a path under a hidden home is ENOENT. An
+    // agent that has been promised unrestricted reads diagnoses all three as "the file is
+    // not there" and goes looking for it somewhere else.
+    //
+    // Say what is actually true, and say the shape of the failure so it is recognisable.
+    b.push_str("echo \"husk: a write outside the list above fails with 'Read-only file\" >&2\n");
+    b.push_str("echo \"husk: system' - that is husk, not the filesystem.\" >&2\n");
+    b.push_str("echo \"husk: reads are mostly unrestricted, with three deliberate gaps:\" >&2\n");
+    b.push_str("echo \"husk:   home directories are hidden (they look EMPTY, not missing),\" >&2\n");
+    b.push_str("echo \"husk:   configured denyRead paths are hidden the same way, and\" >&2\n");
+    b.push_str("echo \"husk:   credential files read as empty or refuse with EACCES.\" >&2\n");
+    b.push_str("echo \"husk: If a file you expect is empty or absent, that may be husk\" >&2\n");
+    b.push_str("echo \"husk: hiding it rather than the file being gone. Copy what the job\" >&2\n");
+    b.push_str("echo \"husk: needs to the writable set above.\" >&2\n");
     // Where husk's side of the story is. The job cannot read it (the cage masks $HOME) and
     // that is the point - but whoever reads this output is on the login node, where it is
     // an ordinary file. Naming it here is the difference between one place to look and a

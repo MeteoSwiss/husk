@@ -205,8 +205,15 @@ export HUSK_WRITABLE='/work/project:/scratch/shared'
 echo "husk: compute cage active - the filesystem is READ-ONLY except:" >&2
 echo "husk:   /work/project  (project dir: where husk was launched)" >&2
 echo "husk:   /scratch/shared" >&2
-echo "husk: reads are unrestricted. A write outside the list above fails" >&2
-echo "husk: with 'Read-only file system' - that is husk, not the filesystem." >&2
+echo "husk: a write outside the list above fails with 'Read-only file" >&2
+echo "husk: system' - that is husk, not the filesystem." >&2
+echo "husk: reads are mostly unrestricted, with three deliberate gaps:" >&2
+echo "husk:   home directories are hidden (they look EMPTY, not missing)," >&2
+echo "husk:   configured denyRead paths are hidden the same way, and" >&2
+echo "husk:   credential files read as empty or refuse with EACCES." >&2
+echo "husk: If a file you expect is empty or absent, that may be husk" >&2
+echo "husk: hiding it rather than the file being gone. Copy what the job" >&2
+echo "husk: needs to the writable set above." >&2
 echo "husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}" >&2
 # --- hand off to the agent's script, inside the cage ---
 exec /bin/bash "$_husk_body" "$@"

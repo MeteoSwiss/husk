@@ -31,8 +31,23 @@ def tool_name():
     return os.path.basename(sys.argv[0]) or "sbatch"
 
 
-def die(msg, code=1):
-    sys.stderr.write(f"{tool_name()}: error: {msg}\n")
+def die(msg, code=1, from_husk=False):
+    """Fail, and be honest about WHO refused.
+
+    Every message used to go out as `sbatch: error: ...`, which is byte-for-byte what real
+    sbatch prints. So husk's own rules arrived wearing SLURM's name, and an agent told
+    `sbatch: error: --qos is not permitted` reasonably concluded the scheduler had rejected
+    it and went looking for a scheduler-shaped workaround. Attribution is the difference
+    between a rule an agent complies with and a failure it routes around.
+
+    The prefix stays for messages that really are about invoking sbatch (a missing script
+    file, a spool that is not there) so tooling that greps for it keeps working; anything
+    that came back from the broker is husk speaking and says so.
+    """
+    if from_husk:
+        sys.stderr.write(f"husk: {msg}\n")
+    else:
+        sys.stderr.write(f"{tool_name()}: error: {msg}\n")
     sys.exit(code)
 
 
@@ -212,7 +227,7 @@ def main():
             if note:
                 sys.stderr.write(f"{tool_name()}: husk: {note.strip()}\n")
             sys.exit(int(resp.get("exit_code", 0)))
-        die(resp.get("message", "submission rejected by broker"),
+        die(resp.get("message", "submission rejected by broker"), from_husk=True,
             code=int(resp.get("exit_code", 1)))
     else:
         # Read-only query: replay the broker's captured output + exit code.
@@ -220,7 +235,7 @@ def main():
             sys.stdout.write(resp.get("stdout", ""))
             sys.stderr.write(resp.get("message", ""))
             sys.exit(int(resp.get("exit_code", 0)))
-        die(resp.get("message", "query rejected by broker"),
+        die(resp.get("message", "query rejected by broker"), from_husk=True,
             code=int(resp.get("exit_code", 1)))
 
 
