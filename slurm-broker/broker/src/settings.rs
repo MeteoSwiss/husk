@@ -622,6 +622,36 @@ impl FsPolicy {
         // well: measured, the job then saw 280 host device nodes instead of 14, and read
         // host PID 1 through the real /proc despite `--unshare-pid`. One config entry
         // undoing every mount that came before it is not a carve-out, it is an off switch.
+        // Say what was refused, and why, and what to write instead.
+        //
+        // Silently dropping a line a human deliberately wrote is the defect this review
+        // found four times over in other places. It is worse here than most, because
+        // refusing `/` is not husk overruling a choice about write access — it is husk
+        // saying the setting does something OTHER than what it says. `--bind / /` is
+        // emitted after every mask, so it re-covers /dev, /proc and both tmpfs mounts too.
+        // Somebody who asked for broad write access got device and /proc exposure they did
+        // not ask for and could not see. Naming actual roots gets them exactly what they
+        // wanted, with the rest of the cage intact.
+        for p in self.allow_read.iter().chain(self.allow_write.iter()) {
+            if usable_carveout(p) {
+                continue;
+            }
+            if matches!(normalize_abs(p).as_deref(), Some("/")) {
+                eprintln!(
+                    "husk: ignoring the filesystem carve-out {p:?}. Binding the root would \
+                     also undo /dev, /proc and the private /tmp and /dev/shm, which is more \
+                     than that line asks for. List the roots you actually need instead — \
+                     e.g. \"/scratch\", \"/capstor\" — and they will be bound exactly as \
+                     written."
+                );
+            } else {
+                eprintln!(
+                    "husk: ignoring the filesystem carve-out {p:?}: it is inside a home \
+                     directory, which husk hides from every job regardless of config. Copy \
+                     what the job needs to a scratch or project path and allow that."
+                );
+            }
+        }
         self.allow_read.retain(|p| usable_carveout(p));
         self.allow_write.retain(|p| usable_carveout(p));
     }
