@@ -58,10 +58,20 @@ checked=0
 while IFS=$'\t' read -r tool kind opt; do
   [ -n "${tool:-}" ] || continue
   command -v "$tool" >/dev/null 2>&1 || continue
+  # EVERY invocation is time-boxed. These are meant to be instant commands that select
+  # nothing, and 163 of them cost nothing — until one of them is not instant. `--iterate`
+  # makes squeue and sinfo print forever, and it hung a whole selftest run on Balfrin before
+  # it was removed from husk's allowlist. A probe that can hang is a probe that stops the
+  # suite, so the guard stays even though that particular option is gone: the next streaming
+  # option should cost 5 seconds, not an afternoon.
+  #
+  # A timeout counts as RECOGNISED, and that is the right reading: a tool that sat there
+  # producing output plainly understood the option. Only an explicit complaint means it did
+  # not.
   if [ "$kind" = value ]; then
-    out=$("$tool" "$opt" "$(value_for "$opt")" --noheader 2>&1 </dev/null)
+    out=$(timeout 5 "$tool" "$opt" "$(value_for "$opt")" --noheader 2>&1 </dev/null)
   else
-    out=$("$tool" "$opt" 2>&1 </dev/null)
+    out=$(timeout 5 "$tool" "$opt" 2>&1 </dev/null)
   fi
   checked=$((checked + 1))
   # The one thing being tested. getopt says "unrecognized option" / "invalid option";

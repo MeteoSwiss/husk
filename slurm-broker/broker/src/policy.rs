@@ -589,13 +589,24 @@ struct QuerySpec {
     flag: &'static [&'static str],
 }
 
+/// NO STREAMING OPTIONS. `-i/--iterate` makes `squeue` and `sinfo` print forever, and it is
+/// excluded from every verb deliberately, on two grounds that are independent of each other.
+///
+/// It cannot work: the spool protocol is request/response — the broker captures a command's
+/// output and returns it as one message — so there is nothing for an endless stream to be
+/// delivered to. And it costs: the broker is single-threaded, so a query that never returns
+/// occupies it until `run_query_cmd`'s watchdog kills it, and every other request, including
+/// `scancel`, waits behind it.
+///
+/// It also hung the parity probe, which is how it was found — 163 instant commands and one
+/// that never ends.
 fn query_spec(tool: &str) -> Option<QuerySpec> {
     // Shared output-shaping flags that mean the same thing everywhere they exist.
     Some(match tool {
         "squeue" => QuerySpec {
             value: &["-u", "--user", "-j", "--jobs", "-p", "--partition", "-A", "--account",
                      "-t", "--states", "-n", "--name", "-q", "--qos", "-w", "--nodelist",
-                     "-M", "--clusters", "-S", "--sort", "-o", "--format", "-i", "--iterate"],
+                     "-M", "--clusters", "-S", "--sort", "-o", "--format"],
             // `-s/--steps` takes an OPTIONAL argument, and SLURM's own man page warns the
             // value must be attached with no space. husk has two arities, not three, so it
             // offers the bare form only — a safe subset rather than a wrong guess.
@@ -604,7 +615,7 @@ fn query_spec(tool: &str) -> Option<QuerySpec> {
         },
         "sinfo" => QuerySpec {
             value: &["-p", "--partition", "-n", "--nodes", "-t", "--states", "-M", "--clusters",
-                     "-S", "--sort", "-o", "--format", "-i", "--iterate"],
+                     "-S", "--sort", "-o", "--format"],
             flag: &["-a", "--all", "-N", "--Node", "-s", "--summarize", "-d", "--dead",
                     "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
         },
