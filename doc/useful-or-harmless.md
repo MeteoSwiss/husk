@@ -3,6 +3,9 @@
 *A note on deferred execution, and why sandboxing an agent on an HPC system is harder than
 sandboxing one on a laptop.*
 
+> **A sandbox confines a process; it does not confine data that some other program will later
+> interpret.**
+
 ## The principle
 
 Fefe's formulation is that a program is either **nützlich** or **unbedenklich** — useful or
@@ -22,8 +25,8 @@ directory**. Convenience is the attack surface.
 
 ## The shape of the exploit class
 
-A sandbox confines a **process**. It does not confine **data that some other program will
-later interpret**.
+The thesis again, since it is the whole argument: a sandbox confines a **process**; it does
+not confine **data that some other program will later interpret**.
 
 ```
    inside the cage                    outside the cage, later
