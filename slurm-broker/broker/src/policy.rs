@@ -80,9 +80,10 @@ pub fn decide(
     match req.tool.as_str() {
         "sbatch" => {} // fall through to the submission flow
         t if READONLY_SLURM.contains(&t) => {
-            let mut argv = vec![req.tool.clone()];
-            argv.extend(req.argv.iter().cloned());
-            return Decision::Query(argv);
+            match vet_query_argv(t, &req.argv) {
+                Ok(argv) => return Decision::Query(argv),
+                Err(why) => return Decision::Reject(why),
+            }
         }
         t if BROKERED_MUTATING.contains(&t) => return cancel_decision(&req.argv),
         other => {
@@ -542,6 +543,89 @@ fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<Str
 /// Accepts `<jobid>`, `<jobid>_<arraytask>` and `<jobid>.<stepid>`, since those are how a
 /// user names a piece of a job they already own. The base id before `_` or `.` is what the
 /// broker checks ownership against.
+/// Default-deny the read-only verbs' option surface.
+///
+/// "Read-only" is a property of what the command does to the SCHEDULER. It says nothing
+/// about what its OPTIONS do to the filesystem, and these commands run OUTSIDE the cage
+/// with the human's full view. `sacct --completion --file=X` reads X. `sacct
+/// --batch-script` prints the stored script of any job on the account. Forwarding the
+/// agent's whole argv into them made husk a read oracle holding the door open.
+///
+/// So the same discipline as the submission surface: recognise a small set of options,
+/// re-emit them, and refuse everything else — including anything that could name a file or
+/// redirect output. A verb with no row in the SINK matrix does not get a passthrough.
+fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
+    // Options that select WHICH records to show, and nothing else. Values are checked
+    // against a conservative charset; none of these can name a file.
+    const VALUE_OPTS: &[&str] = &[
+        "-u", "--user", "-j", "--jobs", "-p", "--partition", "-A", "--account",
+        "-t", "--state", "--states", "-n", "--name", "-q", "--qos", "-M", "--clusters",
+        "-S", "--starttime", "-E", "--endtime", "-N", "--nodelist", "-w", "--nodes",
+        "-i", "--iterate", "-s", "--steps", "-r", "--reservation", "-T", "--truncate",
+    ];
+    const FLAG_OPTS: &[&str] = &[
+        "-a", "--all", "-l", "--long", "-h", "--noheader", "-P", "--parsable",
+        "--parsable2", "-X", "--allocations", "-D", "--dedup", "-e", "--helpformat",
+        "-V", "--version", "--me", "--json",
+    ];
+    // A value that will become an argument to another program: letters, digits, and the
+    // punctuation SLURM's own selectors use. No slashes, so nothing here can be a path.
+    let ok_value = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 256
+            && v.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b",._:+-=%@".contains(&b)
+            })
+    };
+    let refuse = |what: &str| {
+        Err(format!(
+            "husk does not forward {what:?} to {tool}. Read-only queries are brokered with a \
+             fixed set of selector options (which user, which jobs, which partition, which \
+             state, and the usual output flags), because {tool} runs outside the sandbox with \
+             your full filesystem access and some of its options read or write files. Ask for \
+             the records you want with those selectors."
+        ))
+    };
+
+    let mut out = vec![tool.to_string()];
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with('-') {
+            // A bare operand. `squeue 123` is not a thing; a stray word here is either a
+            // mistake or an attempt to pass a path positionally.
+            return refuse(a);
+        }
+        // `--opt=value`
+        if let Some((name, value)) = a.split_once('=') {
+            if !VALUE_OPTS.contains(&name) {
+                return refuse(a);
+            }
+            if !ok_value(value) {
+                return refuse(a);
+            }
+            out.push(format!("{name}={value}"));
+            continue;
+        }
+        if FLAG_OPTS.contains(&a.as_str()) {
+            out.push(a.clone());
+            continue;
+        }
+        if VALUE_OPTS.contains(&a.as_str()) {
+            let Some(v) = it.next() else {
+                return Err(format!("husk: {a} needs a value"));
+            };
+            if !ok_value(v) {
+                return refuse(v);
+            }
+            out.push(a.clone());
+            out.push(v.clone());
+            continue;
+        }
+        return refuse(a);
+    }
+    Ok(out)
+}
+
 fn cancel_decision(argv: &[String]) -> Decision {
     if argv.is_empty() {
         return Decision::Reject(
@@ -2603,6 +2687,64 @@ mod tests {
                 "a refused root must not be announced as writable: {msg}"
             );
         }
+    }
+
+    /// On a shared cluster the resource envelope IS the threat model, and the partition is
+    /// the control that carries it. `--qos` and `--reservation` both move that envelope out
+    /// from under the partition — a QOS changes priority and limits, a reservation grants
+    /// access to nodes set aside for someone else — and both were `Class::Allowed`: chosen
+    /// by the agent and re-emitted verbatim, while THREAT-MODEL.md said this whole family
+    /// was "forced value wins".
+    #[test]
+    fn the_agent_cannot_move_the_resource_envelope() {
+        for argv in [
+            vec!["--partition=preemptible", "--qos=priority"],
+            vec!["--partition=preemptible", "-qpriority"],
+            vec!["--partition=preemptible", "--reservation=maintenance"],
+        ] {
+            let d = decide(&req(&argv, "echo hi\n"), &no_uenv(), &FsPolicy::default(), work());
+            let msg = match d {
+                Decision::Reject(m) => m,
+                _ => panic!("{argv:?} moves the resource envelope and must be refused"),
+            };
+            assert!(msg.contains("husk"), "must be attributed: {msg}");
+        }
+        // The same words in the body reach slurmd through no channel at all now, but the
+        // parser must still refuse them rather than skip them.
+        let d = decide(
+            &req(&["--partition=preemptible"], "#SBATCH --qos=priority\nsrun x\n"),
+            &no_uenv(), &FsPolicy::default(), work(),
+        );
+        assert!(matches!(d, Decision::Reject(_)), "a body --qos must be refused too");
+    }
+
+    /// The read-only verbs were forwarded with the agent's ENTIRE argv, unexamined, into
+    /// another SLURM binary that runs OUTSIDE the cage with the human's full filesystem
+    /// view. "Read-only" is a property of what the command does to the SCHEDULER; it says
+    /// nothing about what its options do to the filesystem. `sacct --completion --file=X`
+    /// reads X. That is a read oracle with husk holding the door.
+    #[test]
+    fn query_verbs_do_not_forward_arbitrary_options() {
+        for argv in [
+            vec!["--completion", "--file=/etc/shadow"],
+            vec!["--batch-script"],
+            vec!["-o", "/users/victim/.bashrc"],
+            vec!["--yaml"],
+        ] {
+            let mut r = req(&["--partition=preemptible"], "echo hi\n");
+            r.tool = "sacct".into();
+            r.argv = argv.iter().map(|s| s.to_string()).collect();
+            match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
+                Decision::Reject(m) => assert!(m.contains("husk"), "attributed: {m}"),
+                Decision::Query(a) => panic!("{argv:?} was forwarded to sacct: {a:?}"),
+                _ => panic!("unexpected decision for {argv:?}"),
+            }
+        }
+        // ...while the ordinary read-only use keeps working.
+        let mut r = req(&["--partition=preemptible"], "echo hi\n");
+        r.tool = "squeue".into();
+        r.argv = vec!["-u".into(), "me".into(), "--states=RUNNING".into()];
+        assert!(matches!(decide(&r, &no_uenv(), &FsPolicy::default(), work()), Decision::Query(_)));
     }
 
     /// Submit `body` and return the script husk hands to sbatch.

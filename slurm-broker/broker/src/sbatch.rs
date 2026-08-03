@@ -151,14 +151,27 @@ pub const REGISTRY: &[OptSpec] = &[
     spec!("--array", "-a", true, Class::Allowed, v_array),
     spec!("--dependency", "-d", true, Class::Allowed, v_dep),
     spec!("--job-name", "-J", true, Class::Allowed, v_name),
-    spec!("--qos", "-q", true, Class::Allowed, v_name),
+    // The resource envelope IS the threat model on a shared cluster, and the partition is
+    // what carries it. A QOS moves priority and limits out from under that partition; a
+    // reservation grants nodes set aside for somebody else. Neither is the agent's to
+    // choose, and THREAT-MODEL.md already said this family was forced.
+    spec!("--qos", "-q", true, Class::Rejected(
+        "husk does not let a job choose its QOS: the partition husk forces is what bounds \
+         what this job may consume, and a QOS moves those limits out from under it. Submit \
+         without --qos. If your work genuinely needs a different QOS, that is a decision for \
+         whoever configured husk, not for this job."
+    ), v_name),
     // FORCED, not Allowed. The account is who gets BILLED, so letting the agent name it
     // would let a caged job charge another project's allocation — and on sites whose
     // cli_filter requires an account (Santis), it is also mandatory for any job to run at
     // all. Same treatment as the partition: taken from the operator's trusted config, never
     // from the request.
     spec!("--account", "-A", true, Class::Forced, v_name),
-    spec!("--reservation", "", true, Class::Allowed, v_name),
+    spec!("--reservation", "", true, Class::Rejected(
+        "husk does not let a job claim a reservation: reserved nodes are set aside for \
+         particular people and particular work, and a brokered job is neither. Submit \
+         without --reservation."
+    ), v_name),
     spec!("--comment", "", true, Class::Allowed, v_comment),
     spec!("--distribution", "-m", true, Class::Allowed, v_dist),
     spec!("--signal", "", true, Class::Allowed, v_signal),
@@ -454,7 +467,15 @@ pub fn body_reject_reason(body: &str) -> Option<String> {
                          (output/error/chdir/export are forced to safe values). Remove it."
                     ))
                 }
+                // A REJECTED option carries its own reason, and the body is the channel
+                // it most needs to be enforced on: the CLI path refuses it loudly while
+                // the body path used to fall into the catch-all below and accept it. Same
+                // shape as the `Ignored` gap one class over — a registry with four classes
+                // and a gate that only distinguished two.
                 Some(s) => {
+                    if let Class::Rejected(why) = s.class {
+                        return Some(format!("#SBATCH {name}: {why}"));
+                    }
                     if s.takes_value && !tok.contains('=') {
                         i += 1;
                     }
