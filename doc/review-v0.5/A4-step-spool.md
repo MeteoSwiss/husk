@@ -3,6 +3,11 @@
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
 · bound by the **rules of engagement** in `review-v0.5-questions.md`
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** The step spool itself is largely unchanged
+> and everything below still applies. Three things around it moved — the holder's liveness, the
+> per-rank `/dev/shm` check, and what survives a job — and one of them turned a starting point
+> below into a CONFIRMED bug that has since been fixed. Marked ★ where it matters.
+
 ## The question
 
 The step spool is a directory the caged ranks can write and the **trusted** step-broker reads.
@@ -24,8 +29,26 @@ this brief tests whether that treatment is complete.
 - The step spool lives in the workdir: `<workdir>/.husk-step-spool-<jobid>`.
 - `step.rs` reads step requests from it and validates them. `is_workdir_allowed` gates the
   step's cwd (absolute, not under `/users`, no traversal).
-- The spool is removed when the job ends — egress socket and socat included (verified now by
-  `job.spool_reclaimed` after a real job, and `guard.spool_removed` for the guard path).
+- The spool is removed when the job ends — egress socket and socat included (verified by
+  `job.spool_reclaimed` after a real job on hardware, and `guard.spool_removed` for the guard
+  path).
+
+★ **Changed since this brief was written, all in the "what a rank can leave behind" area:**
+
+- **`--die-with-parent`** is now on both cages. A task that ends takes its sandbox with it, so
+  a process backgrounded by a rank no longer outlives the rank. This closed a real gap (the
+  guard used to clean up and announce the job finished while the workload ran on in an orphaned
+  bwrap) — and it is worth knowing because it changes what "still running" means when you
+  measure.
+- **`/dev/shm/husk-<jobid>` is now owned and released**, and its ownership check is
+  symlink-safe. Starting point 5 below asked whether a rank could point a shared resource at
+  something else: **the answer was yes** — `[ -O "$_d" ]` followed symlinks, so a co-tenant who
+  won the race to create that path could land a directory of ours read-write inside every rank
+  cage. Fixed (`916880b`). **The lesson generalises to the rest of this brief: test every
+  ownership and existence check for symlink-following, not just this one.**
+- **The holder pid is liveness-checked** before reuse, and PID 1 reaps by disposition. A stale
+  holder used to wedge every later step; a stale *recycled* pid could have named a different
+  process.
 
 ## Starting points
 
@@ -41,9 +64,17 @@ this brief tests whether that treatment is complete.
    step-broker will act on — one the srun stub never sent?
 5. **The socket and socat.** They live in this directory. Can a rank replace the egress socket
    with its own, or point socat at a different target, before the trusted side binds it?
+   ★ The neighbouring version of this question — the `/dev/shm` ownership check — was a real
+   cross-user break. Assume this one deserves the same suspicion, and note the egress socket
+   now lives in node-local `/tmp/husk-<uid>-<jobid>/` rather than the spool, which moved the
+   target rather than removing it.
 6. **Non-emptiness at cleanup.** A directory that still holds a live mountpoint cannot be
    removed (`EBUSY`) — can a rank *keep* the spool un-removable to force accumulation, or to
    preserve something across the boundary?
+7. **★ The body file.** New since Fix 1: the agent's job script is staged at
+   `<write-root>/.husk-body-<req.id>.sh` and the guard `rm -f`s it. That is another
+   agent-influenced path in a directory the job can write — same family as everything else
+   here. (Owned by A3; flag overlaps rather than chasing them.)
 
 ## What counts as a finding
 

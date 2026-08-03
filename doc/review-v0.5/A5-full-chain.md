@@ -3,6 +3,12 @@
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
 · bound by the **rules of engagement** in `review-v0.5-questions.md`
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** The chain still has four layers and the
+> cross-hop question is unchanged, but **both ends moved**: the top now submits on stdin with a
+> husk-authored script, and the bottom hands off to the agent's body as a data file. The
+> laundering carrier this brief named — the job script body — therefore travels differently
+> than it did. Marked ★ below.
+
 ## The question
 
 Each hop in the chain has been reasoned about on its own. Does anything cross **two** hops that
@@ -31,6 +37,26 @@ The chain is two broker instances of the same code at different privilege positi
 
 The recursion is deliberate: `srun` inside an allocation needs a compute-node broker, which is
 the same brick stacked. Both broker instances default-deny their own surface.
+
+★ **What moved at each end, and why it matters to a cross-hop attack:**
+
+- **Hop 1 → 2 changed shape.** husk no longer submits the agent's script. It submits **its own
+  wrapper on stdin**, and the agent's body travels separately, as a file at
+  `<write-root>/.husk-body-<req.id>.sh`, read by an interpreter husk names *inside* the cage.
+  So the body is no longer a thing that passes THROUGH slurmd — it is a thing husk parses at
+  hop 1 and the cage executes at hop 2, with no shared parser between them. The laundering
+  question survives but its carrier is different: the body is now **data at hop 1 and code at
+  hop 2**, which is the classic shape for exactly this class.
+- **`job_args` moved into the guard.** With no script operand there is nowhere on sbatch's
+  command line for them, so they are `sh_quote`d into a `set --` line in the generated script.
+  Agent bytes, quoted by husk, into a script the **uncaged** first instance of the guard
+  parses. That is a hop-1 value landing in a hop-1.5 shell. (Overlaps A2; the chain question
+  here is whether it survives *further* down.)
+- **`req.id` is now a path component at hop 1** (the body file) and the guard deletes that path
+  at hop 2. One agent-supplied string, two hops, two different operations. (Overlaps A3.)
+- **Hop 3 → 4 gained a runtime-built argument.** The rank script now assembles the MUNGE mask
+  on the compute node and expands it unquoted onto bwrap's command line. A value computed at
+  hop 3, executed at hop 4.
 
 ## Starting points
 

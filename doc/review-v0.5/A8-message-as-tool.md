@@ -19,6 +19,11 @@ The explicit instruction from the plan: **ask the reviewer to falsify "announcin
 nothing", not to accept it.** This is the brief where the teaching-errors design is allowed to
 lose.
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** The distinction below is unchanged and is
+> still the whole point. What changed is that husk deliberately added several NEW signals, and
+> two of them are candidate *capabilities* rather than conveniences — which is a higher bar
+> than A7's question and the one this brief exists for. Marked ★.
+
 ## The distinction to hold onto
 
 Three different things, and only the third is a finding here:
@@ -30,6 +35,29 @@ Three different things, and only the third is a finding here:
 3. **Capability** — the message provides something the attacker could **not** have assembled
    by trying: a reliable oracle, a differential, or a stable signal that turns guesswork into
    measurement. **This is the finding.**
+
+★ **New signals to weigh against the third bar specifically:**
+
+- **★ Attribution is a clean one-bit channel now.** Refusals say `husk:`; real SLURM errors say
+  `sbatch: error:`. They used to be byte-identical, so an agent could not tell which layer
+  refused it. That bit is *stable, free and perfectly reliable* — the three properties that
+  turn a signal into an instrument. **A7 asks whether it discloses a secret (it does not).
+  This brief asks the harder thing: does a reliable husk/SLURM discriminator let an agent MAP
+  husk's policy boundary efficiently — binary-search the option registry, or tell "husk
+  refuses this" from "the cluster happens not to support it"?** If yes, that is capability,
+  and it is the strongest candidate in this brief.
+- **★ The banner now describes the SHAPE of each read failure** (masked directory looks empty;
+  credential file empty or `EACCES`; hidden home `ENOENT`). Knowing the shape is what lets an
+  agent *classify* a failure instead of guessing. Convenience, or an instrument for mapping
+  the mask? Test it: can an agent that knows the shapes enumerate what is masked, where one
+  that does not could only enumerate what is absent?
+- **★ The query refusal enumerates the allowed options for that verb.** Straightforwardly a
+  target list. The counterfactual is cheap to check — probing 147 options costs 147 refusals,
+  which an agent can afford — so this is likely convenience. Confirm rather than assume.
+- **★ "This job has NO NETWORK, and it is configuration, not transient."** This tells the agent
+  something about *operator state* it cannot otherwise observe, and it tells it not to retry.
+  Does knowing the difference between "no egress by policy" and "egress broken right now"
+  enable anything?
 
 ## Starting points
 

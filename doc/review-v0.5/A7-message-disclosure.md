@@ -3,6 +3,12 @@
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
 · bound by the **rules of engagement** in `review-v0.5-questions.md`
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** The question is unchanged, but husk now says
+> MORE than when this brief was written — Fixes 4 and 9 added disclosures deliberately, on the
+> reasoning that an agent which cannot attribute a failure routes around it. That reasoning is
+> exactly what this brief is meant to pressure-test, so the new lines are the most interesting
+> material here, not an afterthought. Marked ★ below.
+
 ## The question
 
 husk deliberately tells the agent things — what is writable, what a path resolved to, which
@@ -31,6 +37,33 @@ announcing costs nothing. **This brief exists to test that belief, not to accept
 - **The permitted partition set**, named when a partition is refused.
 - **The inherited wall limit**, stated on the accepted path when no `--time` is given.
 - **The uenv label and view**, and the workdir, in the banner.
+
+★ **Added since this brief was written. Every one of these is a deliberate choice to say more,
+made for a security reason, and every one is therefore fair game:**
+
+- **★ The banner now enumerates the READ gaps.** It used to claim "reads are unrestricted",
+  which was false. It now says home directories are hidden, `denyRead` paths are hidden, and
+  credential files read as empty or `EACCES` — **and it says what each failure LOOKS like**, so
+  an empty directory is recognisable as husk rather than as an empty directory. That is a
+  direct trade of confidentiality for diagnosability: husk is now telling the agent the *shape*
+  of its own masking. Attack it. Does knowing "a masked directory appears empty" let an agent
+  MAP the mask — walk a tree and distinguish "husk hid this" from "nothing here" — where before
+  it could not?
+- **★ Refused carve-outs are announced.** `allowWrite: ["/"]` and a `denyWrite` under the floor
+  are now refused *with the reason and the remedy*, naming the path. Operator-facing, on stderr
+  at startup — but does any of it reach the agent?
+- **★ "This job has NO NETWORK" on the accepted path**, when the allowlist could not be read,
+  including that it is configuration rather than transient and cannot be fixed from inside.
+  That tells the agent something true about the operator's *configuration state*.
+- **★ Refusals now say `husk:` instead of `sbatch: error:`.** Attribution was the point — an
+  agent routes around a scheduler failure and complies with a stated rule. But it also means an
+  agent can now reliably distinguish "husk refused" from "SLURM refused", which is a one-bit
+  oracle it did not have before. Is that bit worth anything?
+- **★ The `--qos`/`--reservation` refusals** name whose decision it is ("that is a decision for
+  whoever configured husk"). Does that leak anything about the operator's setup?
+- **★ The query refusal lists the options that verb DOES accept.** Deliberate — it saves an
+  agent from probing 147 options one at a time. It also hands over husk's exact allowlist. The
+  counterfactual to test: could the agent have enumerated that list anyway, cheaply?
 
 ## Starting points
 

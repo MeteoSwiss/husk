@@ -1,4 +1,4 @@
-# A6 — the newest parser surface: the partition list and `scancel`
+# A6 — the newest parser surface
 
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
 · bound by the **rules of engagement** in `review-v0.5-questions.md`
@@ -16,6 +16,13 @@ on this surface, and both features change a control that the threat model descri
 singular: the partition row said "force exact partition", and `scancel` adds a second mutating
 verb where there was one.
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** The partition list and `scancel` are
+> unchanged and everything below about them holds. But the surface this brief covers —
+> "the newest thing on the submission path" — has grown a great deal since it was written:
+> `--qos` and `--reservation` are now REJECTED, the read-only verbs gained a per-verb option
+> allowlist, and the whole `#SBATCH` channel to slurmd closed. Those are the newest features
+> now, so they belong here. Marked ★.
+
 ## What the code does today
 
 **The partition list.** `HUSK_SLURM_PARTITION` may hold a comma-separated set (Balfrin: GPU
@@ -30,6 +37,34 @@ anything else. Three properties: any argument starting with `-` is refused outri
 deny, not a selector denylist); ids must match `<digits>[_<digits>|.<digits>]`, ≤20 digits;
 and a multi-id request is **all-or-nothing**, so ownership cannot be probed by watching which
 of a batch died.
+
+★ **New surface since this brief was written — this is where the newest code is:**
+
+- **`--qos` and `--reservation` are `Class::Rejected`**, on the CLI *and* in the body. They
+  were `Allowed` — agent-chosen and re-emitted — while the threat model claimed the family was
+  forced. Both move the resource envelope out from under the partition, which is the control
+  that carries it. **The refusal is new code on the hottest path**, and finding them exposed a
+  second gap: the body gate had four registry classes and distinguished two, so a `Rejected`
+  option in a `#SBATCH` line fell into the catch-all and was accepted. That is fixed; the
+  question for you is whether the *fourth* class is now handled everywhere the other three are.
+- **The read-only verbs have a per-verb option allowlist** (`policy::query_spec`), 147 entries
+  across six verbs, values charset-checked with **no slash**, re-emitted canonically as
+  `--long=value`. Before this they forwarded the agent's entire argv into another SLURM binary
+  running **outside the cage with the human's full filesystem view** — `sacct --completion
+  --file=X` reads X, `--batch-script` prints any job's stored script. This is the largest piece
+  of brand-new parsing in the release and it deserves the most attention in this brief.
+  The tables were checked against SchedMD's man pages for 23.02.7 and verified on both clusters
+  by `query.parity`, so do not hunt for *missing* options — hunt for **the arity and
+  canonicalisation logic**: an option on both lists, a value that survives the charset and
+  still means a path, a short form whose long form is wrong, `--opt=` with an empty value,
+  an option repeated, a value containing a space (allowed, for format strings).
+- **No streaming options, on any verb.** `-i/--iterate` was removed after it hung a selftest:
+  the protocol is request/response, so an endless stream has nowhere to go, and the broker is
+  single-threaded so it would sit there until the watchdog fired — with `scancel` queued
+  behind it. **Look for another option with that property**, on any verb, that the table still
+  allows.
+- **`run_sbatch` now has a watchdog** and its own process group, like `run_query_cmd`. A hung
+  submission used to wedge the broker, `scancel` included.
 
 ## Starting points
 
@@ -72,8 +107,13 @@ body (A3), so **aim for completeness rather than depth.**
 
 - Whether the *resource envelope* is the right control (that is a design decision, documented).
 - Whether QOS limits are set correctly at the site — operator configuration, not husk.
-- Other read-only verbs (`squeue`, `sinfo`, `sacct`): they mutate nothing. Note anything odd,
-  do not spend time.
+- **NOT the read-only verbs — those are now IN scope and are the biggest new thing here.**
+  (An earlier version of this brief dismissed them as "they mutate nothing"; that was written
+  before they had a parser of their own, and it was wrong even then — a read-only verb reads,
+  and it reads outside the cage as you.)
+- Re-deriving which options each SLURM version has. The tables are checked against SchedMD's
+  versioned man pages and confirmed by `query.parity` on 23.02.7 and 25.05.4. Attack the
+  logic, not the list.
 
 ## Verdict
 

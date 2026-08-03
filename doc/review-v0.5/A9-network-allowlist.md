@@ -16,6 +16,10 @@ addresses, and the gap between them is where `F13`/`F14`-shaped bugs live. `neta
 comments flag one such trap already — reading a trailing `:...` as a port would make
 `evil.com:...` parse as host `evil.com` with a nonsense port.
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** One chain this brief would have hunted is
+> closed, and one property was MEASURED by a sibling shard that makes the allowlist broader
+> than it reads. Both marked ★ — the second is the most important single fact in this brief.
+
 ## What the code does today
 
 The cage keeps `--unshare-net` and gains one hole: a unix socket, relayed by socat on
@@ -34,6 +38,23 @@ Also current: `*` is accepted as an explicit "everything" entry while `*.com` is
 (vagueness is what is refused, not breadth); SLURM daemon ports are refused **even under `*`**;
 and it is **CONNECT-only**, so `https://` works and plain `http://` does not — serving an
 absolute-URI GET would need a second HTTP parser, which is the shape we are avoiding.
+
+★ **Two changes since this brief was written:**
+
+- **★ CONNECT IS A GENERIC TCP TUNNEL. This was measured, not argued.** The C2 shard ran husk's
+  real `--net-proxy` binary and relayed an **SSH protocol banner, bidirectionally, on port
+  47322**. So "CONNECT-only" bounds the *protocol husk speaks*, not the traffic that flows: once
+  the tunnel is up it is bytes in both directions to whatever is on the far side. The practical
+  consequence, which C2 flagged explicitly as this brief's territory: **an allowlist entry with
+  no `:port` authorises a generic TCP tunnel to that host on EVERY port.** An operator writing
+  `github.com` to permit `git clone` is not obviously agreeing to that. Establish what it
+  actually permits, and whether the port-less form should be allowed to mean it.
+- **★ The proxy now reads its allowlist from the trusted `project_dir`, not `$PWD`.** It used to
+  take the job's `--chdir`, which the agent picks within the writable set — so the confined side
+  chose which settings files governed its own egress, while the submit-time half of the same
+  decision used the project dir. Fixed in `341f2cd`. Do not spend the run on that chain; **do**
+  check that the two halves now genuinely agree, since a disagreement between them is what the
+  bug was.
 
 ## Starting points
 
@@ -54,7 +75,12 @@ absolute-URI GET would need a second HTTP parser, which is the shape we are avoi
 6. **The relay itself.** socat is bound into the cage. Can a rank point it somewhere else, or
    start its own relay to a different unix socket? Can it reach the proxy's socket directly and
    speak something other than CONNECT?
-7. **Known-and-accepted, do not report as new:** `github.com` means *all* of GitHub — org
+7. **★ Port-less entries.** Given the tunnel result above: enumerate what `github.com` (no
+   port) actually reaches. SSH on 22? A database on 5432? Anything listening on that host?
+   Compare against `github.com:443`. If the port-less form is materially broader than an
+   operator would expect, that is a design finding with a cheap fix, and it is the most
+   valuable thing this brief could return.
+8. **Known-and-accepted, do not report as new:** `github.com` means *all* of GitHub — org
    scoping is impossible with a host allowlist because the org is in the path and we do not
    terminate TLS. Confirm, do not rediscover.
 

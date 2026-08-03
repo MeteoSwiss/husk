@@ -3,6 +3,11 @@
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
 · bound by the **rules of engagement** in `review-v0.5-questions.md`
 
+> **Refreshed 2026-08-03, after the v0.5 fixes.** The environment path itself is UNCHANGED —
+> `env_args`, the reserved prefixes, the name grammar and the bound are all as they were, so
+> everything below about them still holds. What changed is the rank cage they land in, and one
+> NEW instance of this brief's own theme arrived with Fix 1. Both are marked ★ below.
+
 ## The question
 
 The job script's environment is carried into rank cages. Can the agent put something in it
@@ -38,6 +43,31 @@ Two design decisions that are load-bearing, and worth attacking directly:
 2. **bwrap applies arguments in order**, so a `--setenv` after a credential `--unsetenv`
    re-sets it. The credential mask and the forwarded delta therefore interact. **Ordering is
    the control here** — try to invert it.
+
+## ★ New since this brief was written
+
+Three changes to the surface, none of which touched `env_args` itself:
+
+- **★ The rank cage now builds a MUNGE mask at runtime, in POSIX sh, and expands it
+  UNQUOTED.** `rank.rs` emits a loop that reads `/run/munge` and `/var/run/munge`, resolves
+  each with `readlink -f`, and accumulates `_m="$_m --tmpfs $_r"` — then puts bare `$_m` on
+  the bwrap command line, where it is word-split. That is deliberate (dash has no arrays) and
+  it is guarded by refusing any resolved path containing whitespace. **It is also the exact
+  shape this brief exists to attack**: a value assembled at runtime and expanded unquoted into
+  a trusted command line. The inputs are compile-time constants and a `readlink`, so the
+  question is whether anything can influence what `readlink -f` returns for those two paths on
+  a compute node — a symlink, a bind, a mount the job can make.
+- **★ `job_args` now travel INSIDE the guard**, not on sbatch's command line. Fix 1 removed the
+  script operand (husk submits on stdin), so the agent's argv for its own script is emitted as
+  a `sh_quote`d `set -- '...' '...'` line in the generated script. Agent-controlled bytes,
+  quoted by husk, into a shell script that the guard's **uncaged first instance also parses**.
+  Parsing is not executing — but a quoting break there is a syntax error at best and code
+  execution outside the cage at worst. `sh_quote` is the whole boundary. Attack it: quotes,
+  newlines, `NUL`, backslashes, `$(...)`, `!`, unbalanced quotes, very long values,
+  non-UTF-8. (Overlaps A5; flag it, do not chase the chain.)
+- **`--die-with-parent`** is now on both cages, and the rank `/dev/shm` ownership check is
+  symlink-safe (`-L` before `-O`). Neither is an env question, but both changed what a rank
+  can leave behind, so do not read old behaviour from an old run.
 
 ## Starting points
 
