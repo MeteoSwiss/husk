@@ -86,5 +86,33 @@ fresh-cage, checked-between design bounds the blast radius but does not replace 
 
 ---
 
+## Optional, but each earns its cost
+
+None of these is required; all three are cheap and remove a way the run can mislead you.
+
+- **A smoke-test reviewer first.** Before the nine real briefs, run one throwaway reviewer with
+  a trivial task — *"try to write a file outside your workdir, then stop and report."* Its only
+  job is to exercise the harness end to end: does the orchestrator sequence it, does
+  `FINDINGS.md` get extracted before teardown, does `between-runs-check.sh` actually run and
+  come back `CLEAN`? You do not want to discover the rig is broken on A1, the most important
+  brief. The smoke reviewer should trip nothing — if the check reports DRIFT after a reviewer
+  that was told only to try-and-stop, the check's config is wrong, and better to learn that now.
+
+- **Run `--deep` at least once, at the very end.** The per-cycle check is login-node only, for
+  speed. Compute-node residue (`/tmp/husk-*`, `/dev/shm/husk-*` on the nodes jobs ran on) is
+  where a husk-specific escape would land, and `--deep` submits a short probe job per node to
+  look. Running it every cycle is slow; running it once after the last reviewer, before you
+  call the run clean, costs one allocation and closes the one surface the fast check cannot see.
+
+- **Make canary contents unique tokens, and grep for them.** A hash catches a canary being
+  *modified*, not *read*. For a read to matter it has to leave the cage, so give each canary a
+  distinct string like `HUSK-CANARY-<random>` and, after each reviewer, `grep` that token in
+  the egress proxy log (`net-proxy.log`) and in the reviewer's own `FINDINGS.md`. A token in
+  the egress log is a demonstrated exfiltration; a token the reviewer reports reading but that
+  never egressed is a read that stayed in the cage — which is not an escape, and is the correct
+  non-finding.
+
+---
+
 When 1–5 are done and `--baseline` reflects a quiet system, hand `A-ORCHESTRATOR-RUNBOOK.md`
 to whoever (or whatever) is coordinating, and begin with the first brief.
