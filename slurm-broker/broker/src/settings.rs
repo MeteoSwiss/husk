@@ -638,17 +638,18 @@ impl FsPolicy {
             }
             if matches!(normalize_abs(p).as_deref(), Some("/")) {
                 eprintln!(
-                    "husk: ignoring the filesystem carve-out {p:?}. Binding the root would \
-                     also undo /dev, /proc and the private /tmp and /dev/shm, which is more \
-                     than that line asks for. List the roots you actually need instead — \
-                     e.g. \"/scratch\", \"/capstor\" — and they will be bound exactly as \
-                     written."
+                    "husk: REFUSED the filesystem carve-out {p:?} — it is not in effect, and \
+                     jobs get the normal cage. Binding the root would also undo /dev, /proc \
+                     and the private /tmp and /dev/shm, which is more than that line asks \
+                     for. List the roots you actually need instead — e.g. \"/scratch\", \
+                     \"/capstor\" — and they will be bound exactly as written."
                 );
             } else {
                 eprintln!(
-                    "husk: ignoring the filesystem carve-out {p:?}: it is inside a home \
-                     directory, which husk hides from every job regardless of config. Copy \
-                     what the job needs to a scratch or project path and allow that."
+                    "husk: REFUSED the filesystem carve-out {p:?} — it is not in effect. It \
+                     is inside a home directory, which husk hides from every job regardless \
+                     of config. Copy what the job needs to a scratch or project path and \
+                     allow that."
                 );
             }
         }
