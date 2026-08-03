@@ -76,10 +76,23 @@ fi
 #
 # So: background a marker, wait long enough for BOTH tasks to have started theirs, count,
 # then kill it. One task alone counts 1 (its own); two sharing a namespace count 2.
-PEER_SCRIPT='sleep 8 & m=$!
-sleep 2
+# SECOND correction, 2026-08-03. The version above still assumed a marker OUTLIVES the task
+# that started it: each task backgrounded a sleep, counted, and exited immediately. That held
+# only while an exiting task left its children reparented and running. It stopped holding
+# when the cage gained `--die-with-parent`, which tears the whole sandbox down with the task
+# that owns it — the containment property being the entire point. With any start-up skew
+# between the two tasks, each one now counts a moment when the other's marker is already
+# gone, and the arm reports "SEPARATE pid namespaces" about a namespace that is demonstrably
+# shared (verified directly: two joiners and the holder all report the same pid:[...] inode,
+# with and without the flag).
+#
+# So do not rely on outliving anything. Each task stays alive across a WINDOW and counts in
+# the middle of it, so both are present at both counting moments for any skew under ~5s.
+PEER_SCRIPT='sleep 14 & m=$!
+sleep 5
 n=0; for p in /proc/[0-9]*; do case $(cat $p/comm 2>/dev/null) in sleep) n=$((n+1));; esac; done
 echo $n
+sleep 5
 kill $m 2>/dev/null'
 if out=$(srun -n2 sh -c "$PEER_SCRIPT" 2>&1); then
   lo=$(printf '%s\n' "$out" | grep -E '^[0-9]+$' | sort -n | head -1)

@@ -638,7 +638,12 @@ run_srun_probe() {
       "step : FAILED"*) seen=1; check FAIL containment steps.launch "brokered srun could not launch a step" ;;
       "cage : homes hidden"*) check PASS containment steps.cage    "ranks are sandboxed (homes hidden inside the step)" ;;
       "cage : /users shows"*) check FAIL containment steps.cage    "a rank could see other homes - the per-task wrap is not applied" ;;
-      "pidns: ranks see only"*)   check PASS containment steps.pidns   "ranks share one pid namespace and cannot see the node" ;;
+      # Says only what it measured. This probe counts the processes a rank can SEE and
+      # concludes it is not in the host namespace. It does NOT check that two ranks share
+      # one namespace with each other - that is steps.pidns_peers, separately - and the
+      # old wording claimed both. When the peer arm failed, the two messages contradicted
+      # each other and cost a round of looking for a regression that was not there.
+      "pidns: ranks see only"*)   check PASS containment steps.pidns   "a rank sees only its own namespace, not the node (peer sharing is steps.pidns_peers)" ;;
       "pidns: a rank sees "*)     check FAIL containment steps.pidns   "a rank is in the HOST pid namespace - it can see and signal the step-broker" ;;
       "pidns: ranks can see each other"*) check PASS containment steps.pidns_peers "ranks can name each other - CMA/MPI has peers" ;;
       "pidns: peers invisible"*)  check FAIL containment steps.pidns_peers "ranks are in SEPARATE pid namespaces - MPI cannot attach" ;;
