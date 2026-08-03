@@ -645,6 +645,18 @@ impl FsPolicy {
 
     fn bwrap_args(&self, workdir: &str, kind: CageKind) -> Vec<String> {
         let mut a: Vec<String> = vec![
+            // The caged process tree dies with the guard that owns it.
+            //
+            // It did not, and the review found the consequence: on a group SIGTERM the
+            // guard ran its cleanup, wrote "step spool removed", printed TERMINATED EARLY
+            // and exited — while the workload carried on inside an orphaned bwrap, now with
+            // no supervisor, no cleanup to come, and a spool that had already been deleted
+            // out from under it. A cage whose owner has gone is a lifecycle bug and a
+            // containment statement at once: husk had announced the job was over.
+            //
+            // This is the kernel-coupled half (PDEATHSIG under the hood). The guard's trap
+            // is the cooperative half, and cooperative release does not survive SIGKILL.
+            "--die-with-parent".into(),
             "--ro-bind".into(), "/".into(), "/".into(),
             "--dev".into(), "/dev".into(),
             "--proc".into(), "/proc".into(),

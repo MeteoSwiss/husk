@@ -109,9 +109,6 @@ static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 const LEGACY_SPOOL_MIN_AGE_SECS: u64 = 3600;
 
 type SigHandler = extern "C" fn(std::os::raw::c_int);
-extern "C" {
-    fn signal(signum: std::os::raw::c_int, handler: SigHandler) -> usize;
-}
 
 extern "C" fn note_shutdown(_sig: std::os::raw::c_int) {
     SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -125,8 +122,9 @@ fn catch_shutdown_signals() {
     const SIGTERM_NUM: std::os::raw::c_int = 15;
     // SAFETY: installing a handler that does nothing but store to an AtomicBool.
     unsafe {
-        signal(SIGTERM_NUM, note_shutdown);
-        signal(SIGINT, note_shutdown);
+        let h = note_shutdown as SigHandler as usize;
+        crate::cage::libc_signal(SIGTERM_NUM, h);
+        crate::cage::libc_signal(SIGINT, h);
     }
 }
 

@@ -211,7 +211,7 @@ fi
 _husk_signalled=
 trap '_husk_signalled=SIGTERM' TERM
 trap '_husk_signalled=SIGINT' INT
-seccomp-wrapper --profile=single-node bwrap '--ro-bind' '/' '/' '--dev' '/dev' '--proc' '/proc' '--tmpfs' '/tmp' '--tmpfs' '/dev/shm' '--unshare-pid' '--dev-bind-try' '/dev/nvidiactl' '/dev/nvidiactl' '--dev-bind-try' '/dev/nvidia-uvm' '/dev/nvidia-uvm' '--dev-bind-try' '/dev/nvidia-uvm-tools' '/dev/nvidia-uvm-tools' '--dev-bind-try' '/dev/nvidia-caps' '/dev/nvidia-caps' '--dev-bind-try' '/dev/gdrdrv' '/dev/gdrdrv' '--dev-bind-try' '/dev/nvidia0' '/dev/nvidia0' '--dev-bind-try' '/dev/nvidia1' '/dev/nvidia1' '--dev-bind-try' '/dev/nvidia2' '/dev/nvidia2' '--dev-bind-try' '/dev/nvidia3' '/dev/nvidia3' '--dev-bind-try' '/dev/nvidia4' '/dev/nvidia4' '--dev-bind-try' '/dev/nvidia5' '/dev/nvidia5' '--dev-bind-try' '/dev/nvidia6' '/dev/nvidia6' '--dev-bind-try' '/dev/nvidia7' '/dev/nvidia7' '--dev-bind-try' '/dev/nvidia-nvswitchctl' '/dev/nvidia-nvswitchctl' '--dev-bind-try' '/dev/nvidia-nvswitch0' '/dev/nvidia-nvswitch0' '--dev-bind-try' '/dev/nvidia-nvswitch1' '/dev/nvidia-nvswitch1' '--dev-bind-try' '/dev/nvidia-nvswitch2' '/dev/nvidia-nvswitch2' '--dev-bind-try' '/dev/nvidia-nvswitch3' '/dev/nvidia-nvswitch3' '--tmpfs' '/users' '--bind' '/work/project' '/work/project' '--tmpfs' '/work/project/.claude' '--tmpfs' '/work/project/.vscode' '--tmpfs' '/work/project/.idea' '--tmpfs' '/work/project/.git' '--tmpfs' '/work/project/.hg' '--ro-bind-try' '/work/project/.mcp.json' '/work/project/.mcp.json' '--ro-bind' '/dev/null' '/work/project/.Rprofile' '--unshare-net' ${_husk_extra[@]+"${_husk_extra[@]}"} -- /bin/bash "$0" "$@"
+seccomp-wrapper --profile=single-node bwrap '--die-with-parent' '--ro-bind' '/' '/' '--dev' '/dev' '--proc' '/proc' '--tmpfs' '/tmp' '--tmpfs' '/dev/shm' '--unshare-pid' '--dev-bind-try' '/dev/nvidiactl' '/dev/nvidiactl' '--dev-bind-try' '/dev/nvidia-uvm' '/dev/nvidia-uvm' '--dev-bind-try' '/dev/nvidia-uvm-tools' '/dev/nvidia-uvm-tools' '--dev-bind-try' '/dev/nvidia-caps' '/dev/nvidia-caps' '--dev-bind-try' '/dev/gdrdrv' '/dev/gdrdrv' '--dev-bind-try' '/dev/nvidia0' '/dev/nvidia0' '--dev-bind-try' '/dev/nvidia1' '/dev/nvidia1' '--dev-bind-try' '/dev/nvidia2' '/dev/nvidia2' '--dev-bind-try' '/dev/nvidia3' '/dev/nvidia3' '--dev-bind-try' '/dev/nvidia4' '/dev/nvidia4' '--dev-bind-try' '/dev/nvidia5' '/dev/nvidia5' '--dev-bind-try' '/dev/nvidia6' '/dev/nvidia6' '--dev-bind-try' '/dev/nvidia7' '/dev/nvidia7' '--dev-bind-try' '/dev/nvidia-nvswitchctl' '/dev/nvidia-nvswitchctl' '--dev-bind-try' '/dev/nvidia-nvswitch0' '/dev/nvidia-nvswitch0' '--dev-bind-try' '/dev/nvidia-nvswitch1' '/dev/nvidia-nvswitch1' '--dev-bind-try' '/dev/nvidia-nvswitch2' '/dev/nvidia-nvswitch2' '--dev-bind-try' '/dev/nvidia-nvswitch3' '/dev/nvidia-nvswitch3' '--tmpfs' '/users' '--bind' '/work/project' '/work/project' '--tmpfs' '/work/project/.claude' '--tmpfs' '/work/project/.vscode' '--tmpfs' '/work/project/.idea' '--tmpfs' '/work/project/.git' '--tmpfs' '/work/project/.hg' '--ro-bind-try' '/work/project/.mcp.json' '/work/project/.mcp.json' '--ro-bind' '/dev/null' '/work/project/.Rprofile' '--unshare-net' ${_husk_extra[@]+"${_husk_extra[@]}"} -- /bin/bash "$0" "$@"
 _husk_rc=$?
 # The step-broker holds the credentials the job must not have, so it dies WITH the job.
 # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.
@@ -244,6 +244,18 @@ fi
 # The agent's staged body. Owned by the guard because it must outlive submission (the
 # job has to be able to read it) but must not outlive the job.
 rm -f "$_husk_body" 2>/dev/null
+# The per-job /dev/shm directory the ranks create and share. It had no owner and no
+# release on ANY path, not even the clean one: a step exited 0 and the directory stayed,
+# RAM-backed, holding whatever MPI segments were in it, until something else on the node
+# happened to clear it. rmdir, not rm -rf: this is /dev/shm, it is shared with every
+# other user, and a recursive delete pointed at a path someone else may have created
+# first is a deletion primitive. If it is not empty we leave it and say so.
+_husk_shm="/dev/shm/husk-${SLURM_JOB_ID:-nojob}"
+if [ -d "$_husk_shm" ] && [ ! -L "$_husk_shm" ] && [ -O "$_husk_shm" ]; then
+rm -f "$_husk_shm"/* 2>/dev/null
+rmdir "$_husk_shm" 2>/dev/null \
+|| echo "husk: kept $_husk_shm - it is not empty" >>"$_husk_log" 2>/dev/null
+fi
 if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
 rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null

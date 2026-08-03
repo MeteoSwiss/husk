@@ -124,8 +124,26 @@ impl StepBroker {
     /// namespace. Created once per JOB rather than per step — nothing in it is
     /// step-specific, and a namespace per step would be a process per step to leak.
     fn ensure_holder(&mut self) -> Result<u32, String> {
+        // A cached pid is a claim about a process, and processes end. If the holder died,
+        // every later step in the job was handed its pid anyway and failed at its own
+        // fail-closed gate on `/proc/<pid>/ns/user` — for the whole wall time, with no
+        // attempt to recover. Worse in principle than a wedge: pids are recycled, so a
+        // stale one can eventually name a DIFFERENT live process of this user's, and the
+        // check would pass on a namespace that has nothing to do with this job.
+        //
+        // Verify it is still the holder we started before handing it out. The namespace
+        // link is the evidence, not the pid: it is what the ranks will actually open, and
+        // it disappears with the process.
         if let Some(h) = &self.holder {
-            return Ok(h.pid);
+            if std::path::Path::new(&crate::cage::userns_path(h.pid)).exists() {
+                return Ok(h.pid);
+            }
+            eprintln!(
+                "husk: the cage holder for this job (pid {}) is gone; starting a new one. \
+                 Steps already running keep the namespace they joined.",
+                h.pid
+            );
+            self.holder = None;
         }
         let exe = std::env::current_exe()
             .map_err(|e| format!("cannot locate the husk broker binary: {e}"))?;

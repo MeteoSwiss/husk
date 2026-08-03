@@ -42,6 +42,11 @@
 
 use std::io::Write;
 
+/// SIGCHLD, and the disposition that makes the kernel reap children for us. Both are
+/// stable across x86_64 and aarch64, the two architectures husk runs on.
+const SIGCHLD: std::os::raw::c_int = 17;
+const SIG_IGN: usize = 1;
+
 const CLONE_NEWUSER: std::os::raw::c_int = 0x1000_0000;
 const CLONE_NEWPID: std::os::raw::c_int = 0x2000_0000;
 
@@ -75,6 +80,12 @@ extern "C" {
     fn libc_fork() -> i32;
     #[link_name = "pause"]
     fn libc_pause() -> std::os::raw::c_int;
+    // Declared with `usize` rather than a function-pointer type because SIG_IGN is not a
+    // function: it is the sentinel 1. One declaration for the whole crate — two `extern`
+    // blocks naming the same symbol with different signatures is undefined behaviour
+    // waiting for a mismatched call, and the compiler says so.
+    #[link_name = "signal"]
+    pub fn libc_signal(sig: std::os::raw::c_int, handler: usize) -> usize;
 }
 
 /// The path a rank passes to `bwrap --pidns`.
@@ -197,10 +208,26 @@ pub fn create_shared_pidns() -> Result<u32, String> {
             }
             // Sleep forever. `pause` rather than a sleep loop so it consumes nothing.
             //
-            // NB it does not reap: orphaned ranks reparent to this PID 1 and their zombies
-            // accumulate for the job's lifetime. Harmless — the namespace and every zombie
-            // in it are destroyed when the job ends — and a subtly wrong reap loop would be
-            // worse than none.
+            // Reap by disposition, not by loop.
+            //
+            // The note that used to sit here said orphaned ranks reparent to this PID 1 and
+            // their zombies "accumulate for the job's lifetime. Harmless — the namespace and
+            // every zombie in it are destroyed when the job ends". The first half is right
+            // and the second is not: a zombie in a PID namespace still holds a pid in the
+            // NODE-GLOBAL space it was allocated from, shared with every other user on that
+            // node. The review measured 30 orphans producing 30 host-visible zombies. That
+            // is the one place a rank reaches past its own job.
+            //
+            // The rejected fix was a wait loop, and rejecting it was right — a subtly wrong
+            // one is worse than none. This is not that: POSIX says a SIGCHLD disposition of
+            // SIG_IGN makes children be reaped automatically and never become zombies, so
+            // the kernel does it and there is no loop to get wrong. `pause` still returns
+            // only on a signal, and PID 1 still ignores everything it has no handler for,
+            // so `kill -9 1` from inside the namespace remains ineffective.
+            //
+            // SIGCHLD is 17 on both architectures husk targets (x86_64, aarch64).
+            // SAFETY: signal() with a valid signal number and SIG_IGN.
+            unsafe { libc_signal(SIGCHLD, SIG_IGN) };
             loop {
                 // SAFETY: pause takes no arguments and only returns on a signal.
                 unsafe { libc_pause() };

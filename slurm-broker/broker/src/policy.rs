@@ -1027,6 +1027,18 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   # The agent's staged body. Owned by the guard because it must outlive submission (the\n\
   # job has to be able to read it) but must not outlive the job.\n\
   rm -f \"$_husk_body\" 2>/dev/null\n\
+  # The per-job /dev/shm directory the ranks create and share. It had no owner and no\n\
+  # release on ANY path, not even the clean one: a step exited 0 and the directory stayed,\n\
+  # RAM-backed, holding whatever MPI segments were in it, until something else on the node\n\
+  # happened to clear it. rmdir, not rm -rf: this is /dev/shm, it is shared with every\n\
+  # other user, and a recursive delete pointed at a path someone else may have created\n\
+  # first is a deletion primitive. If it is not empty we leave it and say so.\n\
+  _husk_shm=\"/dev/shm/husk-${{SLURM_JOB_ID:-nojob}}\"\n\
+  if [ -d \"$_husk_shm\" ] && [ ! -L \"$_husk_shm\" ] && [ -O \"$_husk_shm\" ]; then\n\
+    rm -f \"$_husk_shm\"/* 2>/dev/null\n\
+    rmdir \"$_husk_shm\" 2>/dev/null \\\n\
+      || echo \"husk: kept $_husk_shm - it is not empty\" >>\"$_husk_log\" 2>/dev/null\n\
+  fi\n\
   if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
     rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
     rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* 2>/dev/null\n\

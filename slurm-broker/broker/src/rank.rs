@@ -271,8 +271,16 @@ pub fn wrap_command(
          exec 8<\"$_p\"\n\
          _d=/dev/shm/husk-${{SLURM_JOB_ID}}\n\
          mkdir -m 700 \"$_d\" 2>/dev/null || true\n\
-         if [ ! -O \"$_d\" ]; then\n\
-         echo \"husk: $_d exists and is not owned by this user - refusing to share it\" >&2\n\
+         # -O FOLLOWS SYMLINKS, and /dev/shm is world-writable. A co-tenant who won the\n\
+         # race to create this path could point it at a directory of OURS: -O then\n\
+         # resolved the link, saw a directory this user owns, passed - and bwrap bound\n\
+         # that directory as /dev/shm inside every rank, read-write, through a cage whose\n\
+         # whole job is to hide such things. Someone outside the job chose what was\n\
+         # mounted inside it. -L tests the link itself and does not follow, so it has to\n\
+         # come first; -d then rejects anything that is not a directory at all.\n\
+         if [ -L \"$_d\" ] || [ ! -d \"$_d\" ] || [ ! -O \"$_d\" ]; then\n\
+         echo \"husk: refusing to use $_d - it is a symlink, not a directory, or not owned\" >&2\n\
+         echo \"husk: by this user. Another user on this node may have created it first.\" >&2\n\
          exit 1\n\
          fi\n\
          _s={spool}/mpi_cray_shasta/${{SLURM_JOB_ID}}.${{SLURM_STEP_ID}}\n\
