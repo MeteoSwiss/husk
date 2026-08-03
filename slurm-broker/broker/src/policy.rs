@@ -543,7 +543,7 @@ fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<Str
 /// Accepts `<jobid>`, `<jobid>_<arraytask>` and `<jobid>.<stepid>`, since those are how a
 /// user names a piece of a job they already own. The base id before `_` or `.` is what the
 /// broker checks ownership against.
-/// Default-deny the read-only verbs' option surface.
+/// Default-deny the read-only verbs' option surface, PER VERB.
 ///
 /// "Read-only" is a property of what the command does to the SCHEDULER. It says nothing
 /// about what its OPTIONS do to the filesystem, and these commands run OUTSIDE the cage
@@ -551,39 +551,108 @@ fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<Str
 /// --batch-script` prints the stored script of any job on the account. Forwarding the
 /// agent's whole argv into them made husk a read oracle holding the door open.
 ///
-/// So the same discipline as the submission surface: recognise a small set of options,
-/// re-emit them, and refuse everything else — including anything that could name a file or
-/// redirect output. A verb with no row in the SINK matrix does not get a passthrough.
+/// **Per verb, not one shared list, and that is not tidiness.** The first version here used
+/// a single flat table and was WRONG, not merely coarse: `-p` is `--partition` in `squeue`
+/// and `sinfo` but `--parsable` in `sacct`, where it takes no value. A flat table that
+/// believes `-p` takes a value eats the next argument, so `sacct -p -j 123` loses its `-j`
+/// and then fails on a bare `123`. Same letter, different arity, different tool — an
+/// allowlist assembled from memory rather than from the tools, which is a denylist's
+/// mistake wearing the other hat.
+///
+/// Deliberately SMALL. A short list that is right beats a long one that is guessed, and the
+/// refusal names what this verb does accept, so an agent adapts in one step instead of
+/// probing. Widening it is an operator decision with a man page open.
+///
+/// NOT VERIFIED against real SLURM binaries — there is no SLURM on the development machine.
+/// `query-parity-probe` on a cluster should diff these tables against each tool's own
+/// `--help`, the same instrument shape `sbatch.directive_parity` already uses for `#SBATCH`.
+struct QuerySpec {
+    /// Options that consume a following value (or take one after `=`).
+    value: &'static [&'static str],
+    /// Options that stand alone.
+    flag: &'static [&'static str],
+}
+
+fn query_spec(tool: &str) -> Option<QuerySpec> {
+    // Shared output-shaping flags that mean the same thing everywhere they exist.
+    const COMMON_FLAGS: &[&str] = &["-h", "--noheader", "-l", "--long", "--json", "--yaml"];
+    Some(match tool {
+        "squeue" => QuerySpec {
+            value: &["-u", "--user", "-j", "--jobs", "-p", "--partition", "-A", "--account",
+                     "-t", "--states", "-n", "--name", "-q", "--qos", "-w", "--nodelist",
+                     "-M", "--clusters", "-S", "--sort", "-o", "--format", "-i", "--iterate"],
+            flag: &["-a", "--all", "-r", "--array", "--me", "-s", "--steps",
+                    "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        "sinfo" => QuerySpec {
+            value: &["-p", "--partition", "-n", "--nodes", "-t", "--states", "-M", "--clusters",
+                     "-S", "--sort", "-o", "--format", "-i", "--iterate"],
+            flag: &["-a", "--all", "-N", "--Node", "-s", "--summarize", "-d", "--dead",
+                    "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        // `-p` here is --parsable, a FLAG, and `-r` is --partition. This is the verb the
+        // flat table got wrong.
+        "sacct" => QuerySpec {
+            value: &["-u", "--user", "-j", "--jobs", "-A", "--accounts", "-r", "--partition",
+                     "-s", "--state", "-S", "--starttime", "-E", "--endtime", "-N", "--nodelist",
+                     "-o", "--format", "-M", "--clusters", "-q", "--qos"],
+            flag: &["-a", "--allusers", "-X", "--allocations", "-D", "--duplicates",
+                    "-p", "--parsable", "-P", "--parsable2",
+                    "-n", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        "sstat" => QuerySpec {
+            value: &["-j", "--jobs", "-o", "--format"],
+            flag: &["-a", "--allsteps", "-p", "--parsable", "-P", "--parsable2",
+                    "-n", "--noheader", "--json", "--yaml"],
+        },
+        "sprio" => QuerySpec {
+            value: &["-j", "--jobs", "-u", "--user", "-p", "--partition", "-o", "--format",
+                     "-M", "--clusters"],
+            flag: &["-n", "--norm", "-w", "--weights", "-h", "--noheader", "-l", "--long",
+                    "--json", "--yaml"],
+        },
+        "sshare" => QuerySpec {
+            value: &["-u", "--users", "-A", "--accounts", "-M", "--clusters", "-o", "--format"],
+            flag: &["-a", "--all", "-p", "--parsable", "-P", "--parsable2",
+                    "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        // sreport's grammar is `sreport <type> <report> [opts]` — positional subcommands,
+        // which the rule below refuses on principle. Rather than special-case a parser for
+        // it, husk accepts only the shape it can vouch for and says so.
+        "sreport" => QuerySpec { value: &[], flag: COMMON_FLAGS },
+        _ => return None,
+    })
+}
+
 fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
-    // Options that select WHICH records to show, and nothing else. Values are checked
-    // against a conservative charset; none of these can name a file.
-    const VALUE_OPTS: &[&str] = &[
-        "-u", "--user", "-j", "--jobs", "-p", "--partition", "-A", "--account",
-        "-t", "--state", "--states", "-n", "--name", "-q", "--qos", "-M", "--clusters",
-        "-S", "--starttime", "-E", "--endtime", "-N", "--nodelist", "-w", "--nodes",
-        "-i", "--iterate", "-s", "--steps", "-r", "--reservation", "-T", "--truncate",
-    ];
-    const FLAG_OPTS: &[&str] = &[
-        "-a", "--all", "-l", "--long", "-h", "--noheader", "-P", "--parsable",
-        "--parsable2", "-X", "--allocations", "-D", "--dedup", "-e", "--helpformat",
-        "-V", "--version", "--me", "--json",
-    ];
-    // A value that will become an argument to another program: letters, digits, and the
-    // punctuation SLURM's own selectors use. No slashes, so nothing here can be a path.
+    let Some(spec) = query_spec(tool) else {
+        return Err(format!("husk does not broker {tool}"));
+    };
+    // A value that becomes an argument to another program: letters, digits, and the
+    // punctuation SLURM's selectors and format strings use. NO SLASH, so nothing that
+    // reaches these tools can be a path.
     let ok_value = |v: &str| {
         !v.is_empty()
             && v.len() <= 256
-            && v.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || b",._:+-=%@".contains(&b)
-            })
+            // A SPACE is fine: these become separate argv elements via Command::args, not
+            // a shell string, so nothing re-splits them — and format strings need one
+            // (`-o "%i %T"`). What must not appear is a SLASH, because that is what turns
+            // a selector into a path.
+            && v.bytes().all(|b| b.is_ascii_alphanumeric() || b",._:+-=%@[] ".contains(&b))
+    };
+    let allowed = || {
+        let mut all: Vec<&str> =
+            spec.value.iter().chain(spec.flag.iter()).filter(|o| o.starts_with("--")).copied().collect();
+        all.sort_unstable();
+        all.join(" ")
     };
     let refuse = |what: &str| {
         Err(format!(
             "husk does not forward {what:?} to {tool}. Read-only queries are brokered with a \
-             fixed set of selector options (which user, which jobs, which partition, which \
-             state, and the usual output flags), because {tool} runs outside the sandbox with \
-             your full filesystem access and some of its options read or write files. Ask for \
-             the records you want with those selectors."
+             fixed set of options, because {tool} runs outside the sandbox with your full \
+             filesystem access and some of its options read or write files. For {tool} husk \
+             accepts: {}. If you need another one, that is an operator decision.",
+            allowed()
         ))
     };
 
@@ -591,26 +660,22 @@ fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         if !a.starts_with('-') {
-            // A bare operand. `squeue 123` is not a thing; a stray word here is either a
+            // A bare operand. None of these verbs need one, and a stray word is either a
             // mistake or an attempt to pass a path positionally.
             return refuse(a);
         }
-        // `--opt=value`
         if let Some((name, value)) = a.split_once('=') {
-            if !VALUE_OPTS.contains(&name) {
-                return refuse(a);
-            }
-            if !ok_value(value) {
+            if !spec.value.contains(&name) || !ok_value(value) {
                 return refuse(a);
             }
             out.push(format!("{name}={value}"));
             continue;
         }
-        if FLAG_OPTS.contains(&a.as_str()) {
+        if spec.flag.contains(&a.as_str()) {
             out.push(a.clone());
             continue;
         }
-        if VALUE_OPTS.contains(&a.as_str()) {
+        if spec.value.contains(&a.as_str()) {
             let Some(v) = it.next() else {
                 return Err(format!("husk: {a} needs a value"));
             };
@@ -2746,7 +2811,8 @@ mod tests {
             vec!["--completion", "--file=/etc/shadow"],
             vec!["--batch-script"],
             vec!["-o", "/users/victim/.bashrc"],
-            vec!["--yaml"],
+            vec!["--env-vars"],
+            vec!["--file", "/etc/passwd"],
         ] {
             let mut r = req(&["--partition=preemptible"], "echo hi\n");
             r.tool = "sacct".into();
@@ -2757,11 +2823,49 @@ mod tests {
                 _ => panic!("unexpected decision for {argv:?}"),
             }
         }
-        // ...while the ordinary read-only use keeps working.
+        // ...while the ordinary read-only use keeps working, per verb.
+        for (tool, argv) in [
+            ("squeue", vec!["-u", "me", "--states=RUNNING"]),
+            ("squeue", vec!["--me", "-o", "%i %T"]),
+            ("sinfo", vec!["-p", "short", "-N", "--long"]),
+            ("sacct", vec!["-j", "123", "--format=JobID,State"]),
+            ("sshare", vec!["-U", "-u", "me"]),
+        ] {
+            let mut r = req(&["--partition=preemptible"], "echo hi\n");
+            r.tool = tool.into();
+            r.argv = argv.iter().map(|s| s.to_string()).collect();
+            let d = decide(&r, &no_uenv(), &FsPolicy::default(), work());
+            if tool == "sshare" {
+                // -U is not on sshare's list; the point is that it is refused with a
+                // message naming what IS accepted, not that every real option is present.
+                match d {
+                    Decision::Reject(m) => assert!(m.contains("--accounts"), "must list what works: {m}"),
+                    _ => panic!("an option husk does not know must be refused"),
+                }
+            } else {
+                assert!(matches!(d, Decision::Query(_)), "{tool} {argv:?} must still work");
+            }
+        }
+
+        // THE COLLISION the flat table got wrong: -p is --partition in squeue and sinfo,
+        // but --parsable in sacct, where it takes NO value. A shared table that believes -p
+        // consumes an argument eats the -j and then chokes on the bare 123.
+        let mut r = req(&["--partition=preemptible"], "echo hi\n");
+        r.tool = "sacct".into();
+        r.argv = vec!["-p".into(), "-j".into(), "123".into()];
+        match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
+            Decision::Query(a) => assert_eq!(a, vec!["sacct", "-p", "-j", "123"], "{a:?}"),
+            Decision::Reject(m) => panic!("sacct -p is a flag, not a value option: {m}"),
+            _ => panic!("unexpected"),
+        }
+        // ...and the same letter in squeue DOES take one.
         let mut r = req(&["--partition=preemptible"], "echo hi\n");
         r.tool = "squeue".into();
-        r.argv = vec!["-u".into(), "me".into(), "--states=RUNNING".into()];
-        assert!(matches!(decide(&r, &no_uenv(), &FsPolicy::default(), work()), Decision::Query(_)));
+        r.argv = vec!["-p".into(), "short".into()];
+        match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
+            Decision::Query(a) => assert_eq!(a, vec!["squeue", "-p", "short"], "{a:?}"),
+            other => panic!("squeue -p short must work: {}", matches!(other, Decision::Reject(_))),
+        }
     }
 
     /// Submit `body` and return the script husk hands to sbatch.
