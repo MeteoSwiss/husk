@@ -581,12 +581,14 @@ struct QuerySpec {
 
 fn query_spec(tool: &str) -> Option<QuerySpec> {
     // Shared output-shaping flags that mean the same thing everywhere they exist.
-    const COMMON_FLAGS: &[&str] = &["-h", "--noheader", "-l", "--long", "--json", "--yaml"];
     Some(match tool {
         "squeue" => QuerySpec {
             value: &["-u", "--user", "-j", "--jobs", "-p", "--partition", "-A", "--account",
                      "-t", "--states", "-n", "--name", "-q", "--qos", "-w", "--nodelist",
                      "-M", "--clusters", "-S", "--sort", "-o", "--format", "-i", "--iterate"],
+            // `-s/--steps` takes an OPTIONAL argument, and SLURM's own man page warns the
+            // value must be attached with no space. husk has two arities, not three, so it
+            // offers the bare form only — a safe subset rather than a wrong guess.
             flag: &["-a", "--all", "-r", "--array", "--me", "-s", "--steps",
                     "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
         },
@@ -608,24 +610,31 @@ fn query_spec(tool: &str) -> Option<QuerySpec> {
         },
         "sstat" => QuerySpec {
             value: &["-j", "--jobs", "-o", "--format"],
+            // No --json/--yaml here: sstat gained them after 23.02, and Balfrin is the floor.
             flag: &["-a", "--allsteps", "-p", "--parsable", "-P", "--parsable2",
-                    "-n", "--noheader", "--json", "--yaml"],
+                    "-n", "--noheader"],
         },
         "sprio" => QuerySpec {
             value: &["-j", "--jobs", "-u", "--user", "-p", "--partition", "-o", "--format",
                      "-M", "--clusters"],
-            flag: &["-n", "--norm", "-w", "--weights", "-h", "--noheader", "-l", "--long",
-                    "--json", "--yaml"],
+            // No --json/--yaml: not in 23.02's sprio.
+            flag: &["-n", "--norm", "-w", "--weights", "-h", "--noheader", "-l", "--long"],
         },
         "sshare" => QuerySpec {
             value: &["-u", "--users", "-A", "--accounts", "-M", "--clusters", "-o", "--format"],
+            // sshare's noheader is -n, NOT -h (which is --help here), and it has no
+            // --json/--yaml in 23.02.
             flag: &["-a", "--all", "-p", "--parsable", "-P", "--parsable2",
-                    "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
+                    "-n", "--noheader", "-l", "--long"],
         },
         // sreport's grammar is `sreport <type> <report> [opts]` — positional subcommands,
         // which the rule below refuses on principle. Rather than special-case a parser for
         // it, husk accepts only the shape it can vouch for and says so.
-        "sreport" => QuerySpec { value: &[], flag: COMMON_FLAGS },
+        // sreport's grammar is `sreport <type> <report> [opts]` — positional subcommands,
+        // which the rule below refuses on principle. Empty rather than a plausible-looking
+        // flag list, so the refusal says husk does not broker this shape rather than
+        // offering options that cannot be used without the positionals anyway.
+        "sreport" => QuerySpec { value: &[], flag: &[] },
         _ => return None,
     })
 }
@@ -645,6 +654,33 @@ pub fn print_query_options() {
                 println!("{tool}\tvalue\t{o}");
             }
         }
+    }
+}
+
+/// The `--long=value` spelling of a value option husk accepts.
+///
+/// Every value option is re-emitted this way, whatever the agent wrote, because a SEPARATED
+/// value is only unambiguous for options whose argument is REQUIRED. SLURM has been moving
+/// options to OPTIONAL arguments — `squeue -j` and `--json` are optional in 25.05 and were
+/// not in 23.02 — and for those, getopt only attaches a value written with `=` or jammed
+/// against the short form. `-j 123` then leaves 123 as a positional, which is a different
+/// command than the one the agent asked for and a difference that varies by cluster.
+///
+/// Emitting one canonical spelling removes the whole question, and it is the same
+/// construct-and-re-emit rule the submission surface follows: never forward the caller's
+/// spelling, emit our own.
+///
+/// The value lists are (short, long) pairs in order, which this relies on — asserted by
+/// `every_allowed_query_option_is_accepted`.
+fn long_form(spec: &QuerySpec, opt: &str) -> String {
+    if opt.starts_with("--") {
+        return opt.to_string();
+    }
+    match spec.value.iter().position(|o| *o == opt) {
+        Some(i) if i + 1 < spec.value.len() && spec.value[i + 1].starts_with("--") => {
+            spec.value[i + 1].to_string()
+        }
+        _ => opt.to_string(),
     }
 }
 
@@ -671,6 +707,14 @@ fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
         all.join(" ")
     };
     let refuse = |what: &str| {
+        if spec.value.is_empty() && spec.flag.is_empty() {
+            return Err(format!(
+                "husk does not broker {tool}: its command line is built from positional \
+                 subcommands (`{tool} <type> <report> ...`), and husk only forwards options \
+                 it recognises. Use squeue, sacct or sshare for what you need, or ask your \
+                 operator."
+            ));
+        }
         Err(format!(
             "husk does not forward {what:?} to {tool}. Read-only queries are brokered with a \
              fixed set of options, because {tool} runs outside the sandbox with your full \
@@ -692,7 +736,7 @@ fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
             if !spec.value.contains(&name) || !ok_value(value) {
                 return refuse(a);
             }
-            out.push(format!("{name}={value}"));
+            out.push(format!("{}={value}", long_form(&spec, name)));
             continue;
         }
         if spec.flag.contains(&a.as_str()) {
@@ -706,8 +750,7 @@ fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
             if !ok_value(v) {
                 return refuse(v);
             }
-            out.push(a.clone());
-            out.push(v.clone());
+            out.push(format!("{}={v}", long_form(&spec, a)));
             continue;
         }
         return refuse(a);
@@ -1696,11 +1739,15 @@ mod tests {
     }
 
     #[test]
-    fn readonly_slurm_command_becomes_a_pass_through_query() {
+    fn readonly_slurm_command_is_reconstructed_not_passed_through() {
+        // It is no longer a pass-through, and the rename says so: the short spelling comes
+        // back as the canonical `--long=value`, because a separated value is ambiguous for
+        // any option whose argument is optional — which several of these became between the
+        // SLURM versions husk runs on.
         let mut r = req(&["-u", "cmueller", "--me"], "");
         r.tool = "squeue".into();
         match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
-            Decision::Query(argv) => assert_eq!(argv, vec!["squeue", "-u", "cmueller", "--me"]),
+            Decision::Query(argv) => assert_eq!(argv, vec!["squeue", "--user=cmueller", "--me"]),
             _ => panic!("expected Query for squeue"),
         }
     }
@@ -2878,7 +2925,7 @@ mod tests {
         r.tool = "sacct".into();
         r.argv = vec!["-p".into(), "-j".into(), "123".into()];
         match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
-            Decision::Query(a) => assert_eq!(a, vec!["sacct", "-p", "-j", "123"], "{a:?}"),
+            Decision::Query(a) => assert_eq!(a, vec!["sacct", "-p", "--jobs=123"], "{a:?}"),
             Decision::Reject(m) => panic!("sacct -p is a flag, not a value option: {m}"),
             _ => panic!("unexpected"),
         }
@@ -2887,7 +2934,7 @@ mod tests {
         r.tool = "squeue".into();
         r.argv = vec!["-p".into(), "short".into()];
         match decide(&r, &no_uenv(), &FsPolicy::default(), work()) {
-            Decision::Query(a) => assert_eq!(a, vec!["squeue", "-p", "short"], "{a:?}"),
+            Decision::Query(a) => assert_eq!(a, vec!["squeue", "--partition=short"], "{a:?}"),
             other => panic!("squeue -p short must work: {}", matches!(other, Decision::Reject(_))),
         }
     }
@@ -2913,7 +2960,11 @@ mod tests {
                 // separated form
                 let got = vet_query_argv(tool, &[opt.to_string(), "x".into()])
                     .unwrap_or_else(|e| panic!("{tool} {opt} <value>: {e}"));
-                assert_eq!(got, vec![tool.to_string(), opt.to_string(), "x".to_string()]);
+                let want = if opt.starts_with("--") { format!("{opt}=x") } else {
+                    let i = spec.value.iter().position(|o| o == opt).unwrap();
+                    format!("{}=x", spec.value[i + 1])
+                };
+                assert_eq!(got, vec![tool.to_string(), want], "{tool} {opt}");
                 // and `--opt=value`, which only the long spellings have
                 if opt.starts_with("--") {
                     vet_query_argv(tool, &[format!("{opt}=x")])
