@@ -117,7 +117,18 @@ cp "$HUSK_REVIEW_ROOT/A1/FINDINGS.md" "$FINDINGS/A1.md"
 ```
 This must happen before step 6 — session teardown may take the project directory with it.
 
-**6. Tear down the husk session.** Exit it. The next reviewer gets a brand-new one.
+**6. Tear down the husk session — fully.** `exit` (or Ctrl-C out) does NOT end the session; it
+*backgrounds* it, and the cage and its egress `socat` keep running. You must **terminate and
+delete the background session** in the agent view (`claude agents`): **Ctrl-X to terminate, then
+Ctrl-X again to delete**. That is what actually reaps `claude` and `socat`. Then verify nothing
+survived before you trust the check:
+```bash
+pgrep -u "$USER" -a -x 'claude|socat|bwrap|seccomp-wrapper'   # MUST be empty
+```
+If that is not empty, the session is not down — do not run the check yet (it will DRIFT on the
+live relay, which is not a finding, just a half-torn-down session). Hammer of last resort:
+`kill -TERM -"$(ps -o pgid= -p <claude-pid> | tr -d ' ')"`. The next reviewer gets a brand-new
+session.
 
 **7. Run the out-of-cage check.**
 ```bash
