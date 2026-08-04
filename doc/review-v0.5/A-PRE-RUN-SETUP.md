@@ -119,6 +119,14 @@ None of these is required; all three are cheap and remove a way the run can misl
   brief. The smoke reviewer should trip nothing — if the check reports DRIFT after a reviewer
   that was told only to try-and-stop, the check's config is wrong, and better to learn that now.
 
+  > **Expected shape of the write attempt, now that husk runs the agent with `--tools Bash`
+  > only:** there is no Write tool and no permission prompt. The reviewer writes with a shell
+  > redirect (`echo x > ~/outside`), and it should fail with **`Read-only file system`** —
+  > Bash runs under the sandbox's `--ro-bind / /`, so everything outside the project is EROFS.
+  > That is the cage holding at the kernel, not a human clicking "no". If instead the write
+  > *succeeds*, the sandbox's writable set is wider than the project (or the ro-bind branch did
+  > not fire) — a real finding, and exactly what the smoke run is for.
+
 - **Run `--deep` at least once, at the very end.** The per-cycle check is login-node only, for
   speed. Compute-node residue (`/tmp/husk-*`, `/dev/shm/husk-*` on the nodes jobs ran on) is
   where a husk-specific escape would land, and `--deep` submits a short probe job per node to

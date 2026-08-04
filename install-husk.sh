@@ -414,6 +414,35 @@ if [ -z "${HUSK_SLURM_PARTITION:-}" ]; then
   done
 fi
 
+# ── The agent gets Bash and nothing else ──────────────────────────────────────
+# Anthropic's sandbox runtime wraps each Bash COMMAND — `wrapWithSandbox(command)`
+# builds a bwrap argv and spawns it — so the boundary is in the path of Bash and
+# NOTHING ELSE. With a write config that argv is `--ro-bind / /` with only the
+# project bound back writable, and every denyRead path masked by an empty
+# `--tmpfs`. That is a real, mandatory, kernel-enforced cage.
+#
+# Read/Write/Edit/Glob/Grep do not go through it. They execute inside the agent
+# process, on the host, BESIDE the sandbox: no mount table applies to them. Their
+# only leash is Claude Code's permission list — advisory, path-pattern based, and
+# answerable "yes" by a human. That is why a Write can land a file in a directory
+# the cage otherwise makes unreachable, while the same write from Bash is EROFS.
+# Two doors, one lock.
+#
+# Everything those tools do, Bash does — through the door that IS locked. So husk
+# hands the agent an ALLOWLIST (`--tools`), not a deny-list: a tool added upstream
+# is excluded until someone decides otherwise, because a denylist is a bug list.
+# The agent reads with `cat`, searches with `grep`, and writes with a shell
+# redirect — all inside the cage.
+#
+# Blunt on purpose, and it costs real ergonomics (every file touch is a sandboxed
+# command, which is slow on Lustre). Revisit when the login side gets its own outer
+# cage — that is the fix that would make host-side tools safe again.
+HUSK_TOOLS="Bash"
+
+# husk's flags go FIRST so an explicit user flag still wins: the human launching
+# husk is the trusted party here, the agent inside it is not.
+set -- --tools "$HUSK_TOOLS" "$@"
+
 # No broker layer installed (e.g. unsupported arch) → run the plain cage.
 if [ -z "$wrapper" ] || [ -z "$broker" ]; then
   exec seccomp-wrapper claude "$@"
