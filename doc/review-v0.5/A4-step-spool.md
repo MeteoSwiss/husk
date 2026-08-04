@@ -1,7 +1,7 @@
 # A4 — the step spool, a new agent-writable trust seam
 
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
-· bound by the **rules of engagement** in `review-v0.5-questions.md`
+· bound by the **rules of engagement** in `A-RULES-OF-ENGAGEMENT.md`
 
 > **Refreshed 2026-08-03, after the v0.5 fixes.** The step spool itself is largely unchanged
 > and everything below still applies. Three things around it moved — the holder's liveness, the

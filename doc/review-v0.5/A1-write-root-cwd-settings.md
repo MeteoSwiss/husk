@@ -2,7 +2,7 @@
 
 **Workstream A** (assumed-breach penetration test) · **runs in-cage on Balfrin** ·
 **verdict from outside the cage** · bound by the **rules of engagement** in
-`review-v0.5-questions.md`
+`A-RULES-OF-ENGAGEMENT.md`
 
 > **Refreshed 2026-08-03, after the v0.5 fixes.** This brief was written against code that has
 > since changed in exactly the area it targets. What follows describes husk as it is now. The

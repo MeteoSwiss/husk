@@ -1,7 +1,7 @@
 # A3 — the job-script body
 
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
-· bound by the **rules of engagement** in `review-v0.5-questions.md`
+· bound by the **rules of engagement** in `A-RULES-OF-ENGAGEMENT.md`
 
 > **REWRITTEN 2026-08-03. This brief's original premise no longer exists.** It was built around
 > husk forwarding the body verbatim into slurmd's parser, so that two parsers read the same

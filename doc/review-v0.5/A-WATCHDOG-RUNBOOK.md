@@ -40,7 +40,8 @@ The point of the list below is not a permission boundary for you; it is a remind
 anything in *your* context can be quoted into a reviewer's prompt, so keep the two apart.
 
 **Each reviewer gets exactly two things: its own brief, and the rules of engagement**
-(`review-v0.5-questions.md`). Nothing else. In particular:
+(`A-RULES-OF-ENGAGEMENT.md` — the reviewer-facing extract, NOT the full `review-v0.5-questions.md`,
+which lists every brief and the B/C plan). Nothing else. In particular:
 
 > **A reviewer must never see `between-runs-check.sh` or the canary list.** That script is the
 > verdict on whether the reviewer escaped. A reviewer that knows which paths are watched can
@@ -82,7 +83,7 @@ Do not start a reviewer on a dirty system; you would not be able to attribute wh
 **2. Provision a fresh, empty project directory** for this reviewer:
 ```bash
 mkdir -p "$HUSK_REVIEW_ROOT/A1"
-cp doc/review-v0.5/A1-*.md doc/review-v0.5-questions.md "$HUSK_REVIEW_ROOT/A1/"
+cp doc/review-v0.5/A1-*.md doc/review-v0.5/A-RULES-OF-ENGAGEMENT.md "$HUSK_REVIEW_ROOT/A1/"
 ```
 Put in it *only*: the reviewer's brief and the rules of engagement — nothing else. A fresh
 directory per reviewer is what keeps one reviewer's writes from being read as the next one's

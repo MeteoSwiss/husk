@@ -1,7 +1,7 @@
 # A8 — can a teaching message be turned into a tool?
 
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
-· bound by the **rules of engagement** in `review-v0.5-questions.md`
+· bound by the **rules of engagement** in `A-RULES-OF-ENGAGEMENT.md`
 
 ## The question
 

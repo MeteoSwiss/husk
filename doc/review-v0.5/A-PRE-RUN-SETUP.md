@@ -79,8 +79,9 @@ clean them up yourself when A6 is done — never leave held jobs around.
 
 ## 5. The rules of engagement go into every brief
 
-Each reviewer is handed its brief *and* the rules-of-engagement section of
-`review-v0.5-questions.md`, verbatim. On a real shared cluster these are not optional: stop at
+Each reviewer is handed its brief *and* `A-RULES-OF-ENGAGEMENT.md` (the reviewer-facing extract
+of the rules, verbatim — not the full `review-v0.5-questions.md`, which would leak the other
+briefs and the B/C plan into the cage). On a real shared cluster these are not optional: stop at
 proof of concept, canaries not real secrets, never cancel or disturb another user's work, no
 pivoting to real targets even when reachable, and on a live/ongoing escape **halt and report**
 rather than press it. A reviewer that ignores these can damage the cluster; the single-reviewer,

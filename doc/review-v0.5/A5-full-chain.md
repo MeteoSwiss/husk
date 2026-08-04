@@ -1,7 +1,7 @@
 # A5 — the full chain: `sbatch → broker → srun → broker → ranks`
 
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
-· bound by the **rules of engagement** in `review-v0.5-questions.md`
+· bound by the **rules of engagement** in `A-RULES-OF-ENGAGEMENT.md`
 
 > **Refreshed 2026-08-03, after the v0.5 fixes.** The chain still has four layers and the
 > cross-hop question is unchanged, but **both ends moved**: the top now submits on stdin with a

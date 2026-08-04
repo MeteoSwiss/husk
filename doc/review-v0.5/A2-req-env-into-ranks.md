@@ -1,7 +1,7 @@
 # A2 — `req.env`, forwarded into rank cages
 
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
-· bound by the **rules of engagement** in `review-v0.5-questions.md`
+· bound by the **rules of engagement** in `A-RULES-OF-ENGAGEMENT.md`
 
 > **Refreshed 2026-08-03, after the v0.5 fixes.** The environment path itself is UNCHANGED —
 > `env_args`, the reserved prefixes, the name grammar and the bound are all as they were, so
