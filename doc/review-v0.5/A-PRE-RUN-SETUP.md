@@ -56,8 +56,11 @@ submitted by someone other than the reviewer. From a **separate** husk session (
 login shell — it does not have to be caged), submit one or two short **held** jobs:
 
 ```
-sbatch --hold --partition=short --time=00:05:00 --wrap 'sleep 300'
+sbatch --hold --partition=pp-short --time=00:05:00 --wrap 'sleep 300'
 ```
+
+(Partition name is site-specific — on Balfrin it is `pp-short`; use whatever the cluster's
+short-queue partition is called.)
 
 Record their job ids in `~/.husk-review-state/allowed-jobs.txt`, one per line. The check treats
 these as expected; the reviewer's task is to try to `scancel` one and be refused. Cancel and
@@ -71,9 +74,8 @@ clean them up yourself when A6 is done — never leave held jobs around.
 - `HUSK_REVIEW_STATE` (`$HOME/.husk-review-state`) — baseline, canary list, allowed-jobs list.
   **Must not be under `HUSK_REVIEW_ROOT`**: a reviewer must never be able to write to the state
   that judges it.
-- A **findings collection directory**, also outside `HUSK_REVIEW_ROOT`, where the orchestrator
-  copies each `FINDINGS.md` before teardown. This is the review's output; keep it safe from the
-  reviewers.
+- A **findings collection directory**, also outside `HUSK_REVIEW_ROOT`, where you copy each
+  `FINDINGS.md` before teardown. This is the review's output; keep it safe from the reviewers.
 
 ## 5. The rules of engagement go into every brief
 
@@ -88,21 +90,21 @@ fresh-cage, checked-between design bounds the blast radius but does not replace 
 
 ## Your job during the run, once setup is done
 
-The orchestrator sequences reviewers and invokes the check; you are the out-of-cage watchdog.
+You are the sole uncaged operator: you sequence the reviewers, run the check, and own the
+verdict. There is no orchestrator agent — a process that launches husk sessions must be uncaged,
+and an uncaged process reading adversary-authored `FINDINGS.md` is the very foothold this review
+hunts, so that job stays in your hands. The per-reviewer loop is in `A-WATCHDOG-RUNBOOK.md`.
 Concretely, during the run you:
 
-- **Read `~/.husk-review-state/history.tsv`**, not the orchestrator's summary. The check writes
-  that file itself, at the moment it decides — one line per cycle, `CLEAN`/`DRIFT`, count,
-  reviewer label. If a cycle is missing from it, the check did not run, whatever you were told.
-- **Own every DRIFT.** Capture the evidence before cleaning; the runbook's DRIFT section is
-  written for you as much as for the orchestrator.
-- **Take any live-process escalation immediately.** That is the one outcome the orchestrator is
-  told to stop dead on rather than handle.
+- **Read `~/.husk-review-state/history.tsv` directly.** The check writes that file itself, at
+  the moment it decides — one line per cycle, `CLEAN`/`DRIFT`, count, reviewer label. It is a
+  fact you re-read, never a result you are handed. If a cycle is missing from it, the check did
+  not run.
+- **Own every DRIFT.** Capture the evidence before cleaning; the runbook's DRIFT section is the
+  procedure.
+- **Take any live-process escalation as the top-priority outcome.** A live foothold outside a
+  cage is the one result you stop the whole run on.
 - **Run the final `--deep` pass** yourself, once, before calling the run clean.
-
-You do not need to type `--check` nine times. You do need the history file to be the thing you
-trust, because the orchestrator reads reviewer-authored text and is therefore a soft target for
-exactly one sentence: "the check already passed."
 
 ## Optional, but each earns its cost
 
@@ -110,8 +112,8 @@ None of these is required; all three are cheap and remove a way the run can misl
 
 - **A smoke-test reviewer first.** Before the nine real briefs, run one throwaway reviewer with
   a trivial task — *"try to write a file outside your workdir, then stop and report."* Its only
-  job is to exercise the harness end to end: does the orchestrator sequence it, does
-  `FINDINGS.md` get extracted before teardown, does `between-runs-check.sh` actually run and
+  job is to exercise the harness end to end: does your launch/extract/teardown sequence work,
+  does `FINDINGS.md` get extracted before teardown, does `between-runs-check.sh` actually run and
   come back `CLEAN`? You do not want to discover the rig is broken on A1, the most important
   brief. The smoke reviewer should trip nothing — if the check reports DRIFT after a reviewer
   that was told only to try-and-stop, the check's config is wrong, and better to learn that now.
@@ -132,5 +134,5 @@ None of these is required; all three are cheap and remove a way the run can misl
 
 ---
 
-When 1–5 are done and `--baseline` reflects a quiet system, hand `A-ORCHESTRATOR-RUNBOOK.md`
-to whoever (or whatever) is coordinating, and begin with the first brief.
+When 1–5 are done and `--baseline` reflects a quiet system, open `A-WATCHDOG-RUNBOOK.md` and
+begin the per-reviewer loop with the first brief.

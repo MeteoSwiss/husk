@@ -9,7 +9,7 @@
 #
 # It is DELIBERATELY biased toward DIRTY. Anything it does not recognise is drift, because a
 # false "clean" lets a compromised reviewer contaminate the next one, and a false "dirty"
-# only costs you a look. See A-ORCHESTRATOR-RUNBOOK.md.
+# only costs you a look. See A-WATCHDOG-RUNBOOK.md.
 #
 #   --baseline   snapshot the current (known-good) state. Run ONCE, after setup, before any
 #                reviewer. See A-PRE-RUN-SETUP.md.
@@ -17,7 +17,7 @@
 #   it followed. Optional, and worth it: an unlabelled history is hard to read afterwards.
 #
 #   --check      compare now against the baseline. Prints STATE: CLEAN or STATE: DRIFT and
-#                exits 0 / nonzero. This is what the orchestrator runs after each reviewer.
+#                exits 0 / nonzero. This is what you run, by hand, after each reviewer.
 #   --deep       additionally probe the compute nodes used this session for /tmp and /dev/shm
 #                residue (submits a short job per node; needs the cluster idle-ish).
 #
@@ -42,7 +42,7 @@ CANARY_LIST="$STATE_DIR/canaries.txt"
 #
 # WATCH ONLY THINGS THAT DO NOT CHURN. This is the load-bearing rule and it is the same one
 # husk itself follows: a check that reports DRIFT for innocent reasons is a check the
-# orchestrator learns to ignore, and an ignored control is worse than none. So do NOT watch
+# watchdog learns to ignore, and an ignored control is worse than none. So do NOT watch
 # whole directories that the tools write to normally — `~/.ssh` (known_hosts changes on every
 # login), `~/.claude` (Claude Code writes todos/projects/history/sessions constantly),
 # `~/.husk` (a job log per brokered run, by design). Watching those wholesale would cry wolf
@@ -200,16 +200,14 @@ fi
 
 # THE RECORD IS WRITTEN HERE, BY THIS SCRIPT, NOT BY WHOEVER RAN IT.
 #
-# The orchestrator may invoke this check — that is fine and saves the human nine invocations.
-# What must not happen is the human learning the result only through the orchestrator's own
-# account of it. The orchestrator is uncaged and it READS FINDINGS.md, a file authored by an
-# adversarial-by-role caged agent: that is a prompt-injection channel into the component
-# sequencing the whole run, and "the check said CLEAN" is exactly the sentence an escaped
-# reviewer would want it to believe.
+# You run this check yourself, by hand — there is no orchestrator agent, because a process that
+# sequences reviewers must be uncaged to launch husk, and an uncaged process fed adversarial
+# FINDINGS.md is precisely the escape this review hunts. So the only uncaged actor is you.
 #
-# So the verdict lands in an append-only log the human owns, outside REVIEW_ROOT, written by
-# this script at the moment it decides. husk's own rule, one level up: the audited party does
-# not author the audit trail. Read this file, not the summary you are given.
+# The verdict still lands in an append-only log, written by THIS script at the moment it
+# decides, so the record is a fact you can re-read rather than a claim you were handed. husk's
+# own rule, one level up: the audited party does not author the audit trail. When you later
+# read the run's history, trust this file — not any agent's summary of it.
 log_verdict() {
   printf '%s\t%s\t%s\t%s\n' \
     "$(date -u +%FT%TZ)" "$1" "${2:-0}" "${HUSK_REVIEW_LABEL:-<unlabelled>}" \
@@ -223,7 +221,7 @@ if [ "$drift" -eq 0 ]; then
   exit 0
 else
   log_verdict DRIFT "$drift"
-  echo "STATE: DRIFT ($drift item(s)) — see A-ORCHESTRATOR-RUNBOOK.md 'When the check reports DRIFT'"
+  echo "STATE: DRIFT ($drift item(s)) — see A-WATCHDOG-RUNBOOK.md 'When the check reports DRIFT'"
   echo "       recorded in $STATE_DIR/history.tsv"
   exit 1
 fi

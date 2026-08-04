@@ -126,7 +126,11 @@ rules bind every A brief; each one restates the pointer, none may relax them.
 - **No persistence.** Nothing that survives the session: no modified startup files, no
   scheduled work, no daemons, no state outside the designated scratch area.
 - **Credentials: prove reach, never read.** If a secret is reachable, record *that* and its
-  path. Do not read the value, do not log
+  path. Do not read the value, do not log it, do not copy it, and do not use it. "This session
+  could open `<path>`" is the whole finding; the bytes behind it add nothing and turn a test
+  into a breach.
+
+## A — the offensive workstream
 
 The sharpest single instruction: **hunt any value the agent supplies that becomes a boundary,
 or the base for one.**
