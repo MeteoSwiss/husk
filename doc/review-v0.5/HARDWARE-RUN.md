@@ -14,7 +14,7 @@ decides whether the CRITICAL is closed or merely narrowed.
 
 ```bash
 cd ~/mch/agentskills-internal
-git log --oneline -12                      # expect 24a4b81 at the top
+git log --oneline -12                      # expect ec0f677 at the top
 (cd slurm-broker && ./build-release.sh)    # per-arch binaries
 ./install-husk.sh                          # REQUIRED: merges the new sandbox denyWrite
 grep -n 'Rprofile\|hg/hgrc' ~/.claude/settings.json   # must now list both
