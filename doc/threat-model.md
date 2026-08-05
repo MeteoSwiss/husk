@@ -31,12 +31,16 @@ Two things follow directly:
   vendor sandbox may be *run* for defence in depth; the guarantee never routes
   through it.
 - **Generality is not a feature.** Because no agent is on the enforcement path, husk
-  wraps Claude, a closed third-party agent, or a self-hosted open-weight model
-  identically. That falls out of the trust model.
+  wraps the reference integration, a closed third-party agent, or a self-hosted
+  open-weight model identically. That falls out of the trust model — and it is also
+  what makes the premise pay for itself against §2.2, where the thing being confined
+  is a vendor binary nobody can read.
 
 ---
 
 ## 2. Adversary
+
+### 2.1 The agent
 
 Two vectors with the same output, not distinguished by any control:
 
@@ -63,6 +67,35 @@ scheduler, the fabric, or site admin policy.
 **The human is inattentive by default.** No control may depend on careful review of
 an individual prompt or approval. The primary use case is an unattended multi-day
 run with nobody present. §7 lists what this assumption still costs.
+
+### 2.2 The harness binary itself
+
+**The second adversary is the vendor's code, and it is not the model.** husk wraps a
+*process*, and an agent harness is shipped as a closed binary — typically several
+hundred megabytes of it, updated on the vendor's schedule, with a telemetry client, a
+crash reporter, an auto-updater and an analytics path somewhere inside. None of that
+is auditable, none of it is the LLM, and all of it runs with the user's uid, the
+user's filesystem reach and the user's cluster identity.
+
+That matters more here than on a laptop, because of where it runs. The home directory
+holds SSH keys and cluster credentials. The project directory holds unpublished
+research. The node sits inside an institution's network next to other people's jobs.
+"This binary decides what leaves that machine" is not a hypothetical governance
+question for a public weather service; it is the question.
+
+**The distinguishing property is that no agent-level control applies to it.** Prompt
+policy, tool permissions, approval dialogs and a runtime's own sandbox are all things
+the vendor's code implements or ignores at its discretion — asking a binary to confine
+itself is asking the confined party for cooperation, which §1 rules out. Against this
+adversary **only the wrapped layers count**: what is not in the mount namespace cannot
+be read, and what has no route cannot be sent. Everything mediated by the agent's own
+policy is, for this adversary, not a control at all.
+
+It realises the same harms as §2.1 — H2, H6 and H8 in particular — so it needs no new
+IDs. What it changes is *which controls are load-bearing*, and it is an **independent
+reason to wrap the whole harness** rather than each command it spawns: even a perfectly
+behaved model does not make the binary around it auditable. Trust in a particular
+vendor is not a security property, and it is not transferable to the next one.
 
 ---
 

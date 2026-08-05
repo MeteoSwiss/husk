@@ -13,7 +13,8 @@ in that sentence is a scope limit and each is deliberate:
   administer. There is no root, no daemon, no site cooperation required. That is what makes
   it deployable on a shared cluster, and it is also the ceiling on what it can promise.
 - **For LLM agents** — the adversary model is a capable, non-malicious system that will do
-  surprising things with credentials, allocations and other people's jobs. Not malware.
+  surprising things with credentials, allocations and other people's jobs. Not malware. But
+  see below: the model is not the only thing in the process.
 - **On supercomputers** — shared login nodes, a batch scheduler, other people's work running
   next to yours, and a home directory full of things worth protecting.
 
@@ -34,6 +35,30 @@ not something husk can verify or a future version guarantee (`P2`).
 This has a precise consequence that shapes everything below. The obligation on an agent is
 **not cooperation but tolerance**: it does not have to help, it only has to keep working
 while restricted. Nothing is delegated to it, so nothing about it has to be trusted.
+
+### 1.1 What is wrapped is a process, not a model
+
+**husk wraps the harness binary, and that is a second reason rather than an implementation
+detail.** An agent harness ships as a closed binary — hundreds of megabytes, updated on the
+vendor's schedule, containing a telemetry client, a crash reporter, an auto-updater and
+whatever else the vendor chose. None of it is auditable and none of it is the model, yet all
+of it runs with the user's uid, filesystem reach and cluster identity.
+
+So the boundary is not only "what might the LLM be talked into doing" but **"what does this
+opaque process do on a machine that holds SSH keys, unpublished research and other people's
+jobs"**. Those are different questions with the same answer, and the second one does not go
+away if the model behaves perfectly.
+
+It also cannot be answered by anything the vendor supplies. A runtime's own sandbox, its
+permission prompts and its tool policy are all implemented by the code in question, which is
+the confined party — and §1 does not accept the confined party's word for the shape of its
+own cage. **Against this adversary only the wrapped layers count**: what is not mounted
+cannot be read, what has no route cannot be sent. This is why husk aims to own the outer
+boundary rather than configure someone else's, and why the contract below asks nothing of the
+agent's internals — trusting a specific vendor is not a security property, and it does not
+transfer to the next one.
+
+See [threat-model.md §2.2](threat-model.md).
 
 **Two mechanisms, one principle:**
 
