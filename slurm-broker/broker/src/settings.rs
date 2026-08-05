@@ -934,7 +934,10 @@ impl FsPolicy {
                     a.push(p);
                 }
                 Op::Allow(p) => {
-                    a.push("--ro-bind".into());
+                    // `-try`: a carve-out whose source is missing must not kill every job
+                    // with a bwrap message that never says husk. A bad carve-out is already
+                    // reported loudly at resolve time ("REFUSED the filesystem carve-out").
+                    a.push("--ro-bind-try".into());
                     a.push(p.clone());
                     a.push(p);
                 }
@@ -985,30 +988,38 @@ impl FsPolicy {
             // helper F22 introduced for exactly this, and it also gets `~/x` right (there
             // is nothing to re-bind under a hidden home).
             let Some(p) = abs_for_cage(p, workdir) else { continue };
-            // …and ONLY when the path is really there. **A BIND WHOSE SOURCE IS MISSING
-            // KILLS THE CAGE OUTRIGHT** — bwrap exits before the job runs, with a message
-            // that never says "husk". Balfrin 5014767/5014768/5014769, three dead jobs:
+            // **AND `-try`, BECAUSE A STAT HERE CANNOT BE TRUSTED.** A bind whose source is
+            // missing kills the cage outright — bwrap exits before the job runs, with a
+            // message that never says "husk":
             //
             //   bwrap: Can't find source path <workdir>/.claude/settings.json: No such file
             //
-            // The latent bug was always here (an absolute denyWrite of an absent path did
-            // the same); resolving relative entries is what made it fire, because the
-            // SHIPPED config lists `.claude/settings.json` and most projects have no such
-            // file. Fail-closed, and still an outage on every brokered job.
+            // The first fix was to skip the entry when the path does not exist. That fixed
+            // the selftest and did NOT fix real jobs, because the existence check is a
+            // TOCTOU across two machines: husk stats on the LOGIN node at submit time, bwrap
+            // binds on a COMPUTE node when the job starts.
             //
-            // Skipping the absent case is not a hole. denyWrite's job is to make an
-            // EXISTING readable path unwritable; stopping a dangerous path from being
-            // CREATED is the auto-exec mask's job below, which is shape-aware and
-            // absent-safe by construction and already covers `.claude`, `.git`, `.hg`,
-            // `.Rprofile` and `.mcp.json` — `.claude/settings.json` is inside a `--tmpfs`
-            // there, which is strictly stronger than a read-only bind. What B3-F8 actually
-            // buys is a relative deny on something the auto-exec set does NOT cover
-            // (`notes/secret.txt`), and that case is honoured exactly when the file exists.
-            if !std::path::Path::new(&p).exists() {
-                continue;
-            }
+            // What fills that window is not chance, it is the neighbouring cage. `sbatch`
+            // runs inside a login-cage Bash command, and the vendor runtime protects a
+            // non-existent deny path by binding `/dev/null` over it — which makes bwrap
+            // create an empty file on the HOST as the mount point, inside the project
+            // directory, for exactly as long as that command runs. So husk stats
+            // `.claude/settings.json` during the one moment it exists, emits a hard bind for
+            // it, the command ends, the runtime deletes its ghost, and the job dies minutes
+            // later on a node that never saw the file. Deterministic, and invisible to any
+            // test that does not call the broker from inside a husk session — which is why
+            // 91/0/0 on both clusters said nothing about it.
+            //
+            // `--ro-bind-try` is the answer, and the stat is dropped rather than kept as
+            // decoration: whether the file is there is a question only the compute node can
+            // answer, so let bwrap answer it. For a DENY, tolerating a missing source means
+            // "protect it if it is there" — and the absent case is not a hole, because
+            // stopping a dangerous path from being CREATED is the auto-exec mask's job
+            // below, which is shape-aware and absent-safe and already covers `.claude`,
+            // `.git`, `.hg`, `.Rprofile` and `.mcp.json`. `.claude/settings.json` sits inside
+            // a `--tmpfs` there, which is strictly stronger than a read-only bind.
             if p.starts_with('/') && !path_under_floor(&p) {
-                a.push("--ro-bind".into());
+                a.push("--ro-bind-try".into());
                 a.push(p.clone());
                 a.push(p.clone());
             }
@@ -1112,7 +1123,10 @@ impl FsPolicy {
                     // pointer is what must not be rewritten, and what it names is outside.
                     Ok(m) if m.is_file() => {
                         let p = format!("{root}/{dir}");
-                        a.push("--ro-bind".into());
+                        // `-try`: the SHAPE was read on the login node at submit time and
+                        // acted on by a compute node later. If it changed in between there is
+                        // nothing to protect, and killing the job is the wrong answer.
+                        a.push("--ro-bind-try".into());
                         a.push(p.clone());
                         a.push(p);
                     }
@@ -1157,7 +1171,13 @@ impl FsPolicy {
             if matches!(std::fs::symlink_metadata(format!("{root}/.hg")), Ok(m) if m.is_dir()) {
                 let path = format!("{root}/.hg/hgrc");
                 let src = if std::path::Path::new(&path).exists() { path.clone() } else { "/dev/null".to_string() };
-                a.push("--ro-bind".into());
+                // `-try`, for the reason spelled out at the denyWrite loop: this stat runs on
+                // the LOGIN node at submit time while bwrap binds on a COMPUTE node later, and
+                // the login cage creates and deletes ghost mount points in this very
+                // directory. `.Rprofile` and `.hg/hgrc` are BOTH in the shipped login
+                // denyWrite (A4-F3), so both are ghost-created there — a hard bind on either
+                // is the same outage as `.claude/settings.json`, waiting its turn.
+                a.push("--ro-bind-try".into());
                 a.push(src);
                 a.push(path);
             }
@@ -1170,7 +1190,13 @@ impl FsPolicy {
             for rel in AUTO_EXEC_RO_OR_EMPTY {
                 let path = format!("{root}/{rel}");
                 let src = if std::path::Path::new(&path).exists() { path.clone() } else { "/dev/null".to_string() };
-                a.push("--ro-bind".into());
+                // `-try`, for the reason spelled out at the denyWrite loop: this stat runs on
+                // the LOGIN node at submit time while bwrap binds on a COMPUTE node later, and
+                // the login cage creates and deletes ghost mount points in this very
+                // directory. `.Rprofile` and `.hg/hgrc` are BOTH in the shipped login
+                // denyWrite (A4-F3), so both are ghost-created there — a hard bind on either
+                // is the same outage as `.claude/settings.json`, waiting its turn.
+                a.push("--ro-bind-try".into());
                 a.push(src);
                 a.push(path);
             }
@@ -1709,7 +1735,7 @@ mod tests {
             "a .git FILE must not be masked as a directory - that kills the cage: {a}"
         );
         assert!(
-            a.contains(&format!("--ro-bind {}/.git {}/.git", wt.display(), wt.display())),
+            a.contains(&format!("--ro-bind-try {}/.git {}/.git", wt.display(), wt.display())),
             "a .git file is a pointer to a real repo and must be read-only: {a}"
         );
 
@@ -1721,7 +1747,7 @@ mod tests {
         let a = p.compute_bwrap_args(&bare.to_string_lossy()).join(" ");
         assert!(a.contains(&format!("--tmpfs {}/.hg ", bare.display())), "{a}");
         assert!(
-            a.contains(&format!("--ro-bind /dev/null {}/.Rprofile", bare.display())),
+            a.contains(&format!("--ro-bind-try /dev/null {}/.Rprofile", bare.display())),
             "an absent .Rprofile must be masked empty, not left creatable: {a}"
         );
 
@@ -1729,7 +1755,7 @@ mod tests {
         std::fs::create_dir_all(hg.join(".hg")).unwrap();
         let a = p.compute_bwrap_args(&hg.to_string_lossy()).join(" ");
         assert!(
-            a.contains(&format!("--ro-bind /dev/null {}/.hg/hgrc", hg.display())),
+            a.contains(&format!("--ro-bind-try /dev/null {}/.hg/hgrc", hg.display())),
             "an hgrc that does not exist yet must not be creatable: {a}"
         );
 
@@ -1739,7 +1765,7 @@ mod tests {
         std::fs::write(with_r.join(".Rprofile"), "options(digits=7)\n").unwrap();
         let a = p.compute_bwrap_args(&with_r.to_string_lossy()).join(" ");
         assert!(
-            a.contains(&format!("--ro-bind {}/.Rprofile {}/.Rprofile", with_r.display(), with_r.display())),
+            a.contains(&format!("--ro-bind-try {}/.Rprofile {}/.Rprofile", with_r.display(), with_r.display())),
             "a legitimate .Rprofile must stay readable: {a}"
         );
 
@@ -1772,7 +1798,7 @@ mod tests {
             !a.contains("--ro-bind /users /users"),
             "a denyWrite under the floor must not bind the floor back into the cage: {a}"
         );
-        assert!(a.contains(&format!("--ro-bind {realp} {realp}")), "ordinary denyWrite still works: {a}");
+        assert!(a.contains(&format!("--ro-bind-try {realp} {realp}")), "ordinary denyWrite still works: {a}");
         let _ = std::fs::remove_dir_all(&real);
 
         for bad in ["/", "//", "/."] {
@@ -1908,7 +1934,7 @@ mod tests {
         let args = p.compute_bwrap_args("/users/x/proj");
         let cmd = args.join(" ");
         // miniconda carve-out present as a read-only bind...
-        assert!(cmd.contains("--ro-bind /users/x/miniconda3 /users/x/miniconda3"));
+        assert!(cmd.contains("--ro-bind-try /users/x/miniconda3 /users/x/miniconda3"));
         // ...and applied AFTER the /users tmpfs so it actually re-exposes it.
         let hide = args.iter().position(|a| a == "/users").unwrap();
         let allow = args.iter().position(|a| a == "/users/x/miniconda3").unwrap();
@@ -2251,7 +2277,7 @@ mod tests {
             ..Default::default()
         };
         let args = p.compute_bwrap_args("/work");
-        assert!(args.join(" ").contains(&format!("--ro-bind {s_prot} {s_prot}")));
+        assert!(args.join(" ").contains(&format!("--ro-bind-try {s_prot} {s_prot}")));
         let wr = args.iter().position(|a| a == &s_scr).unwrap();
         let ro = args.iter().position(|a| a == &s_prot).unwrap();
         assert!(wr < ro, "denyWrite ro-bind must follow the allowWrite bind to win");
@@ -2315,6 +2341,73 @@ mod tests {
     }
 
     #[test]
+    fn nothing_inside_the_project_dir_is_bound_hard_because_that_directory_moves() {
+        // **THE INVARIANT THE ICON OUTAGE TAUGHT, and the one worth keeping.**
+        //
+        // husk builds bwrap arguments on the LOGIN node at submit time; bwrap consumes them
+        // on a COMPUTE node when the job starts. Every existence check in between is a
+        // TOCTOU across two machines and an unbounded queue wait — and the project directory
+        // is the one place where something is actively creating and deleting files in that
+        // window. `sbatch` runs inside a login-cage Bash command, and the vendor runtime
+        // protects a non-existent deny path by binding `/dev/null` over it, which makes bwrap
+        // create an empty file ON THE HOST as its mount point, in the project directory, for
+        // exactly as long as that command runs.
+        //
+        // So husk stat'd `.claude/settings.json` during the one moment it existed, emitted a
+        // hard bind, the command ended, the runtime deleted its ghost, and every ICON job
+        // died minutes later with a bwrap error that never said "husk". `.Rprofile` and
+        // `.hg/hgrc` were the same bug waiting its turn — both are in the shipped login
+        // denyWrite, so both get ghost-created too.
+        //
+        // The rule, asserted rather than remembered: **anything strictly below the workdir
+        // is bound with `-try`.** The workdir bind ITSELF stays hard — if the project
+        // directory is gone the job must die, and that is not a race, it is a fact.
+        let root = std::env::temp_dir().join(format!("husk-noharden-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::create_dir_all(root.join(".hg")).unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        // Everything the login cage might have ghosted into existence a moment ago.
+        for f in [".claude/settings.json", ".hg/hgrc", ".Rprofile", ".mcp.json", "notes/x.txt"] {
+            std::fs::write(root.join(f), b"").unwrap();
+        }
+        let w = root.to_string_lossy().to_string();
+        let p = FsPolicy {
+            deny_write: vec![
+                ".claude/settings.json".into(),
+                ".hg/hgrc".into(),
+                "notes/x.txt".into(),
+            ],
+            ..Default::default()
+        };
+        let args = p.compute_bwrap_args(&w);
+
+        let mut i = 0;
+        while i < args.len() {
+            let op = args[i].as_str();
+            if matches!(op, "--bind" | "--ro-bind" | "--dev-bind") {
+                let (src, dest) = (&args[i + 1], &args[i + 2]);
+                let below = dest.starts_with(&format!("{w}/"));
+                assert!(
+                    !below || src == "/dev/null",
+                    "`{op} {src} {dest}` is a HARD bind below the project dir. That directory \
+                     has files created and removed in it while husk is deciding — the ICON \
+                     outage was exactly this. Use --ro-bind-try."
+                );
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        // …and the workdir itself is still hard, because its absence is not a race.
+        assert!(
+            args.windows(3).any(|c| c[0] == "--bind" && c[1] == w && c[2] == w),
+            "the workdir bind must stay unconditional: {args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_relative_deny_write_is_honoured_on_compute_too() {
         // **B3-F8.** `deny_write` was the one field F22 never reached. It tested
         // `starts_with('/')` directly, so a RELATIVE entry — the natural spelling for a
@@ -2346,24 +2439,28 @@ mod tests {
         };
         let args = p.compute_bwrap_args(&w).join(" ");
         assert!(
-            args.contains(&format!("--ro-bind {w}/.claude/settings.json {w}/.claude/settings.json")),
+            args.contains(&format!("--ro-bind-try {w}/.claude/settings.json {w}/.claude/settings.json")),
             "a relative denyWrite must be resolved against the workdir: {args}"
         );
         assert!(
-            args.contains(&format!("--ro-bind {w}/notes/protected.txt")),
+            args.contains(&format!("--ro-bind-try {w}/notes/protected.txt")),
             "`./` is the same spelling: {args}"
         );
-        assert!(args.contains(&format!("--ro-bind {a_abs}")), "absolute still works: {args}");
+        assert!(args.contains(&format!("--ro-bind-try {a_abs}")), "absolute still works: {args}");
         // `~/x` stays dropped, and that is correct rather than an oversight: a bind EXPOSES
         // ITS SOURCE, so re-binding a home path would punch it back through the `--tmpfs
         // /users` floor that exists to remove it — a deny that grants.
         assert!(!args.contains(".ssh/config"), "a home path must not be bound back in: {args}");
-        // And the case that killed the Balfrin jobs: a relative entry naming a file that is
-        // NOT there must be silently skipped, never emitted as a bind bwrap cannot satisfy.
+        // And the case that killed the Balfrin jobs, in its final form. The first attempt
+        // SKIPPED an entry whose path did not exist — which fixed the selftest and not the
+        // cluster, because the stat runs on the login node and bwrap runs on a compute node
+        // later. The answer is not a better check; it is to stop checking and let bwrap
+        // decide at the only moment that can be right.
         let p2 = FsPolicy { deny_write: vec![".claude/settings.local.json".into()], ..Default::default() };
+        let a2 = p2.compute_bwrap_args(&w).join(" ");
         assert!(
-            !p2.compute_bwrap_args(&w).join(" ").contains("settings.local.json"),
-            "an absent denyWrite must not become a bind — bwrap would exit before the job ran"
+            !a2.contains(&format!("--ro-bind {w}/.claude/settings.local.json")),
+            "an absent denyWrite must never be a HARD bind — bwrap exits before the job runs: {a2}"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&abs);
