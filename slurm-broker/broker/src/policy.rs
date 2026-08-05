@@ -1020,6 +1020,8 @@ fn wrap_script(
     let mask_paths = settings::CREDENTIAL_SOCKET_DIRS.join(" ");
     let sec = profile.seccomp_profile();
     let (broker_path, stub_path, socat_path) = husk_paths();
+    // One definition of the heartbeat's name: the step broker writes it, the guard reclaims it.
+    let heartbeat = crate::step::StepBroker::HEARTBEAT;
     let broker_q = settings::sh_quote(&broker_path);
     let stub_q = settings::sh_quote(&stub_path);
     let socat_q = settings::sh_quote(&socat_path);
@@ -1488,8 +1490,14 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
       || echo \"husk: kept $_husk_shm - it is not empty\" >>\"$_husk_log\" 2>/dev/null\n\
   fi\n\
   if [ -n \"$_husk_spool\" ] && [ -d \"$_husk_spool\" ]; then\n\
+    # NOTE THE SHAPE: this line NAMES what it removes, so every artifact anyone adds to\n\
+    # the spool must be added here too, or the rmdir below fails and the whole spool leaks.\n\
+    # A cleanup that enumerates is a denylist. It cost three selftest failures the day the\n\
+    # broker heartbeat arrived (2026-08-06), caught on hardware by the arm that exists for\n\
+    # exactly this. The glob comes from the Rust constant so there is one definition, and it\n\
+    # covers the write-and-rename temp as well as the heartbeat itself.\n\
     rm -f \"$_husk_spool\"/req-*.json \"$_husk_spool\"/resp-*.json 2>/dev/null\n\
-    rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* 2>/dev/null\n\
+    rm -f \"$_husk_spool\"/out-* \"$_husk_spool\"/err-* \"$_husk_spool\"/{heartbeat}* 2>/dev/null\n\
     if rmdir \"$_husk_spool\" 2>/dev/null; then\n\
       echo \"husk: step spool removed\" >>\"$_husk_log\" 2>/dev/null\n\
     else\n\
@@ -2163,6 +2171,44 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).to_string(),
             String::from_utf8_lossy(&out.stderr).to_string(),
         )
+    }
+
+    #[test]
+    fn the_guard_reclaims_every_file_the_step_broker_leaves_in_the_spool() {
+        // **2026-08-06, three selftest failures on Balfrin.** The guard's spool cleanup NAMES
+        // what it deletes (`req-*`, `resp-*`, `out-*`, `err-*`) and then `rmdir`s. Adding a
+        // fifth artifact — the broker heartbeat — without adding it here left the directory
+        // non-empty, so the rmdir failed and the whole spool leaked on every path: clean
+        // exit, signalled job, and real jobs alike.
+        //
+        // A cleanup that enumerates is a denylist, and this is what that costs. The list is
+        // kept because the "kept … it still holds:" message is a deliberate diagnostic — a
+        // wholesale `rm -rf` would reclaim the directory and destroy the signal that
+        // something unexpected was in it. So the enumeration stays and this test guards it.
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &[],
+            profile::Profile::SingleNode,
+            "/work/project",
+            false,
+            &["/work/project".to_string()],
+        );
+        let cleanup = script
+            .split_once("_husk_spool\"/req-")
+            .expect("the spool cleanup must exist")
+            .1;
+        let cleanup = &cleanup[..cleanup.len().min(600)];
+        assert!(
+            cleanup.contains(crate::step::StepBroker::HEARTBEAT),
+            "the cleanup must reclaim the heartbeat, or every spool leaks: {cleanup}"
+        );
+        // From the constant, not a copy of the string — two spellings of one name is how
+        // this diverges again the next time either side is renamed.
+        assert!(
+            script.contains(&format!("{}*", crate::step::StepBroker::HEARTBEAT)),
+            "and by glob, so the write-and-rename temp goes with it: {cleanup}"
+        );
     }
 
     #[test]

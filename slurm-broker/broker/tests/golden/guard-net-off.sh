@@ -224,8 +224,14 @@ rmdir "$_husk_shm" 2>/dev/null \
 || echo "husk: kept $_husk_shm - it is not empty" >>"$_husk_log" 2>/dev/null
 fi
 if [ -n "$_husk_spool" ] && [ -d "$_husk_spool" ]; then
+# NOTE THE SHAPE: this line NAMES what it removes, so every artifact anyone adds to
+# the spool must be added here too, or the rmdir below fails and the whole spool leaks.
+# A cleanup that enumerates is a denylist. It cost three selftest failures the day the
+# broker heartbeat arrived (2026-08-06), caught on hardware by the arm that exists for
+# exactly this. The glob comes from the Rust constant so there is one definition, and it
+# covers the write-and-rename temp as well as the heartbeat itself.
 rm -f "$_husk_spool"/req-*.json "$_husk_spool"/resp-*.json 2>/dev/null
-rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* 2>/dev/null
+rm -f "$_husk_spool"/out-* "$_husk_spool"/err-* "$_husk_spool"/broker.alive* 2>/dev/null
 if rmdir "$_husk_spool" 2>/dev/null; then
 echo "husk: step spool removed" >>"$_husk_log" 2>/dev/null
 else

@@ -147,7 +147,9 @@ impl StepBroker {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         let path = self.spool.join(Self::HEARTBEAT);
-        let tmp = self.spool.join(".broker.alive.tmp");
+        // Named as a SUFFIX of the heartbeat, not a dotfile, so the guard's cleanup can
+        // reclaim both with one `broker.alive*` glob instead of listing them.
+        let tmp = self.spool.join(format!("{}.tmp", Self::HEARTBEAT));
         // Write-and-rename: the stub reads this concurrently, and a torn read would look
         // like a stale broker — i.e. it would manufacture exactly the failure it detects.
         if fs::write(&tmp, format!("{now:.3}\n")).is_ok() && fs::rename(&tmp, &path).is_err() {
@@ -519,7 +521,7 @@ mod tests {
         // No temp file left beside it: the stub globs this directory looking for its own
         // response, and litter in an agent-writable spool is its own small problem.
         assert!(
-            !dir.join(".broker.alive.tmp").exists(),
+            !dir.join(format!("{}.tmp", super::StepBroker::HEARTBEAT)).exists(),
             "the write-and-rename temp must not survive"
         );
         let _ = std::fs::remove_dir_all(&dir);
