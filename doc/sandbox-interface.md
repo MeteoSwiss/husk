@@ -1,5 +1,13 @@
-Sandbox interface spec
-======================
+# Sandbox interface spec
+
+> **⚠ STALE — read with care (flagged 2026-08-05).** This describes a v0.2/v0.3 contract
+> and cites harm IDs against a threat model that has since moved (H10/H11 added, the
+> bash-vs-native-tool asymmetry closed by `--tools Bash`). It is nonetheless the
+> **acceptance criterion for ROADMAP 6b** — the test is that the string `claude` appears
+> nowhere in it except as one integration among others — so it is worth rewriting *before*
+> 6a rather than after. Until then, treat [PRINCIPLES.md](PRINCIPLES.md),
+> [threat-model.md](threat-model.md) and [constraints.md](constraints.md) as authoritative
+> where they disagree with it.
 
 This document defines the contract between the HPC agent sandbox and the
 agent it wraps. An agent that satisfies the requirements below can be
@@ -10,7 +18,7 @@ wraps Anthropic's Claude Code (see integrations/husk/); future
 integrations are added by writing a launcher that invokes the sandbox
 with the agent binary as its target.
 
-Threat model: doc/threat-model.txt. Harm IDs (H1, H2, …) referenced below
+Threat model: doc/threat-model.md. Harm IDs (H1, H2, …) referenced below
 are defined there.
 
 ## What the sandbox provides
@@ -181,7 +189,7 @@ An agent is wrappable if:
    that drove this spec: existing agents that mix in-process tools with
    subprocess tools (the Claude Code situation) leave a hole the sandbox
    cannot close. The bash-vs-native-tool asymmetry called out in
-   threat-model.txt is exactly the symptom of failing this requirement.
+   threat-model.md is exactly the symptom of failing this requirement.
 
    Corollary: an agent that fully satisfies this requirement does not need
    per-tool permission deny rules to protect credentials or config — the OS

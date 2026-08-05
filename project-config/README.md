@@ -21,7 +21,7 @@ This file covers only the workflow decisions that vary per project. Machine-wide
 > accidental direct use; they are not an airtight barrier. The real egress
 > boundary is the bwrap network namespace — until that is wired up, `curl`,
 > `wget`, `ssh`, and friends are denied here as a compensating control.
-> See `doc/constraints.txt` for the full rationale.
+> See `doc/constraints.md` for the full rationale.
 
 | Entry | What it blocks | Why |
 |---|---|---|
