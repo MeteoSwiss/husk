@@ -32,8 +32,16 @@ use crate::settings::sh_quote;
 /// `HUSK_` is ours for the same reason: `HUSK_STEP_SPOOL` tells a stub where to send
 /// requests, so letting the caged side set it would let a rank redirect its own
 /// brokering. Our control plane is no more forwardable than the scheduler's.
+///
+/// `_HUSK_` is here because husk already uses it — `_HUSK_RESANDBOXED` is the variable the
+/// job guard reads to decide whether it is inside the cage yet — and the filter did not
+/// cover it. Nothing on the RANK path reads a `_HUSK_` value today, so the gap was inert;
+/// it is reserved now precisely because "inert" is a property of the current code and not
+/// of the interface. The next person to add an underscore-prefixed internal would inherit
+/// a forwardable control variable and no reason to suspect it, which is how a landmine
+/// works. Reserving a prefix costs nothing; the name is ours either way.
 const RESERVED_ENV_PREFIXES: &[&str] =
-    &["SLURM_", "SBATCH_", "PMI_", "PMIX_", "PALS_", "HUSK_"];
+    &["SLURM_", "SBATCH_", "PMI_", "PMIX_", "PALS_", "HUSK_", "_HUSK_"];
 
 /// Proxy variables are never forwarded — they are a property of the namespace you are in.
 ///
@@ -200,12 +208,34 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
             sock = sh_quote(e.sock)
         ),
     };
+    // **B4-F8.** fds 8 and 9 are the job's shared PID and user namespace handles. bwrap
+    // consumes them during setup and does NOT close them, so they were inherited straight
+    // through into the workload — measured inside a real rank as `8 -> pid:[…]`,
+    // `9 -> user:[…]`. Nothing was reachable through them (`NS_GET_PARENT` → EPERM on both,
+    // `setns` on our own userns → EINVAL), so this is hygiene rather than a hole; but "no use
+    // found" is a weaker claim than "closed", and a handle to the namespace that IS the
+    // cage's shared identity is not something a workload should be holding by accident.
+    //
+    // They cannot be closed before `exec bwrap` — bwrap needs them — and bwrap has no flag
+    // to drop them: any fd it is handed is inherited by whatever it execs. So the close has
+    // to happen on the far side of the cage, in the one instant between bwrap's exec and the
+    // workload's, which means a shell hop.
+    //
+    // Done HERE, in the inner script the egress path already has, and deliberately NOT on
+    // the plain path: `a_rank_without_egress_gets_exactly_the_old_script` requires the
+    // no-network case to stay byte-for-byte what it was before egress existed — no extra
+    // shell, no extra process — because that is the MPI-critical path and it cost real
+    // bring-up rounds. Trading a measured-harmless fd leak for a new process on every rank
+    // of every MPI job is not a trade this fix gets to make on its own; it is a change of
+    // that invariant, and it needs a human and a hardware run. **So the plain path still
+    // leaks fds 8 and 9. Recorded, not silently closed.**
     match net {
         None => format!("exec {cage} \"$@\"\n"),
         Some(e) => format!(
             "export _HUSK_NET_SOCK={sock}\n\
              export _HUSK_SOCAT={caged}\n\
-             _husk_inner='if [ -x \"$_HUSK_SOCAT\" ]; then\n\
+             _husk_inner='exec 8<&- 9<&-\n\
+             if [ -x \"$_HUSK_SOCAT\" ]; then\n\
              \"$_HUSK_SOCAT\" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 \
              UNIX-CONNECT:\"$_HUSK_NET_SOCK\" >/dev/null 2>&1 &\n\
              export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128\n\
@@ -257,6 +287,17 @@ pub fn wrap_command(
     // which would run the workload in a cage that cannot talk to its peers and would look
     // like an MPI bug. `bwrap --userns` is itself fail-closed — it exits rather than
     // inventing a namespace — so this is the readable half of a belt-and-braces pair.
+    //
+    // **B4-F7: `|| exit 1` on each redirection, because the belt was not actually fastened.**
+    // The `-r` test and the `exec 9<` that follows it are two operations with a window
+    // between them, and the redirection was unguarded — so what happens if it fails is the
+    // SHELL's choice, not ours: `dash` exits, `bash` prints an error and CARRIES ON with fd
+    // 9 unopened. The outcome stayed fail-closed only because `bwrap --userns 9` then dies
+    // with "Bad file descriptor". That is bwrap's guarantee while the comment above credits
+    // this script, and a guarantee attributed to the wrong layer is one that quietly
+    // disappears when that layer is replaced (6a replaces exactly this layer). Whether
+    // `/bin/sh` is bash or dash on a given cluster then decides which half is load-bearing,
+    // which is not a thing husk should be depending on.
     let script = format!(
         "set -u\n\
          _u={userns}\n\
@@ -264,13 +305,13 @@ pub fn wrap_command(
          echo \"husk: the job's cage holder is gone ($_u) - refusing to run this rank\" >&2\n\
          exit 1\n\
          fi\n\
-         exec 9<\"$_u\"\n\
+         exec 9<\"$_u\" || exit 1\n\
          _p={pidns}\n\
          if [ ! -r \"$_p\" ]; then\n\
          echo \"husk: the job's PID namespace is gone ($_p) - refusing to run this rank\" >&2\n\
          exit 1\n\
          fi\n\
-         exec 8<\"$_p\"\n\
+         exec 8<\"$_p\" || exit 1\n\
          _d=/dev/shm/husk-${{SLURM_JOB_ID}}\n\
          mkdir -m 700 \"$_d\" 2>/dev/null || true\n\
          # -O FOLLOWS SYMLINKS, and /dev/shm is world-writable. A co-tenant who won the\n\
@@ -440,6 +481,35 @@ mod tests {
     }
 
     #[test]
+    fn the_underscore_husk_prefix_is_reserved_too() {
+        // The filter reserved `HUSK_` and not `_HUSK_`, while husk itself uses the latter:
+        // `_HUSK_RESANDBOXED` is what the job guard reads to decide whether it is inside
+        // the cage yet. Nothing on the RANK path reads a `_HUSK_` value, so the gap was
+        // inert — but "inert" describes today's code, not the interface, and the next
+        // underscore-prefixed internal would arrive forwardable with nothing to hint at it.
+        //
+        // Asserted on the PREFIX, not on the one name, so a future `_HUSK_ANYTHING` is
+        // covered the day it is written rather than the day someone remembers this.
+        let args = env_args(
+            &envmap(&[
+                ("_HUSK_RESANDBOXED", "1"),
+                ("_HUSK_SOMETHING_INVENTED_LATER", "x"),
+                ("HUSK_STEP_SPOOL", "/tmp/mine"),
+                ("KEEPME", "ok"),
+            ]),
+            &envmap(&[]),
+            &[],
+        );
+        for reserved in ["_HUSK_RESANDBOXED", "_HUSK_SOMETHING_INVENTED_LATER", "HUSK_STEP_SPOOL"] {
+            assert!(
+                !args.contains(&reserved.to_string()),
+                "husk's own control plane is not forwardable by the caged side: {args:?}"
+            );
+        }
+        assert!(args.contains(&"KEEPME".to_string()), "benign vars still pass: {args:?}");
+    }
+
+    #[test]
     fn option_shaped_and_malformed_names_are_dropped() {
         // Names become ARGUMENTS to bwrap, so one that looks like an option would be
         // read as one by whatever parses them next.
@@ -473,6 +543,50 @@ mod tests {
         assert!(
             !before_bwrap.contains("LD_PRELOAD"),
             "nothing may set LD_PRELOAD before the cage: {before_bwrap}"
+        );
+    }
+
+    #[test]
+    fn the_rank_script_fails_closed_in_any_shell_not_just_the_one_we_happen_to_get() {
+        // **B4-F7.** `[ -r "$_u" ]` and the `exec 9<"$_u"` that follows it are two operations
+        // with a window between them, and the redirection was unguarded — so what happened
+        // when it failed was the SHELL's decision, not husk's:
+        //
+        //     dash:  exec 9</missing  → the shell EXITS
+        //     bash:  exec 9</missing  → prints an error and CARRIES ON, fd 9 unopened
+        //
+        // The result stayed fail-closed only because `bwrap --userns 9` then dies with "Bad
+        // file descriptor" — i.e. the guarantee belonged to bwrap while the comment credited
+        // this script. A guarantee attributed to the wrong layer is one that vanishes when
+        // that layer is replaced, and 6a replaces exactly this layer.
+        //
+        // Two halves, because either alone is hollow: that the construct really does make
+        // the two shells agree, and that husk actually emits it.
+        for sh in ["bash", "dash"] {
+            let Ok(out) = std::process::Command::new(sh)
+                .arg("-c")
+                .arg("exec 9</husk-no-such-namespace-file || exit 1\necho REACHED_THE_WORKLOAD")
+                .output()
+            else {
+                continue; // dash is not installed everywhere; bash carries the assertion
+            };
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("REACHED_THE_WORKLOAD"),
+                "{sh} continued past a failed namespace open — the guard must not depend on \
+                 which shell the cluster ships"
+            );
+            assert!(!out.status.success(), "{sh} must exit nonzero");
+        }
+
+        let argv = built(&["./a.out"]);
+        let script = &argv[2];
+        assert!(
+            script.contains("exec 9<\"$_u\" || exit 1"),
+            "the userns open must be guarded by husk, not by the shell's disposition: {script}"
+        );
+        assert!(
+            script.contains("exec 8<\"$_p\" || exit 1"),
+            "and so must the pidns open: {script}"
         );
     }
 
@@ -612,6 +726,53 @@ mod tests {
         assert!(!script.contains("SOCAT"), "no relay without egress: {script}");
         assert!(!script.contains("_husk_inner"), "no inner shell without a socket: {script}");
         assert!(script.contains("-- \"$@\""), "the workload is exec'd directly: {script}");
+    }
+
+    #[test]
+    fn a_networked_rank_closes_the_shared_namespace_fds_before_the_workload() {
+        // **B4-F8.** fds 8 and 9 are the job's shared PID and user namespace handles. bwrap
+        // consumes them at setup and does not close them, so they were inherited straight
+        // into the workload — measured in a real rank as `8 -> pid:[…]`, `9 -> user:[…]`.
+        // Nothing was reachable through them (NS_GET_PARENT → EPERM on both, setns on our
+        // own userns → EINVAL), so this is hygiene; but "no use found" is a weaker claim
+        // than "closed", and a handle to the namespace that IS the cage's shared identity
+        // should not be in a workload's fd table by accident.
+        //
+        // Closed in the inner shell, which is the only place it CAN be done: not before
+        // `exec bwrap` (bwrap needs them) and not by bwrap (it has no flag to drop them).
+        let argv = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            live_holder(),
+            Some(Egress { sock: "/work/.husk-step-spool-7/net.sock", socat: "/work/.husk-step-spool-7/socat" }),
+            &v(&["./a.out"]),
+        );
+        let script = &argv[2];
+        assert!(script.contains("exec 8<&- 9<&-"), "the namespace fds must be closed: {script}");
+        // Before the workload, not after — the point is that the workload never has them.
+        let closed = script.find("exec 8<&- 9<&-").unwrap();
+        let workload = script.rfind("exec \"$@\"").unwrap();
+        assert!(closed < workload, "the close must precede the exec: {script}");
+    }
+
+    #[test]
+    fn the_plain_rank_path_still_leaks_the_namespace_fds_and_that_is_a_decision() {
+        // The other half of B4-F8, recorded rather than quietly fixed. Closing the fds needs
+        // a shell hop, and `a_rank_without_egress_gets_exactly_the_old_script` forbids one
+        // here on purpose: the no-network case is the MPI-critical path and must stay
+        // byte-for-byte what it was before egress existed. Trading a measured-harmless leak
+        // for a new process on every rank of every MPI job is a change to that invariant,
+        // not a bug fix, and it needs a human and a hardware run.
+        //
+        // This test exists so the state is asserted rather than assumed: if someone adds the
+        // hop, this fails and they must come here and read why it was left out.
+        let script = &built(&["./a.out"])[2];
+        assert!(
+            !script.contains("exec 8<&- 9<&-"),
+            "the plain path grew an fd close — that means it grew a shell hop; see \
+             a_rank_without_egress_gets_exactly_the_old_script before keeping this"
+        );
     }
 
     #[test]

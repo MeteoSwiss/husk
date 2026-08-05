@@ -221,7 +221,23 @@ fn resolve_session_log(spool: &Path) -> PathBuf {
     if let Some(home) = home.filter(|h| !h.as_os_str().is_empty()) {
         let path = session_log_path(&home, secs, std::process::id());
         match path.parent().map(fs::create_dir_all) {
-            Some(Ok(())) => return path,
+            Some(Ok(())) => {
+                // B1-F7: give the directory a lifetime owner. This is the moment it is
+                // about to grow, so it is the moment to bound it — one file per session is
+                // the right shape, "one per session forever" is a home quota that fills and
+                // takes the user down with a cause nobody will connect to husk. Best-effort:
+                // hygiene must never stop a session from starting.
+                if let Some(dir) = path.parent() {
+                    let n = husk_slurm_broker::prune_log_dir(dir, secs);
+                    if n > 0 {
+                        eprintln!(
+                            "husk-slurm-wrapper: pruned {n} old log file(s) from {}",
+                            dir.display()
+                        );
+                    }
+                }
+                return path;
+            }
             _ => eprintln!(
                 "husk-slurm-wrapper: cannot create '{}' — falling back to a log inside the \
                  spool, which the sandboxed agent can write",

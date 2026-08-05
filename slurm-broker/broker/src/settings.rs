@@ -974,7 +974,18 @@ impl FsPolicy {
             //
             // Under the floor there is nothing to make read-only anyway: it is already
             // invisible and already unwritable. Dropping the entry loses nothing.
-            if p.starts_with('/') && !path_under_floor(p) {
+            //
+            // **B3-F8.** `deny_write` was the one field F22 never reached: it tested
+            // `starts_with('/')` directly, so a RELATIVE entry — the natural spelling for a
+            // project file, and the spelling the shipped config uses for `.claude/…`,
+            // `.Rprofile` and `.hg/hgrc` — was silently dropped here while the login cage
+            // honoured it. The two cages disagreed about the same policy line, in the
+            // direction that fails OPEN: the user wrote a deny, read a deny in their
+            // settings, and got one on login and none on compute. `abs_for_cage` is the
+            // helper F22 introduced for exactly this, and it also gets `~/x` right (there
+            // is nothing to re-bind under a hidden home).
+            let Some(p) = abs_for_cage(p, workdir) else { continue };
+            if p.starts_with('/') && !path_under_floor(&p) {
                 a.push("--ro-bind".into());
                 a.push(p.clone());
                 a.push(p.clone());
@@ -2208,6 +2219,39 @@ mod tests {
         let wr = args.iter().position(|a| a == "/scr").unwrap();
         let ro = args.iter().position(|a| a == "/scr/protected").unwrap();
         assert!(wr < ro, "denyWrite ro-bind must follow the allowWrite bind to win");
+    }
+
+    #[test]
+    fn a_relative_deny_write_is_honoured_on_compute_too() {
+        // **B3-F8.** `deny_write` was the one field F22 never reached. It tested
+        // `starts_with('/')` directly, so a RELATIVE entry — the natural spelling for a
+        // project file, and the one the SHIPPED config uses for `.claude/settings.json`,
+        // `.Rprofile` and `.hg/hgrc` — was silently dropped on compute while the login cage
+        // honoured it. One policy line, two cages, two answers, and the disagreement fails
+        // OPEN: the user wrote a deny, read a deny back, and got one on login only.
+        let p = FsPolicy {
+            deny_write: vec![
+                ".claude/settings.json".into(),
+                "./notes/protected.txt".into(),
+                "/scr/absolute".into(),
+                "~/.ssh/config".into(),
+            ],
+            ..Default::default()
+        };
+        let args = p.compute_bwrap_args("/work/proj").join(" ");
+        assert!(
+            args.contains("--ro-bind /work/proj/.claude/settings.json /work/proj/.claude/settings.json"),
+            "a relative denyWrite must be resolved against the workdir: {args}"
+        );
+        assert!(
+            args.contains("--ro-bind /work/proj/notes/protected.txt"),
+            "`./` is the same spelling: {args}"
+        );
+        assert!(args.contains("--ro-bind /scr/absolute"), "absolute still works: {args}");
+        // `~/x` stays dropped, and that is correct rather than an oversight: a bind EXPOSES
+        // ITS SOURCE, so re-binding a home path would punch it back through the `--tmpfs
+        // /users` floor that exists to remove it — a deny that grants.
+        assert!(!args.contains(".ssh/config"), "a home path must not be bound back in: {args}");
     }
 
     // ── F6a: bounded credential auto-scan ───────────────────────────────────

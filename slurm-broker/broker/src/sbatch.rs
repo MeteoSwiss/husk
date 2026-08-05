@@ -412,8 +412,11 @@ pub fn interpret_cli_in(reg: Registry, tool: &str, cli: &[String]) -> Result<Vec
 /// escape). Benign `Allowed`/`Ignored` directives are accepted. Returns `Some(reason)`
 /// to reject the submission.
 pub fn body_reject_reason(body: &str) -> Option<String> {
-    for line in body.lines() {
-        let t = line.trim_start();
+    // Header only, column 0 — same rule and same reason as `sbatch_directives`: a `#BB` in
+    // a heredoc is data for a generated script, not a burst-buffer request for this job,
+    // and rejecting it stopped a legal submission (A3).
+    for line in header_lines(body) {
+        let t = line;
         if t.starts_with("#BB") || t.starts_with("#DW") {
             return Some(
                 "burst-buffer / DataWarp directives (#BB / #DW) are not permitted in a brokered \
@@ -495,17 +498,87 @@ pub fn body_reject_reason(body: &str) -> Option<String> {
     None
 }
 
-/// Collect option tokens from `#SBATCH` directive lines in a script body.
+/// The script HEADER: the leading run of blank and comment lines, i.e. everything before
+/// the first command.
+///
+/// **A3.** husk used to scan the WHOLE body for `#SBATCH`, at any indentation. That is not
+/// where directives live — sbatch stops looking at the first command — and it made husk
+/// reject scripts that are perfectly legal: a run script whose heredoc GENERATES an inner
+/// job script carries `#SBATCH` lines that are data, meant for a different submission
+/// entirely, and husk read them as if they were its own. Same for `#BB` inside a heredoc.
+/// A false reject on a real ICON-shaped workflow is a usability bug with the blast radius
+/// of a security one: the scientist cannot submit and nothing explains why.
+///
+/// Narrowing is safe here, and this is the only reason it is safe: **the agent's body no
+/// longer reaches slurmd at all** — husk submits its own script and runs the body as data
+/// inside the cage. A directive husk does not read is therefore INERT, not smuggled. When
+/// the body was forwarded verbatim, scanning less than slurmd's parser would have been an
+/// escape; now it is just an option husk declines to honour, and the note below says so.
+///
+/// Blank lines do NOT end the header, because real run scripts space their directives out.
+fn header_lines(body: &str) -> impl Iterator<Item = &str> {
+    body.lines().take_while(|l| {
+        let t = l.trim_start();
+        t.is_empty() || t.starts_with('#')
+    })
+}
+
+/// Is this line a directive husk reads? Column 0, like sbatch: an indented `#SBATCH` is not
+/// a directive to sbatch either (it stops the scan outright there).
+fn directive_body(line: &str) -> Option<&str> {
+    line.strip_prefix("#SBATCH")
+}
+
+/// Collect option tokens from `#SBATCH` directive lines in a script HEADER.
 pub fn sbatch_directives(body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for line in body.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("#SBATCH") {
+    for line in header_lines(body) {
+        if let Some(rest) = directive_body(line) {
             for tok in rest.split_whitespace() {
                 out.push(tok.to_string());
             }
         }
     }
     out
+}
+
+/// `#SBATCH`-looking lines husk did NOT read, as advice for a SUCCESSFUL submit.
+///
+/// Narrowing the scan trades a false reject for a silent ignore, and a silent ignore is the
+/// failure mode this project keeps having to fix — so say it. But say it only where a human
+/// plausibly MEANT the line for this job: indented in the header (sbatch ignores those too,
+/// and it is an easy mistake), or below the header but before any heredoc. Lines after a
+/// heredoc opener are the generated-inner-script case that motivated the fix, and warning
+/// about them on every ICON submit would be exactly the crying wolf that gets a message
+/// switched off.
+pub fn unread_directive_note(body: &str) -> Option<String> {
+    let header_count = header_lines(body).count();
+    let mut missed: Vec<usize> = Vec::new();
+    let mut heredoc_seen = false;
+    for (i, line) in body.lines().enumerate() {
+        let t = line.trim_start();
+        if i >= header_count && line.contains("<<") {
+            heredoc_seen = true;
+        }
+        if !t.starts_with("#SBATCH") {
+            continue;
+        }
+        let read = i < header_count && directive_body(line).is_some();
+        if !read && !heredoc_seen {
+            missed.push(i + 1);
+        }
+    }
+    if missed.is_empty() {
+        return None;
+    }
+    let where_ = missed.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(", ");
+    Some(format!(
+        "husk read this job's #SBATCH directives from the script HEADER only — the lines \
+         before the first command, starting at column 0. Line(s) {where_} look like \
+         directives but are indented or sit below the first command, so they were NOT used \
+         (real sbatch stops there too). If one was meant for this job, move it into the \
+         header at column 0."
+    ))
 }
 
 #[cfg(test)]
@@ -764,9 +837,71 @@ mod tests {
     }
 
     #[test]
-    fn directives_collected_only_from_sbatch_lines() {
+    fn directives_are_collected_from_the_header_only() {
+        // **A3.** This test used to assert the BUG: it required `-t 10` — written AFTER
+        // `echo hi` — to be collected. Scanning the whole file is not what sbatch does and
+        // is not what a script means; it is what made husk reject legal run scripts.
         let body = "#!/bin/bash\n#SBATCH --partition=preemptible --nodes=2\necho hi\n#SBATCH -t 10\n";
-        let d = sbatch_directives(body);
-        assert_eq!(d, v(&["--partition=preemptible", "--nodes=2", "-t", "10"]));
+        assert_eq!(sbatch_directives(body), v(&["--partition=preemptible", "--nodes=2"]));
+
+        // Blank and comment lines do NOT end the header — real run scripts space their
+        // directives out and comment them, and stopping at the first blank line would
+        // silently drop half of a legitimate header.
+        let spaced = "#!/bin/bash\n#SBATCH -p x\n\n# why we need two nodes\n#SBATCH -N 2\n\nsrun hostname\n";
+        assert_eq!(sbatch_directives(spaced), v(&["-p", "x", "-N", "2"]));
+
+        // Column 0, like sbatch: an indented `#SBATCH` is not a directive there either.
+        assert!(sbatch_directives("#!/bin/bash\n  #SBATCH -p x\n").is_empty());
+    }
+
+    #[test]
+    fn a_heredoc_that_generates_an_inner_job_script_is_not_read_as_this_jobs_directives() {
+        // **A3, the case that actually bit.** A run script that writes ANOTHER job script
+        // carries `#SBATCH` (and `#BB`) lines that are DATA for a different submission.
+        // husk read them as its own and refused to submit — a false reject on an
+        // ICON-shaped workflow, with no way for the scientist to comply short of not
+        // generating a script.
+        //
+        // Safe to narrow ONLY because the agent's body no longer reaches slurmd: husk
+        // submits its own script and runs the body as data inside the cage, so a directive
+        // husk does not read is inert rather than smuggled.
+        let body = "#!/bin/bash\n#SBATCH --partition=preemptible\n\
+                    cat > inner.sh <<'EOF'\n\
+                    #SBATCH --qos=elevated\n\
+                    #SBATCH --reservation=maint\n\
+                    #BB stage_in source=/x destination=/y\n\
+                    EOF\n\
+                    sbatch inner.sh\n";
+        assert_eq!(sbatch_directives(body), v(&["--partition=preemptible"]));
+        assert!(
+            body_reject_reason(body).is_none(),
+            "generating an inner script must not be a rejection — that was A3"
+        );
+        // …and it must not nag about them either: these are the lines the fix exists for,
+        // so a note on every submit would be the crying-wolf failure in message form.
+        assert!(unread_directive_note(body).is_none(), "no note for heredoc content");
+
+        // The header is still enforced, so the escape-shaped cases still reject.
+        assert!(body_reject_reason("#!/bin/bash\n#SBATCH --qos=elevated\n").is_some());
+        assert!(body_reject_reason("#!/bin/bash\n#BB stage_in\n").is_some());
+    }
+
+    #[test]
+    fn a_directive_husk_did_not_read_is_reported_rather_than_silently_ignored() {
+        // Narrowing the scan trades a false reject for a silent ignore, and silence is the
+        // failure mode this project keeps fixing. The two cases a human plausibly MEANT:
+        // indented in the header, and below the first command with no heredoc in sight.
+        let indented = "#!/bin/bash\n  #SBATCH --time=01:00:00\nsrun hostname\n";
+        let note = unread_directive_note(indented).expect("an indented directive must be reported");
+        assert!(note.contains('2'), "the note must name the line: {note}");
+        assert!(note.contains("column 0"), "and the remedy: {note}");
+
+        let after_command = "#!/bin/bash\nmodule load icon\n#SBATCH --time=01:00:00\n";
+        assert!(
+            unread_directive_note(after_command).is_some(),
+            "a directive below the first command is the classic mistake and must be reported"
+        );
+        // A clean script says nothing at all.
+        assert!(unread_directive_note("#!/bin/bash\n#SBATCH -p x\nsrun hostname\n").is_none());
     }
 }

@@ -414,6 +414,10 @@ fn main() {
             )
         });
 
+    // Did the spool exist before we touched it? An owner must be able to tell what it
+    // CREATED from what it merely found, or it cannot know what it is entitled to remove.
+    // (B1-F6 — the `--once` path acquired both a directory and a claim and released neither.)
+    let spool_preexisted = spool.exists();
     if let Err(e) = std::fs::create_dir_all(&spool) {
         eprintln!("broker: cannot create spool {spool:?}: {e}");
         std::process::exit(1);
@@ -567,8 +571,26 @@ fn main() {
             eprintln!("broker: scan error: {e}");
         }
         // `--once` is a single scan for tests and dry runs, not a session — it leaves the
-        // spool (and any staged script it was asked to inspect) exactly as it found it.
+        // spool CONTENTS (including any staged script it was asked to inspect) exactly as it
+        // found them. What it must NOT leave behind is what it acquired: the ownership claim
+        // it wrote, and the directory if there was none before.
+        //
+        // B1-F6. This path used to `return` straight past the teardown below, so a `--once`
+        // run in a fresh directory created a spool, stamped `owner` with its own pid, exited,
+        // and left both. Nothing else ever cleaned them up: `reap_stale_spools` is scoped and
+        // age-gated, and the next session reads that `owner` file to decide what it may
+        // touch. "Release on EVERY path" does not mean the normal one and the signalled one.
+        //
+        // Deliberately not `remove_spool_dir`: the CONTENTS belong to whoever asked for the
+        // scan. `remove_dir` refuses a non-empty directory, which is exactly the right
+        // behaviour — a dry run that staged a script keeps its directory and says so.
         if once {
+            if owns_spool {
+                let _ = std::fs::remove_file(spool.join("owner"));
+            }
+            if !spool_preexisted && std::fs::remove_dir(&spool).is_err() {
+                eprintln!("broker: --once kept spool {spool:?} — it is not empty");
+            }
             return;
         }
         if shutting_down() {

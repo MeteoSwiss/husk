@@ -294,6 +294,109 @@ pub fn session_log_path(home: &Path, unix_secs: u64, pid: u32) -> PathBuf {
     home.join(".husk/log").join(format!("husk-{}-{pid}.log", utc_stamp(unix_secs)))
 }
 
+/// Retention for `~/.husk/log`. **B1-F7: the directory had an owner for its CONTENT and
+/// none for its LIFETIME.** One file per session is the right shape — it is what makes a
+/// dead session's lines distinguishable from a live one's — but "one per session, forever"
+/// is unbounded growth in a user's home, which on a cluster is a quota, and a quota that
+/// fills is an outage with a confusing cause. Every other husk resource names an owner and
+/// a release; this one named neither.
+///
+/// The owner is the NEXT session start: the wrapper prunes just before it opens its own
+/// log. Cheap (one readdir), needs no daemon, and the moment it runs is the moment the
+/// directory is about to grow.
+///
+/// Three independent bounds, because each catches what the others miss: age (old logs are
+/// worthless), count (many short sessions in a day), and total bytes (one pathological run
+/// that logged a great deal). Whichever binds first wins.
+pub const LOG_RETAIN_MAX_AGE_SECS: u64 = 14 * 86_400;
+pub const LOG_RETAIN_MAX_FILES: usize = 50;
+pub const LOG_RETAIN_MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
+/// Never touch anything written in the last hour: a concurrent session's log is not ours to
+/// remove, and mtime is the only liveness signal available here. Deleting a live session's
+/// log would break the one guarantee that made this file worth keeping outside the spool.
+pub const LOG_RETAIN_MIN_AGE_SECS: u64 = 3600;
+
+/// One log file as the retention policy sees it.
+pub struct LogEntry {
+    pub name: String,
+    pub age_secs: u64,
+    pub bytes: u64,
+}
+
+/// Which log files to delete. **Pure**, so the policy is testable without mtimes on disk —
+/// the IO half below is then small enough to read.
+///
+/// Only files husk itself writes are candidates (`husk-*.log` session logs, `job-*.log` from
+/// the compute guard). Anything else in that directory belongs to someone else, and a
+/// cleanup that deletes what it did not create is a deletion primitive, not hygiene — the
+/// same rule the spool reaper and the job guard already follow.
+pub fn logs_to_prune(mut entries: Vec<LogEntry>) -> Vec<String> {
+    entries.retain(|e| {
+        (e.name.starts_with("husk-") || e.name.starts_with("job-")) && e.name.ends_with(".log")
+    });
+    // Oldest first: age is the order every bound prunes in.
+    entries.sort_by(|a, b| b.age_secs.cmp(&a.age_secs).then_with(|| a.name.cmp(&b.name)));
+    let prunable = |e: &LogEntry| e.age_secs >= LOG_RETAIN_MIN_AGE_SECS;
+
+    let mut doomed: Vec<String> = Vec::new();
+    let mut kept: Vec<&LogEntry> = Vec::new();
+    for e in &entries {
+        if e.age_secs > LOG_RETAIN_MAX_AGE_SECS && prunable(e) {
+            doomed.push(e.name.clone());
+        } else {
+            kept.push(e);
+        }
+    }
+    // Count and bytes, still oldest-first, and still never a file that may be live.
+    let mut total: u64 = kept.iter().map(|e| e.bytes).sum();
+    let mut n = kept.len();
+    for e in kept {
+        if n <= LOG_RETAIN_MAX_FILES && total <= LOG_RETAIN_MAX_TOTAL_BYTES {
+            break;
+        }
+        if !prunable(e) {
+            continue;
+        }
+        doomed.push(e.name.clone());
+        total = total.saturating_sub(e.bytes);
+        n -= 1;
+    }
+    doomed
+}
+
+/// Apply `logs_to_prune` to a real directory. Returns how many files were removed.
+///
+/// Best-effort by design: this is hygiene, not the boundary, so it must never be able to
+/// stop a session from starting. Every error is swallowed deliberately.
+pub fn prune_log_dir(dir: &Path, now_secs: u64) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut entries = Vec::new();
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else { continue };
+        if !md.is_file() {
+            continue;
+        }
+        let age = md
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| now_secs.saturating_sub(d.as_secs()))
+            .unwrap_or(0);
+        entries.push(LogEntry {
+            name: e.file_name().to_string_lossy().to_string(),
+            age_secs: age,
+            bytes: md.len(),
+        });
+    }
+    let mut removed = 0;
+    for name in logs_to_prune(entries) {
+        if std::fs::remove_file(dir.join(&name)).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// `YYYYmmdd-HHMMSSZ` from a Unix timestamp. UTC, so a filename means the same thing
 /// from any login node; sortable, so `ls` is chronological.
 pub fn utc_stamp(unix_secs: u64) -> String {
@@ -518,5 +621,59 @@ mod tests {
     fn pid_is_alive_sees_this_process_and_not_a_dead_one() {
         assert!(pid_is_alive(std::process::id()));
         assert!(!pid_is_alive(999_999));
+    }
+
+    fn log(name: &str, age_secs: u64, bytes: u64) -> LogEntry {
+        LogEntry { name: name.to_string(), age_secs, bytes }
+    }
+
+    #[test]
+    fn the_log_directory_has_a_lifetime_bound_by_age_count_and_bytes() {
+        // **B1-F7.** `~/.husk/log` had an owner for its CONTENT (one file per session, kept
+        // outside the agent-writable spool on purpose) and none for its LIFETIME. On a
+        // cluster an unbounded directory in $HOME is a quota, and a quota that fills is an
+        // outage whose cause nobody connects to husk.
+        //
+        // Three bounds because each catches what the others miss.
+        let old = logs_to_prune(vec![
+            log("husk-20260101-000000Z-1.log", 30 * 86_400, 10),
+            log("husk-20260804-000000Z-2.log", 86_400, 10),
+        ]);
+        assert_eq!(old, vec!["husk-20260101-000000Z-1.log"], "age must prune");
+
+        let many: Vec<LogEntry> = (0..LOG_RETAIN_MAX_FILES + 5)
+            .map(|i| log(&format!("husk-{i:04}.log"), 7200 + i as u64, 10))
+            .collect();
+        assert_eq!(logs_to_prune(many).len(), 5, "count must prune the excess, and only it");
+
+        let fat = vec![
+            log("husk-a.log", 7200, LOG_RETAIN_MAX_TOTAL_BYTES),
+            log("husk-b.log", 3601, LOG_RETAIN_MAX_TOTAL_BYTES),
+        ];
+        assert_eq!(logs_to_prune(fat), vec!["husk-a.log"], "bytes must prune, oldest first");
+    }
+
+    #[test]
+    fn log_pruning_spares_live_sessions_and_files_husk_did_not_write() {
+        // A concurrent session's log is not ours to delete — mtime is the only liveness
+        // signal here, so nothing recent is ever a candidate. Deleting a live session's log
+        // would break the exact guarantee that put this file outside the spool.
+        let live: Vec<LogEntry> = (0..LOG_RETAIN_MAX_FILES + 10)
+            .map(|i| log(&format!("husk-{i:04}.log"), 60, 10))
+            .collect();
+        assert!(logs_to_prune(live).is_empty(), "a fresh file may belong to a live session");
+
+        // And a cleanup that enumerates what it did NOT create is a deletion primitive, not
+        // hygiene — the same rule the spool reaper and the job guard already follow.
+        let foreign = vec![
+            log("notes.txt", 99 * 86_400, 10),
+            log("husk-old.log", 99 * 86_400, 10),
+            log("job-4242.log", 99 * 86_400, 10),
+            log("important-backup.log.gz", 99 * 86_400, 10),
+        ];
+        let doomed = logs_to_prune(foreign);
+        assert!(doomed.contains(&"husk-old.log".to_string()), "husk's own logs are fair game");
+        assert!(doomed.contains(&"job-4242.log".to_string()), "so are the guard's");
+        assert_eq!(doomed.len(), 2, "and nothing else, ever: {doomed:?}");
     }
 }

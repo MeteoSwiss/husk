@@ -452,11 +452,14 @@ pub fn decide(
         // out about the limit from squeue afterwards.
         // Both advisories ride the same channel, since both are things the agent learns
         // only by being told: the wall limit it inherited, and whether it has a network.
-        note: match (time_note.is_empty(), net_note.is_empty()) {
-            (_, true) => time_note,
-            (true, false) => net_note,
-            (false, false) => format!("{net_note}\n{time_note}"),
-        },
+        // Three advisories now ride this channel, all of them things the agent learns only
+        // by being told: the wall limit it inherited, whether it has a network, and (A3)
+        // whether a line it wrote that LOOKS like a directive was actually read.
+        note: [net_note, time_note, sbatch::unread_directive_note(&req.script.body).unwrap_or_default()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
         wrapped_script: wrap_script(
             &body_path,
             &req.job_args,

@@ -245,6 +245,38 @@ fn serve_one(client: UnixStream, allow: &Allowlist) -> Verdict {
 }
 
 /// Serve until the listener dies. Never returns in normal operation.
+/// One slot in the concurrent-tunnel budget, released by `Drop`.
+///
+/// **B1-F8.** The count used to be a `fetch_add` at the top of the thread and a `fetch_sub`
+/// as its LAST STATEMENT. A panic anywhere in `serve_one` unwinds straight past that line,
+/// so the slot is never returned — and the leak is permanent, because nothing ever resets
+/// the counter. Sixty-four panics and the proxy answers every later connection with "too
+/// many concurrent connections" for the rest of the job: a job that talks to the network
+/// loses it entirely, with a message that describes load rather than the bug. The input
+/// that panics comes from the cage, so the trigger is the agent's to choose.
+///
+/// `Drop` runs during unwinding, so tying the release to a value's lifetime makes it
+/// unconditional — the same rule husk applies to every other OS resource it holds. The
+/// acquire is `fetch_update`, which also makes the cap EXACT: the old check-then-add let two
+/// connections pass the test before either incremented.
+struct TunnelSlot(Arc<AtomicUsize>);
+
+impl TunnelSlot {
+    fn acquire(live: &Arc<AtomicUsize>) -> Option<Self> {
+        live.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < MAX_TUNNELS).then_some(n + 1)
+        })
+        .ok()
+        .map(|_| Self(Arc::clone(live)))
+    }
+}
+
+impl Drop for TunnelSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub fn serve(listener: UnixListener, allow: Allowlist) {
     let allow = Arc::new(allow);
     let live = Arc::new(AtomicUsize::new(0));
@@ -256,7 +288,7 @@ pub fn serve(listener: UnixListener, allow: Allowlist) {
                 continue;
             }
         };
-        if live.load(Ordering::Relaxed) >= MAX_TUNNELS {
+        let Some(slot) = TunnelSlot::acquire(&live) else {
             // Refuse rather than queue: a queued connection looks like a slow network to
             // the job, and "husk is slow" is a worse diagnosis to hand someone than
             // "husk refused, here is why".
@@ -267,18 +299,17 @@ pub fn serve(listener: UnixListener, allow: Allowlist) {
                  connections ({MAX_TUNNELS})\r\n"
             );
             continue;
-        }
+        };
         let allow = Arc::clone(&allow);
-        let live2 = Arc::clone(&live);
-        live.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
+            // Moved into the thread and dropped when it ends, HOWEVER it ends.
+            let _slot = slot;
             match serve_one(client, &allow) {
                 // Logged on the TRUSTED side, so the record of what a job reached does not
                 // depend on the job. Host and port only: never the payload.
                 Verdict::Allowed => {}
                 Verdict::Refused(why) => eprintln!("husk-proxy: refused: {why}"),
             }
-            live2.fetch_sub(1, Ordering::Relaxed);
         });
     }
 }
@@ -286,6 +317,39 @@ pub fn serve(listener: UnixListener, allow: Allowlist) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_tunnel_returns_its_slot() {
+        // **B1-F8, the case that made it a bug rather than a tidiness note.** The release
+        // used to be the thread's last statement, which a panic never reaches — and nothing
+        // resets the counter, so the leak is permanent. Sixty-four panics and every later
+        // connection is refused for the rest of the job, with a message about load.
+        let live = Arc::new(AtomicUsize::new(0));
+        for _ in 0..MAX_TUNNELS * 2 {
+            let slot = TunnelSlot::acquire(&live).expect("a returned slot must be reusable");
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _slot = slot;
+                panic!("whatever serve_one does with hostile bytes");
+            }));
+            assert!(r.is_err(), "the test must actually panic or it proves nothing");
+        }
+        assert_eq!(live.load(Ordering::Relaxed), 0, "every slot must come back");
+    }
+
+    #[test]
+    fn the_tunnel_cap_is_exact_and_slots_are_reusable() {
+        // The old check-then-add let two connections pass `live < MAX` before either
+        // incremented, so the cap was approximate. fetch_update makes it exact — and the
+        // cap must still be a cap, not a one-shot budget.
+        let live = Arc::new(AtomicUsize::new(0));
+        let held: Vec<TunnelSlot> =
+            (0..MAX_TUNNELS).map(|_| TunnelSlot::acquire(&live).expect("under the cap")).collect();
+        assert_eq!(live.load(Ordering::Relaxed), MAX_TUNNELS);
+        assert!(TunnelSlot::acquire(&live).is_none(), "the cap must hold at the boundary");
+        drop(held);
+        assert_eq!(live.load(Ordering::Relaxed), 0, "dropping releases");
+        assert!(TunnelSlot::acquire(&live).is_some(), "a job gets its network back");
+    }
 
     #[test]
     fn parses_a_connect_request() {

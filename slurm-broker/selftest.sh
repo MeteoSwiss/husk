@@ -898,7 +898,30 @@ if [ ! -d "$LIFE_SPOOL" ]; then
 else
   check FAIL lifecycle spool.teardown "spool survived its session: $(ls -a "$LIFE_SPOOL" | tr '\n' ' ')"
 fi
-rm -rf "$LIFE"
+# L6 — B1-F6. `--once` is a single scan for tests and dry runs, and it is allowed to leave
+# the spool CONTENTS alone — that is what makes it useful. What it must not leave is what it
+# ACQUIRED: a directory that was not there before, and the ownership claim it stamped. It
+# used to return straight past the teardown, so a --once run in a fresh directory created a
+# spool, wrote `owner` with its own pid, exited, and left both — and nothing else ever
+# cleaned them up (reap_stale_spools is scoped and age-gated, and the next session reads that
+# owner file to decide what it may touch). "Release on every path" is not "on the two paths
+# I was thinking about".
+ONCE="$PWORK/oncerelease"; rm -rf "$ONCE"; mkdir -p "$ONCE"
+( cd "$ONCE" && "$BROKER" --dry-run --once --spool "$ONCE/fresh" ) >/dev/null 2>>"$BROKER_LOG"
+# …and the other half: a spool that already existed, with content, must SURVIVE — only the
+# claim is released. Removing it would break every caller that reads a staged script back.
+mkdir -p "$ONCE/existing"; : > "$ONCE/existing/keepme"
+( cd "$ONCE" && "$BROKER" --dry-run --once --spool "$ONCE/existing" ) >/dev/null 2>>"$BROKER_LOG"
+once_why=""
+[ -d "$ONCE/fresh" ]           && once_why+="a spool it created was left behind; "
+[ ! -f "$ONCE/existing/keepme" ] && once_why+="it deleted content it did not create; "
+[ -f "$ONCE/existing/owner" ]  && once_why+="it left its ownership claim on a spool it borrowed; "
+if [ -z "$once_why" ]; then
+  check PASS lifecycle spool.once_released "--once released the spool it created and the claim it wrote, and kept what it borrowed"
+else
+  check FAIL lifecycle spool.once_released "${once_why%; }"
+fi
+rm -rf "$LIFE" "$ONCE"
 
 # ---- the compute side: the guard's own spool and log --------------------------------
 # The job's step spool has the same two problems the login spool had, for the same reason:
