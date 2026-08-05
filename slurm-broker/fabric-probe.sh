@@ -47,6 +47,25 @@ say "host    : $(hostname)   arch=$(uname -m)   kernel=$(uname -r)"
 say "date    : $(date -u +%FT%TZ)"
 say "uenv    : ${UENV_VIEW:-<none>}  (label ${UENV_LABEL:-<none>})"
 say "in slurm: JOB_ID=${SLURM_JOB_ID:-<none>}  NODES=${SLURM_JOB_NUM_NODES:-?}  NTASKS=${SLURM_NTASKS:-?}"
+
+# WHERE AM I? `salloc` grants the allocation but leaves your shell on the LOGIN node
+# (unless the site sets SallocDefaultCommand). Every arm below that does NOT go through
+# srun then measures the login node's hardware — different NIC count, possibly different
+# config — while looking exactly like a compute-node result. A C1 verdict taken that way
+# is about the wrong machine, and the report gives no hint of it.
+# SLURMD_NODENAME is set by slurmstepd inside a step, so it is present on a compute node
+# and absent in a salloc shell: a clean discriminator that needs no hostname parsing.
+if [ -n "${SLURM_JOB_ID:-}" ] && [ -z "${SLURMD_NODENAME:-}" ]; then
+  say ""
+  say "  *** WARNING: allocation held, but this shell is NOT on a compute node. ***"
+  say "  Local arms (C4 inventory, C1 fi_info) will measure $(hostname) — a LOGIN node."
+  say "  Only the srun-based arms reach compute. To measure the real hardware, either:"
+  say "      sbatch -N2 --ntasks-per-node=2 -p <part> fabric-probe.sh     # whole probe on compute"
+  say "  or  srun --pty --overlap bash    # then re-run this from the compute shell"
+  say ""
+elif [ -n "${SLURMD_NODENAME:-}" ]; then
+  say "location: compute node ${SLURMD_NODENAME} (local arms measure real job hardware)"
+fi
 have() { command -v "$1" >/dev/null 2>&1; }
 for t in bwrap fi_info srun cc mpicc seccomp-wrapper; do
   if have "$t"; then note "tool present : $t ($(command -v "$t"))"; else note "tool MISSING : $t"; fi
