@@ -13,6 +13,24 @@
 > submitted script contains no agent bytes. **The body is still parsed — by husk — and it still
 > becomes a file at a path built from an agent-supplied value. That is what is left, and it is
 > what this brief is now about.**
+>
+> ## ★★ Updated 2026-08-05 — the premise moved a second time
+>
+> Two changes since the rewrite above, in opposite directions, and they interact:
+>
+> 1. **The scan narrowed to the header** (`79cd790`). husk now reads `#SBATCH` lines only in
+>    the leading comment block, not the whole file. This fixed a false-reject on
+>    heredoc-generated inner scripts. It is safe *only* because the body is inert to slurmd —
+>    which is a load-bearing claim this review should attack rather than assume (N4 owns it).
+> 2. **The parse now feeds husk's argv much more widely** (`da7a6e6`). husk interprets the
+>    body's directives and **re-emits the whole resource family** onto sbatch's command line,
+>    merged with the CLI by option name. Before this, resource directives were validated and
+>    then silently dropped — which was a production outage: `#SBATCH --ntasks=64` got one task
+>    and nothing said so.
+>
+> Together: **husk reads less of the file than it used to, and does more with what it reads.**
+> A directive husk fails to see is now a directive that neither gets rejected *nor* re-emitted,
+> in a script whose author expected it to take effect.
 
 ## The question
 
@@ -38,6 +56,28 @@ dropped option an ungated body channel.
 2. **Emission.** For `--output`, `--error`, `--chdir`, `--partition`, `--uenv`, `--view`, husk
    *takes the value from the directive*, validates and confines it, and puts **its own** option
    on the real command line.
+3. ★ **Re-emission of the resource family.** Everything `Class::Allowed` in the registry —
+   `--ntasks`, `--cpus-per-task`, `--time`, `--mem`, `--gres`, `--array`, `--distribution`, the
+   rest — is now interpreted from the body and re-emitted, unless the CLI supplies the same
+   option name. The merge key is the option name, computed by splitting the canonicalised
+   token at the first `=` (`policy.rs:414`).
+
+★ **Two gates, and the second one is doing more work than the first.** `sbatch_directives`
+tokenises with `split_whitespace()` and **no quote handling at all** (`sbatch.rs:540`). Every
+re-emitted value then has to pass a per-option charset grammar, and a registry-wide invariant
+test forbids `" ' \ ; $ ` < >` newline and tab for *every* `Allowed` option. Measured on
+2026-08-05:
+
+```
+#SBATCH --job-name="my run"   →  tokens: ["--job-name=\"my", "run\""]  →  REJECTED
+#SBATCH --job-name="myrun"    →  tokens: ["--job-name=\"myrun\""]      →  REJECTED
+```
+
+Both fail closed, on the *grammar*, not on the tokeniser. So the missing quote handling does
+not become an injection — but it does mean **husk refuses ordinary job scripts**, and there is
+a neat inconsistency to pull on: `v_comment` is deliberately widened to allow a space, and the
+whitespace-splitting tokeniser makes that space unreachable. The grammar and the tokeniser
+disagree about what is expressible.
 
 So the parse no longer feeds slurmd — it feeds **husk's own argv**. A misparse is no longer a
 parser differential with the scheduler; it is husk emitting the wrong thing under its own name.
@@ -60,13 +100,21 @@ parser differential with the scheduler; it is husk emitting the wrong thing unde
    value the agent could not set directly on the CLI? The `dominated`/`dedicated` split is the
    place: those are the options husk *reads from the body*. Malformed spellings, repeated
    directives, a value that passes husk's validator and means something else to SLURM.
-3. **Where the directive scan stops.** husk scans `#SBATCH` lines; bash treats them as
-   comments. Since the body no longer reaches slurmd this can no longer be a parity bug — but
-   it can still be a *policy* bug: a directive husk does not see is a directive husk does not
-   reject, and a directive husk sees where bash sees a command is a directive that changes
-   husk's emission while the job does something else. Try: leading whitespace of every kind,
-   `\r\n`, a BOM, `#SBATCH` after the first command, `#SBATCH` inside a heredoc or a quoted
-   string, continuation lines.
+3. ★ **Where the directive scan stops — and it stops earlier than it used to.** husk scans
+   `#SBATCH` lines in the **header block only**; bash treats them as comments. Since the body
+   no longer reaches slurmd this can no longer be a parity bug — but it can still be a *policy*
+   bug, and the narrowing widened it: a directive husk does not see is a directive husk neither
+   rejects nor re-emits, and a directive husk sees where bash sees a command changes husk's
+   emission while the job does something else. Try: leading whitespace of every kind, `\r\n`, a
+   BOM, `#SBATCH` after the first command, `#SBATCH` inside a heredoc or a quoted string,
+   continuation lines, and specifically **what ends the header** — the first line that is
+   neither a comment nor blank. Find a line husk treats as the end of the header that a human
+   (or ICON's run-script generator) would not.
+
+   Note the mitigation before you report: `unread_directive_note` warns on `#SBATCH`-looking
+   lines husk did *not* read, but only where a human plausibly meant them for this job. A
+   directive that lands in the silent gap between "not read" and "not warned about" is the
+   finding.
 4. **The body file is agent-writable and its path is predictable.** Rewriting it before the job
    runs changes only the agent's own payload — no boundary crossed, so that is not a finding by
    itself. What *would* be: making the guard's `rm -f` remove something else, or making the

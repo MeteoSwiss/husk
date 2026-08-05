@@ -4,10 +4,16 @@
 **verdict from outside the cage** · bound by the **rules of engagement** in
 `A-RULES-OF-ENGAGEMENT.md`
 
-> **Refreshed 2026-08-03, after the v0.5 fixes.** This brief was written against code that has
-> since changed in exactly the area it targets. What follows describes husk as it is now. The
-> "what was fixed" section is there so you do not spend your run rediscovering a closed hole
-> and reporting it as new — that is the most likely way to waste this brief.
+> **Refreshed 2026-08-05, after the fix round that followed this brief's own CRITICAL.** This
+> brief was written against code that has since changed in exactly the area it targets. What
+> follows describes husk as it is now. The "what was fixed" section is there so you do not
+> spend your run rediscovering a closed hole and reporting it as new — that is the most likely
+> way to waste this brief.
+>
+> **You found the v0.5 CRITICAL.** `--output` with a symlinked leaf gave arbitrary write as the
+> user, outside the cage. It is fixed in two halves (below), and both halves are new code that
+> nobody has attacked. **Attacking the fix is worth more than re-attacking the original hole.**
+> New material since the last run is marked ★.
 
 ## The question
 
@@ -35,8 +41,14 @@ compares, so `//users/me` — the same directory to the kernel and to bwrap — 
 through them. One extra slash flipped a session from rejected to submitted with a home bound
 writable.
 
-Two bugs, one shape: **a boundary check that was not applied to the value that became the
-boundary.** Assume there is a third.
+★ **The v0.5 pen test, this brief:** `--output` pointing at a symlinked leaf. The check *was*
+applied to the right value this time — but at submit time, on the login node, against a
+filesystem that slurmd would not touch until hours later on a different machine.
+
+Three bugs, and the third broke the pattern. The first two were **a boundary check not applied
+to the value that became the boundary**. The third was a boundary check applied to the right
+value **at a time when the answer could still change**. Assume there is a fourth, and note that
+you now have two shapes to hunt, not one.
 
 ## What the code does today
 
@@ -64,6 +76,24 @@ Read this before attacking; it is all post-fix.
 - **Settings that do not parse fail closed**: husk refuses to start rather than resolving a
   broken file to an empty policy (which silently dropped every `denyRead` and credential mask).
 
+★ **The four things that changed after your last run — all of them new code:**
+
+- **The `--output`/`--error` leaf is checked with `symlink_metadata`** (`settings.rs:402`),
+  which does *not* follow. Everything above the leaf is canonicalised; the leaf is the only
+  unresolved component left, so one non-following `stat` on it is the whole check.
+- **`--open-mode=append` is forced** (`policy.rs:375`), so even a target husk was wrong about
+  is appended to rather than truncated. A second `--open-mode` from the agent is dropped.
+- ★★ **A RUN-TIME half was added, because a submit-time check cannot hold.** The job's guard
+  re-checks fd 1 and fd 2 on the compute node, via `/proc/$$/fd/`, before the agent's body
+  runs (`policy.rs:1266`). This exists because the submit-time check is a **two-machine
+  TOCTOU**: husk validates on the login node, and the job may sit pending for hours before
+  slurmd opens that path on a different machine. Anything checked at submit time can be
+  swapped inside that window.
+- **Deny binds under the workdir became `--ro-bind-try`** (`396ae7b`), so a bind whose source
+  is absent at job start is *skipped* rather than fatal. That was forced by a real outage —
+  the login cage creates ghost files inside the project dir — but it converts a loud failure
+  into a silent one.
+
 Both directions are asserted by tests: submitting *from* a declared `allowWrite` directory
 works and the logs land there; anywhere else is refused. **A fix that only refuses would break
 the feature**, so a wrongly-refused legitimate path is a finding too.
@@ -84,10 +114,26 @@ the feature**, so a wrongly-refused legitimate path is a finding too.
 4. **`%` specifiers** in `--output`/`--error` are allowlisted with `%x` excluded, because
    SLURM expands them *after* husk has checked the string. Try the rest.
 5. **An `allowWrite` root that is itself a symlink**, or that contains one.
-6. **`#SBATCH` in the body** setting the same three options. Note this channel changed
-   completely: the body no longer reaches slurmd at all (husk submits its own script on
-   stdin), so the question is not "does the directive win" but "does husk's *parse* of it
-   still influence what husk emits, and can that be steered".
+6. ★ **`#SBATCH` in the body** setting the same three options. **This channel changed twice
+   and the brief you last read was wrong about it.** The body still never reaches slurmd —
+   husk submits its own script on stdin (`spool.rs:186`) and the agent's body is a separate
+   data file. But as of `da7a6e6` husk *interprets* body directives and **re-emits them onto
+   the real command line**, merged with the CLI by option name. So the question is no longer
+   "does husk's parse influence what husk emits" — it does, by design, on every job. The
+   question is **whether the merge can be steered**: see N5, which owns this surface.
+
+7. ★ **The run-time fd check has a designed soft spot, and it is written down.** If fd 1 does
+   not look like a regular file the guard reports and *continues* (`policy.rs:1290`) — failing
+   open, because a legitimate job may have its stdout on a pipe. Two questions: can you reach
+   that branch deliberately (make `readlink` fail, make `/proc` unavailable, exhaust
+   something), and if you can, does the submit-time half still hold on its own? Assume the
+   branch is reachable; the interesting part is what is left when it is.
+
+8. ★ **`--ro-bind-try` means a deny that silently does not apply.** If the source is absent
+   when the job starts, the bind is skipped and nothing says so. Can you arrange that — remove
+   a denied path between submit and job start, then create it inside the job? The auto-exec
+   masks are supposed to cover the absent case; check that they do for a path the *operator*
+   denied explicitly, which is the case the masks were not written for. (Shared with N6.)
 
 ## What counts as a finding
 
@@ -95,6 +141,12 @@ the feature**, so a wrongly-refused legitimate path is a finding too.
 - Any value the agent supplies that ends up as the **base** of a confinement check.
 - A disagreement between `normalize_abs` and `confine_under_workdir` about the same path.
 - A submission accepted from a directory not in the writable set.
+- ★ **Anything checked at submit time that can be changed before the job runs.** This is the
+  generalisation of your own CRITICAL: husk validates on the login node and slurmd acts on a
+  compute node, later. Every submit-time check is a claim about a machine husk is not on, at a
+  time that has not happened yet. Enumerating the checks that live only at submit time is
+  itself a useful deliverable, whether or not you can win any of the races.
+- ★ A route that reaches the fd guard's fail-open branch *and* defeats the submit-time check.
 - **The inverse:** a submission *refused* from a directory that IS in the declared writable
   set. The feature failing closed is still the feature failing, and `b4879f0` was two bugs in
   one expression — a security hole and a usability one.

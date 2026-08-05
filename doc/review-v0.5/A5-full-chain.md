@@ -3,11 +3,24 @@
 **Workstream A** (assumed-breach) · **in-cage on Balfrin** · **verdict from outside**
 · bound by the **rules of engagement** in `A-RULES-OF-ENGAGEMENT.md`
 
-> **Refreshed 2026-08-03, after the v0.5 fixes.** The chain still has four layers and the
-> cross-hop question is unchanged, but **both ends moved**: the top now submits on stdin with a
-> husk-authored script, and the bottom hands off to the agent's body as a data file. The
-> laundering carrier this brief named — the job script body — therefore travels differently
-> than it did. Marked ★ below.
+> **Refreshed 2026-08-05.** The chain still has four layers and the cross-hop question is
+> unchanged, but both ends have moved again. Marked ★ below.
+>
+> ## ★★ Read this first: this brief has never actually run
+>
+> The last attempt did not produce a result. **The cage-build collision killed three of its
+> four concurrent jobs in bwrap setup**, so the deep chain was *blocked*, not walked. The
+> "REFUTED" verdicts recorded against hops 2–4 came from reading code on a laptop afterwards,
+> not from the cluster. Treat them as untested hypotheses, not as prior results.
+>
+> That collision is fixed. **This is a first run, not a re-run** — and it is the only brief on
+> the list of which that is true. Two consequences:
+>
+> - The concurrency this brief needs now works. If jobs start dying in setup again, that is
+>   itself the finding — stop and report it rather than working around it.
+> - Nothing here has been picked over. Where the other briefs are hunting for a fourth bug in a
+>   surface that has yielded three, you are walking a chain that no reviewer has reached the
+>   end of.
 
 ## The question
 
@@ -44,9 +57,24 @@ the same brick stacked. Both broker instances default-deny their own surface.
   wrapper on stdin**, and the agent's body travels separately, as a file at
   `<write-root>/.husk-body-<req.id>.sh`, read by an interpreter husk names *inside* the cage.
   So the body is no longer a thing that passes THROUGH slurmd — it is a thing husk parses at
-  hop 1 and the cage executes at hop 2, with no shared parser between them. The laundering
-  question survives but its carrier is different: the body is now **data at hop 1 and code at
-  hop 2**, which is the classic shape for exactly this class.
+  hop 1 and the cage executes at hop 2. The laundering question survives but its carrier is
+  different: the body is now **data at hop 1 and code at hop 2**, which is the classic shape
+  for exactly this class.
+- ★★ **A new hop appeared, upstream of everything this brief previously covered.** As of
+  `da7a6e6` husk *interprets* the body's `#SBATCH` directives and **re-emits the resource
+  family onto sbatch's own command line**, merged with the CLI options by option name. The
+  brief you last read said the two had "no shared parser"; that is now false.
+  
+  This is the cross-hop shape you are hunting, and it is new: **a byte the agent writes into a
+  data file at hop 1 becomes an argv element husk hands to slurmd — before hop 2 exists.** The
+  agent's body is the least-trusted input in the system and sbatch's command line is the most
+  trusted channel husk has. Everything in between is one parser and one merge rule, written
+  in an afternoon. N5 owns the parser in detail; **your question is different — what does a
+  laundered option do *further down the chain*, at hops 3 and 4, that hop 1 would not notice?**
+- ★ **Hop 4 gained an inner shell.** B4-F8 put an `exec` hop inside each rank's cage: the rank
+  script now carries a single-quoted inner script (`rank.rs:241`) that closes the namespace fds
+  and `exec`s the workload. Another quoting surface on the MPI-critical path, and the path
+  where literal quotes once took every job down.
 - **`job_args` moved into the guard.** With no script operand there is nowhere on sbatch's
   command line for them, so they are `sh_quote`d into a `set --` line in the generated script.
   Agent bytes, quoted by husk, into a script the **uncaged** first instance of the guard
@@ -61,9 +89,19 @@ the same brick stacked. Both broker instances default-deny their own surface.
 ## Starting points
 
 1. **Value laundering.** Find a field the login broker passes through as data that the
-   step-broker later treats as a control — or vice versa. The job script body is the obvious
-   carrier: it is opaque to the login broker's option checks but is where the step requests are
-   generated.
+   step-broker later treats as a control — or vice versa. The job script body is still the
+   obvious carrier, but ★ **note what changed: the body is no longer opaque to the login
+   broker's option checks.** husk now reads it, and a directive in it becomes an argv element.
+   So the body is simultaneously (a) data staged to a file, (b) input to husk's option parser,
+   and (c) the place step requests are generated. One artefact, three readers, three different
+   notions of what it means. That is the richest laundering surface in the system.
+
+   The specific chain worth walking: **a resource option accepted at hop 1 and re-emitted, that
+   changes what hop 3 or hop 4 does.** `--ntasks`, `--gres`, `--distribution`, `--cpus-per-task`
+   all shape the step layout the step-broker later launches ranks into. Hop 1 validates them as
+   *charsets*, not as semantics — the grammar's stated job is to keep shell metacharacters out
+   and let slurmd judge meaning. So ask what a value that is charset-legal and semantically
+   hostile does three hops later.
 2. **Trust position confusion.** Each broker instance is trusted *relative to what it launches*
    and untrusted relative to what launched it. Is there any code path where an instance treats
    input from the wrong direction as trusted? The environment carried down the chain is the

@@ -7,6 +7,29 @@
 > and everything below still applies. Three things around it moved — the holder's liveness, the
 > per-rank `/dev/shm` check, and what survives a job — and one of them turned a starting point
 > below into a CONFIRMED bug that has since been fixed. Marked ★ where it matters.
+>
+> ## ★★ Updated 2026-08-05 — how your last run actually went, and what it means for this one
+>
+> **Your independent pass came back clean. The hinted pass found A4-F3.** That is the single
+> most useful fact about this brief, and it is a fact about *method*, not about the bug.
+>
+> A4-F3: the compute cage masked `.Rprofile` and `.hg/hgrc`; the login cage did not. Both live
+> in the shared, agent-writable project dir, so a login-session agent could delete and recreate
+> either with content of its choosing. R sources `.Rprofile` from the working directory at
+> startup; Mercurial reads `.hg/hgrc` and trusts it because the invoking user owns it. **Neither
+> needs the agent to be running** — the payload fires the next time a human runs `R` or `hg` in
+> that directory, outside every cage. And the compute cage's re-masking *hid* the gap, because
+> it made brokered jobs look protected.
+>
+> The durable shape, which is what you should hunt this time:
+>
+> > **husk expresses one policy in two places — Rust for the compute cage, shipped JSON for the
+> > login cage — and they disagreed.** Wherever a control is stated twice, the divergence is
+> > the bug, and the cage that is *more* protective hides the one that is less.
+>
+> There is now a pairing test asserting the two lists against each other
+> (`LOGIN_AUTO_EXEC_DENY`, `settings.rs:187`). One pair is pinned. **The question for this run
+> is how many other doubly-stated policies exist that nobody has paired yet.**
 
 ## The question
 
@@ -75,6 +98,25 @@ this brief tests whether that treatment is complete.
    `<write-root>/.husk-body-<req.id>.sh` and the guard `rm -f`s it. That is another
    agent-influenced path in a directory the job can write — same family as everything else
    here. (Owned by A3; flag overlaps rather than chasing them.)
+
+8. ★★ **The auto-exec mask set is a denylist, and it is stated in two languages.** Four lists
+   govern it (`settings.rs`): `AUTO_EXEC_DIRS` (masked wholesale), `AUTO_EXEC_RO_FILES`
+   (read-only if present), `AUTO_EXEC_RO_OR_EMPTY` (masked even when absent, so the plant
+   cannot be created), and `LOGIN_AUTO_EXEC_DENY` (the login half, enforced by shipped JSON).
+   Every one enumerates *what husk knows about*. Find something that auto-executes from a
+   working directory, needs no trust prompt, and is on none of them.
+
+   Two specific traps already paid for, so aim past them: masking a path *inside* `.git`
+   fabricated a repository where none existed and broke `git init`, which is why `.git` is
+   masked by **shape** rather than by path; and an absent *intermediate* (`.hg` with no repo)
+   must become an empty directory, not a character device.
+
+9. ★ **Absent target vs absent source.** The mask architecture rests on "a path that does not
+   exist yet is still masked, so it cannot be created." A neighbouring change now makes an
+   absent *source* skip silently (`--ro-bind-try`, `396ae7b`, forced by the ghost-file
+   incident). Those are meant to be two different cases. Test that they actually are — a
+   confusion between them turns "masked even when absent" into "silently not masked". (Shared
+   with N6.)
 
 ## What counts as a finding
 
