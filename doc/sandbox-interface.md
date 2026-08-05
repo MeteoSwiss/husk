@@ -1,236 +1,222 @@
 # Sandbox interface spec
 
-> **⚠ STALE — read with care (flagged 2026-08-05).** This describes a v0.2/v0.3 contract
-> and cites harm IDs against a threat model that has since moved (H10/H11 added, the
-> bash-vs-native-tool asymmetry closed by `--tools Bash`). It is nonetheless the
-> **acceptance criterion for ROADMAP 6b** — the test is that the string `claude` appears
-> nowhere in it except as one integration among others — so it is worth rewriting *before*
-> 6a rather than after. Until then, treat [PRINCIPLES.md](PRINCIPLES.md),
-> [threat-model.md](threat-model.md) and [constraints.md](constraints.md) as authoritative
-> where they disagree with it.
+**The contract between husk and the agent it wraps.** An agent that satisfies it can be
+wrapped without modification, and without husk knowing anything about the agent.
 
-This document defines the contract between the HPC agent sandbox and the
-agent it wraps. An agent that satisfies the requirements below can be
-wrapped by the sandbox without modification to the sandbox layer.
+husk is a **best-effort, client-side sandbox for LLM agents on supercomputers**. Every word
+in that sentence is a scope limit and each is deliberate:
 
-The sandbox is agent-agnostic. It wraps any process. The first integration
-wraps Anthropic's Claude Code (see integrations/husk/); future
-integrations are added by writing a launcher that invokes the sandbox
-with the agent binary as its target.
+- **Best-effort** — it raises the cost of the harms in [threat-model.md](threat-model.md). It
+  is not a jail for hostile native code, and it does not claim to be. An agent determined to
+  break out, with a kernel exploit, breaks out.
+- **Client-side** — it runs as the user, with the user's rights, on a machine husk does not
+  administer. There is no root, no daemon, no site cooperation required. That is what makes
+  it deployable on a shared cluster, and it is also the ceiling on what it can promise.
+- **For LLM agents** — the adversary model is a capable, non-malicious system that will do
+  surprising things with credentials, allocations and other people's jobs. Not malware.
+- **On supercomputers** — shared login nodes, a batch scheduler, other people's work running
+  next to yours, and a home directory full of things worth protecting.
 
-Threat model: doc/threat-model.md. Harm IDs (H1, H2, …) referenced below
-are defined there.
+Level 2 of the documentation stack — see [README.md](README.md). Harms are `H*`, principles
+are `P*`.
 
-## What the sandbox provides
+---
 
-Three independent layers applied to the wrapped process tree:
+## 1. The axiom
 
-1. Filesystem isolation (bubblewrap).
-   The wrapped process sees a mount namespace where:
-     - One or more explicit paths (typically the project directory) are
-       writable.
-     - Paths outside any denyRead region are visible read-only via the
-       root bind mount.
-     - Paths inside denyRead regions are invisible. On CSCS the default
-       denyRead is /users — all home directories on the cluster.
-     - Configuration files inside protected regions may be replaced with
-       /dev/null inside the namespace.
-   Defends H2, H4 (operationally), H7, H8, H9-in.
+> **Confine from the outside. Wrap what you can, mediate what you cannot, and require nothing
+> of either.**
 
-2. Network isolation (bwrap --unshare-net + host-side proxy).
-   The wrapped process has no network namespace of its own. Its only
-   network path is a Unix socket bind-mounted into the sandbox connecting
-   to a host-side proxy. The proxy:
-     - Exposes one HTTP CONNECT endpoint (port 3128) and one SOCKS5
-       endpoint (port 1080) inside the sandbox.
-     - Enforces a domain allowlist from a user-maintained config file.
-       The agent can read the file but cannot write it. The proxy reloads
-       on file change.
-     - Optionally logs requests for audit.
-   There is no other network path. Direct socket() / connect() reaches
-   nothing. Defends H5, H5', H6.
+husk never asks the agent to restrict itself. A control that depends on the confined party
+choosing to honour it is not a boundary, it is an agreement — and the agent's disposition is
+not something husk can verify or a future version guarantee (`P2`).
 
-3. Syscall isolation (seccomp).
-   A deny-list of "exotic" syscalls is installed before the wrapped
-   process starts:
-     - Blocked: ptrace, bpf, io_uring family, AF_UNIX socket creation,
-       kexec_load, pivot_root, personality (ABI-switch forms), plus ~20
-       more. Full list in the seccomp-wrapper source.
-     - Coverage includes secondary ABIs (x86 on x86_64, arm on aarch64).
-     - Enforcement: SCMP_ACT_KILL_PROCESS. An offending child is killed;
-       the parent agent receives the exit code and can recover.
-   Standard syscalls (read, openat, write, mmap, futex, …) work normally.
-   Defends H1 (narrows kernel attack surface).
+This has a precise consequence that shapes everything below. The obligation on an agent is
+**not cooperation but tolerance**: it does not have to help, it only has to keep working
+while restricted. Nothing is delegated to it, so nothing about it has to be trusted.
 
-## Wrapping a closed-binary agent (namespace inheritance)
+**Two mechanisms, one principle:**
 
-The sandbox treats the agent as opaque — it never patches the agent. When the
-wrapped agent is itself a closed binary that sets up its OWN inner bwrap per
-tool call (as Claude Code does — a single compiled binary, unpatchable), the
-sandbox can still inject filesystem policy from the OUTSIDE: create the mount
-namespace and apply bind-mounts BEFORE launching the agent, and the agent's
-inner bwrap — which re-binds the host filesystem from the namespace it runs
-in — inherits them.
+| | mechanism | example | what the agent must do |
+|---|---|---|---|
+| **Wrap** | the resource is reachable, so remove it from the namespace | `/users` is not mounted; there is no network but a proxy socket | nothing — it is simply not there |
+| **Mediate** | the resource is a service husk cannot wrap, so substitute the door to it | `slurmctld` runs on another host; a stub sits at the path of the real `sbatch` | nothing — it runs `sbatch` and gets what is at that path |
 
-The v0.2.1 SLURM shim uses exactly this: an outer wrapper bind-mounts a
-controlled stand-in over sbatch/srun/salloc/scancel before exec'ing the
-agent, and every sandboxed tool call inherits the shimmed binary. This is how
-an unmodifiable agent is contained without any API into it — the general
-pattern for closed integrations.
+Mediation is not a weaker form of wrapping, it is the answer to a different question: *you
+cannot put a mount namespace around a daemon on another machine.* What both have in common is
+that the agent is not consulted.
 
-## Sandbox-to-agent context channel
+---
 
-The sandbox communicates its state and configuration to the agent via two
-mechanisms:
+## 2. What husk provides
 
-  1. Environment variables (SANDBOX_* namespace) — structured facts the
-     agent reads programmatically. Minimum set:
-       SANDBOX_ACTIVE              "1" when the sandbox is wrapping
-       SANDBOX_PROJECT_DIR         absolute path to the writable working
-                                   directory
-       SANDBOX_DENY_READ           paths invisible to the wrapped process
-                                   (comma-separated)
-       SANDBOX_ALLOWLIST_PATH      file the user maintains for both
-                                   network and filesystem allowlist policy
-       SANDBOX_NETWORK_KEY         key within ALLOWLIST_PATH for network
-                                   allowedDomains
-       SANDBOX_FILESYSTEM_KEY      key within ALLOWLIST_PATH for filesystem
-                                   allowRead
-       SANDBOX_POSTURE             "strict" or "permissive" (network)
-       SANDBOX_INFO_PATH           absolute path to the reference document
-                                   described below
+### 2.1 Wrapped layers
 
-  2. A reference document at $SANDBOX_INFO_PATH — human-readable, written
-     for an LLM agent to consume. Describes the rules in prose plus
-     recommended user-facing phrasing for each failure mode the agent will
-     encounter.
+Applied to the **whole agent process tree**, from outside, by a wrapper the agent never sees:
 
-The agent decides how to consume the channel. LLM agents typically inject
-relevant content into a system prompt; script-based agents read the
-document when handling errors. The contract is that the sandbox provides
-these — the agent is free to ignore them, but a polished integration uses
-them to give the user actionable guidance instead of a bare error code.
+1. **Filesystem** (bubblewrap). Read-only root; the writable set is the project directory
+   plus configured roots; homes are replaced by an empty tmpfs; declared credential paths are
+   masked; auto-exec dotfiles are neutralised.
+2. **Network** (network namespace + proxy). No route by default. With an allowlist
+   configured, exactly one hole: a unix socket to a filtering proxy that runs **outside** the
+   namespace and holds the policy.
+3. **Syscalls** (seccomp). A blocking filter, with `io_uring` the trap worth naming — see
+   §4.3.
 
-### Failure modes the reference document should cover
+### 2.2 Mediated services
 
-The document should walk the agent through at least these cases, with
-sample user-facing phrasing for each:
+Where the resource is a daemon husk cannot wrap:
 
-  - Network HTTP 403. The requested domain is not in the allowlist. The
-    user can add it by editing $SANDBOX_ALLOWLIST_PATH under
-    $SANDBOX_NETWORK_KEY.
+- **The scheduler.** A stub is bind-mounted over the real client binary inside the cage; a
+  broker runs outside it, holds the credentials and the daemon route, and validates every
+  request by construction rather than by filtering (`P4`, `P5`). The real binary and the
+  credentials never exist inside the boundary, so there is nothing to bypass.
 
-  - Filesystem ENOENT / EACCES on a path inside $SANDBOX_DENY_READ. The
-    path is invisible to the agent because it falls inside a denied
-    region. Typical case: the user's ~/miniconda3/ lives under /users and
-    is not in allowRead. The user fixes by adding the path to
-    $SANDBOX_ALLOWLIST_PATH under $SANDBOX_FILESYSTEM_KEY (same file,
-    different key).
+### 2.3 Context channel
 
-  - Subprocess killed by SIGSYS. The subprocess hit a blocked syscall.
-    The agent should pick a different approach and not retry; this is a
-    structural limit, not user-fixable.
+husk tells the agent what its boundary is — a banner in the job, `HUSK_WRITABLE` in the
+environment, and an attributed message on every refusal (`P11`). This is **information, not
+negotiation**: the agent cannot reply, and nothing it does with the information changes the
+boundary. It exists because an unattributed denial produces confident wrong remediation, not
+because the agent is owed an explanation.
 
-  - Network connection refused / DNS resolution failed for a domain that
-    IS on the allowlist. Infrastructure issue (proxy down, upstream
-    unreachable), not a sandbox policy issue; the agent should surface
-    the actual error rather than blame the sandbox.
+---
 
-## SLURM gateway (optional)
+## 3. Conformance: what the agent must tolerate
 
-Where the host scheduler (e.g. SLURM) is unreachable from inside the sandbox by
-design — the credential socket (MUNGE/AF_UNIX) and the network are both cut — an
-agent still needs a controlled way to submit jobs that do not escape onto
-unsandboxed compute nodes. The sandbox can provide a GATEWAY:
+> **If it still works inside the sandbox because it has a graceful fallback, it is wrappable.
+> If it refuses to work, it is not.**
 
-  - It SHADOWS the submit binary (e.g. sbatch) inside the sandbox with a thin
-    stub, and exposes a request channel (a bind-mounted drop dir or fifo) whose
-    path it advertises in the context channel (e.g. SANDBOX_SLURM_BROKER).
-  - The stub serializes a structured job request (script, partition, resources)
-    to the channel — plain file I/O, so it works even with AF_UNIX blocked.
-  - A BROKER process running OUTSIDE the sandbox (where the scheduler IS
-    reachable) validates the request against policy, forces safe options, and
-    submits a job whose payload runs re-sandboxed (the same syscall + bwrap
-    layers) on the compute node.
+That is the whole test, and it is about degradation rather than about needing nothing.
 
-The split is deliberate: the real submit binary and the scheduler credentials
-never enter the sandbox, so the agent has no path to submit directly — a stub
-that submitted from inside would be bypassable. The broker, the request schema,
-and the compute-side re-sandboxing are agent- and sandbox-agnostic; only the two
-delivery responsibilities above (shadow the binary, expose the channel) belong
-to the sandbox, which keeps the gateway portable across integrations.
+| # | requirement | why it is a real limit |
+|---|---|---|
+| **T1** | **Tolerates an incomplete filesystem.** Paths vanish, writes return `EROFS`, some files read empty. The agent must degrade, not abort. | husk cannot make a hidden home appear. An agent that requires `$HOME` to be writable at startup cannot run. |
+| **T2** | **Tolerates having no network, or accepts proxy configuration.** Standard `HTTP_PROXY`/`HTTPS_PROXY` env, or an equivalent setting. | The proxy is the only route. Raw sockets and direct DNS do not work, and an agent that treats "no network" as fatal has no degraded mode to fall back to. |
+| **T3** | **Does not require a blocked syscall.** | `io_uring` is the live trap: some async I/O libraries adopt it opportunistically, and it is blocked because it is a well-known filter bypass. The agent must be able to run on `epoll`/`poll`. |
+| **T4** | **Runs unprivileged.** No setuid, no `CAP_SYS_ADMIN`, no assumption of root. | husk itself has no privilege to grant. |
+| **T5** | **Tolerates a mediated binary.** What sits at a system binary's path may be a stub that validates and forwards. | The agent must not require the real binary by inode, hash, or its exact stderr. |
 
-## What the agent must accept
+**Not wrappable, by design.** An agent that needs a kernel module, a privileged helper, or a
+device husk cannot expose is out of scope — and saying so is a feature of this document, not a
+gap in it. The interesting boundary is not "does it need something" but "does it *fail* when
+it does not get it".
 
-An agent is wrappable if:
+---
 
-1. It writes only to its configured working directory or to other
-   explicitly allowed paths. The home directory may be read-only or
-   hidden depending on denyRead policy.
+## 4. What is deliberately NOT required
 
-2. Network traffic is configurable to go through the sandbox proxy. The
-   agent accepts HTTP_PROXY / HTTPS_PROXY / SOCKS_PROXY env vars, or
-   exposes an equivalent configuration mechanism. Direct DNS, raw
-   sockets, and io_uring-based networking will not work.
+Each of these was a requirement in an earlier draft. Each was dropped because it asked the
+agent for cooperation, and the axiom says we do not.
 
-3. It does not depend on blocked syscalls. Most agents satisfy this by
-   default. The notable trap is io_uring, which some modern async I/O
-   libraries use opportunistically; the agent must run in a mode that
-   uses epoll / poll / select instead.
+### 4.1 Nothing about the agent's internal tool architecture
 
-4. Tools that affect the system run as subprocesses, not in-process.
-   The sandbox layers apply to the entire process tree, but only to
-   processes that ARE in the tree. A tool the agent implements by opening
-   a file descriptor in its own process bypasses bwrap entirely. Such
-   tools cannot be sandboxed by this mechanism — they must be implemented
-   as subprocesses, or the agent must accept they are unsandboxed.
+The previous spec required system-affecting tools to run as **subprocesses**, on the grounds
+that a tool implemented in-process — opening a file descriptor inside the agent — bypasses a
+sandbox applied per-command. It called this "the most important requirement", and it was
+right about the mechanism: that asymmetry is real, it was measured, and it is what the tool
+allowlist in the reference integration currently works around.
 
-   This is the most important requirement. It is the structural finding
-   that drove this spec: existing agents that mix in-process tools with
-   subprocess tools (the Claude Code situation) leave a hole the sandbox
-   cannot close. The bash-vs-native-tool asymmetry called out in
-   threat-model.md is exactly the symptom of failing this requirement.
+**But the requirement was an artefact of wrapping the wrong thing.** It follows only if the
+sandbox wraps each *command*. Wrap the **harness** — one namespace around the agent process
+itself — and the distinction disappears: an in-process file read and a shelled-out `cat` are
+the same syscall in the same namespace, and a path that is not mounted is not reachable by
+either. There is no in-process door because there is no door.
 
-   Corollary: an agent that fully satisfies this requirement does not need
-   per-tool permission deny rules to protect credentials or config — the OS
-   filesystem boundary (denyRead) covers every tool uniformly. Such rules
-   (Read/Edit/Write deny patterns) are a compensation for in-process tools,
-   the Claude Code case; on a fully wrappable agent the policy lives in
-   denyRead and in the property that neither agent nor sandbox can modify the
-   allowlist. They may be kept as cheap defense-in-depth, but they stop being
-   load-bearing.
+So husk does not ask how an agent implements its tools. Owning the outer boundary is husk's
+job, and the moment husk owns it, the question stops being the agent's problem. Where husk
+does not yet own it, the shortfall is husk's to state — not a conformance requirement to
+push onto the agent.
 
-5. It runs as a normal user. No setuid, no CAP_SYS_ADMIN, no assumption
-   of root.
+### 4.2 Nothing about the agent's intentions
 
-## Out of scope for the sandbox
+Earlier drafts required that the agent "does not attempt to detect or bypass the sandbox".
+That is unenforceable and, under the axiom, unnecessary: probing is expected, and a boundary
+that holds only while unprobed is not a boundary. If an attempt succeeds, the finding is
+against husk.
 
-These are the agent's responsibility, not the sandbox's:
+### 4.3 Nothing about where the agent writes
 
-  - Agent loop, planning, tool dispatch, model API calls.
-  - Per-tool permission policy ("ask before sbatch", H3).
-  - Per-file content policy (don't read .env, fine-grained H2).
-  - User interaction, prompts, confirmations.
-  - Session transcripts and other agent-level audit.
-  - Choice of model and model provider.
+The agent does not have to confine itself to the writable set — husk confines it. The
+requirement is only T1: that being confined produces a degraded run rather than a crash.
 
-The network allowlist policy is the user's responsibility, not the
-sandbox's or the agent's. The user maintains the allowlist file directly;
-the sandbox enforces it; the agent cannot modify it. An agent that could
-expand its own network permissions would bypass H6 entirely.
+---
 
-## Compliance checklist
+## 5. The integration profile
 
-  [ ] Confines writes to a configurable working directory.
-  [ ] Accepts proxy configuration via standard env vars or config.
-  [ ] Does not require io_uring or any other blocked syscall.
-  [ ] Implements system-affecting tools as subprocesses (no in-process
-      file or network access).
-  [ ] Runs as an unprivileged user.
-  [ ] Does not attempt to detect or bypass the sandbox.
+An agent cannot widen its own boundary (`P2`). But an **integration** — the human-authored
+glue for a particular agent — must be able to *declare* what that agent needs, so an operator
+can decide before launch. Declaration by the integrator, decision by the operator, enforcement
+from outside. That is not cooperation: nothing the agent does at run time affects it.
 
-An agent meeting all six is fully wrappable. An agent meeting 1, 2, 3, 5,
-6 but failing 4 (in-process tools) is a best-effort integration: those
-specific tools are documented as known asymmetries, and their behavior
-depends on agent-level policy rather than sandbox-level enforcement. The
-current Claude Code integration is this case.
+A profile declares:
+
+- **Egress**: hosts and ports the agent must reach to function at all (a model endpoint), and
+  which are optional. The operator decides what goes in the allowlist; an empty allowlist must
+  still produce a working, degraded agent.
+- **Filesystem**: paths outside the project directory the agent needs to read, and any it must
+  write. Each is a carve-out an operator approves individually.
+- **Subprocesses**: whether the agent spawns helpers, and whether those helpers have needs of
+  their own.
+- **Mediated binaries**: which system commands the integration expects to be substituted.
+
+This section is the honest cost of agent-neutrality: **every harness has quirks, and finding
+them is work that cannot be automated away.** The profile is where that work is written down
+once instead of rediscovered per site.
+
+### 5.1 Model context servers (MCP and equivalents)
+
+The sharp case, and it splits along the wrap/mediate line, which is a good sign the framing
+holds:
+
+- **Local server — a subprocess the agent spawns.** It is a child of the wrapped process, so
+  it is already inside the cage. Nothing extra is required, and nothing extra is granted: it
+  inherits exactly the boundary the agent has.
+- **Remote server — a network service.** It is an egress allowlist entry like any other, named
+  in the profile and approved by the operator.
+
+Both are supportable in principle. What is **not** supportable is a server that must reach
+outside the boundary to be useful, because that is a request to widen the boundary from the
+inside. The shipped configuration currently disables project-supplied servers by default; that
+is a conservative starting position for the reference integration rather than a statement
+about the mechanism.
+
+---
+
+## 6. Policy
+
+husk defines **its own policy schema**. A vendor's configuration format is an **adapter** onto
+it, not the canonical form.
+
+This is the difference between wrapping one agent and being able to wrap agents. Expressing
+policy in a vendor's vocabulary means every future agent must be described in that vendor's
+terms, and it couples husk's boundary to a schema someone else revises. The adapter keeps the
+convenience — an existing integration's config continues to work — without the coupling.
+
+The policy source must be a file **the agent cannot write** (`P2`), and that pairing is
+asserted by a test rather than maintained by hand (`P8`).
+
+---
+
+## 7. Conformance checklist
+
+```
+[ ] T1  Degrades rather than aborts on a read-only / partially absent filesystem
+[ ] T2  Accepts proxy configuration, or runs usefully with no network
+[ ] T3  Runs without io_uring or any other blocked syscall
+[ ] T4  Runs unprivileged
+[ ] T5  Tolerates a stub in place of a mediated system binary
+```
+
+An agent meeting all five is wrappable. An agent failing one is not "partially wrapped" — it
+is an agent whose gap husk must state plainly, in its integration row, so that nobody reads
+a boundary into a place where there is none.
+
+## 8. Integrations
+
+| integration | status | known gap |
+|---|---|---|
+| Claude Code | reference integration, shipped | in-process file tools are not covered while the vendor runtime owns the outer boundary; worked around with a tool allowlist until husk owns it |
+
+The reference integration is one row. Everything above this table is the contract, and the
+contract does not know what is in it.

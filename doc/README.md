@@ -21,7 +21,7 @@ it is about.
 |---|---|---|---|
 | **L1** | [PRINCIPLES.md](PRINCIPLES.md) | what would still be true if husk were rewritten for another scheduler in another language | a principle is contradicted, or a candidate earns its second instance |
 | **L2** | [threat-model.md](threat-model.md) | the harm catalog (H1–H11), the compute-side attack vectors (AV1–AV8), what depends on a human | the architecture or the harm set changes |
-| **L2** | [sandbox-interface.md](sandbox-interface.md) | the agent-agnostic contract — the acceptance criterion for wrapping something that is not Claude | ⚠ **stale**; rewrite before ROADMAP 6a |
+| **L2** | [sandbox-interface.md](sandbox-interface.md) | the agent-agnostic contract: what husk provides, what an agent must TOLERATE, and what is deliberately not required | the axiom changes, or an integration finds a requirement the contract missed |
 | **L3** | [constraints.md](constraints.md) | every control, by enforcement surface: what it defends, what asserts it, which principle it serves | a control is added, changed, or removed |
 | **L4** | [review-v0.5/](review-v0.5/), [../slurm-broker/](../slurm-broker/), the git log | findings, bringups, mechanism, fix rationale — append-only | continuously |
 | **⟂** | [context.md](context.md) | current state, open gaps, what is in flight | every release, and whenever the state changes |
