@@ -323,7 +323,7 @@ glued spelling) were all *visible holes* in it:
 | slurmd decision | channels that can set it | broker control today | must dominate → |
 |---|---|---|---|
 | **what code runs** (→ whether it's caged) | script file · `--wrap` · stdin · **the script's own first line** | snapshot all three into `body`; husk submits **its own wrapper on stdin** and runs the agent's body as DATA inside the cage. `--wrap` stripped (F27) | the bytes slurmd executes are husk's, entirely — the agent authors none of them, and there is no staged path to substitute |
-| **stdout/stderr path** | `-o/-e` (4 spellings) · `#SBATCH` · `SBATCH_OUTPUT/ERROR` | husk always EMITS `--output/--error` on the CLI (outranks `#SBATCH`); glued shorts split first (F13); env stripped. The *value* may come from the request but is **confined to the job working directory subtree** — canonicalised, symlinks resolved, `%` specifiers allowlisted with `%x` excluded | an emitted-by-construction value wins over every channel, and can only name a file inside the subtree the job could already write |
+| **stdout/stderr path** | `-o/-e` (4 spellings) · `#SBATCH` · `SBATCH_OUTPUT/ERROR` | husk always EMITS `--output/--error` on the CLI, which outranks both `#SBATCH` and the env (CLI > env > directive) — the env is **dominated, not stripped**; glued shorts split first (F13). The *value* may come from the request but is confined to the job's writable set: the parent is canonicalised on disk, and the LEAF is `lstat`ed separately because it may carry `%j` and cannot be canonicalised — **that omission was A1**, an arbitrary write as the user outside the cage. `%` specifiers allowlisted, `%x` excluded | confinement at submit time is necessary and **not sufficient** (P3): slurmd opens the path when the job starts, so `--open-mode=append` denies the race anything to destroy and the job guard refuses to run a body whose fd 1/2 resolve outside the writable set |
 | **working dir** | `-D/--chdir` · `#SBATCH` · `SBATCH_CHDIR` · `req.cwd` | emit `--chdir`; confine `req.cwd` (reject `/`, floors, traversal) (F15/F19); a requested `--chdir` must resolve inside the `req.cwd` subtree | emitted + confined; `cwd` treated as adversarial, not metadata. The writable bind is still `req.cwd`, so `--chdir` changes where the job STARTS, never what is writable |
 | **partition/account/qos/reservation** | `-p` (4 spellings) · `#SBATCH` · `SBATCH_PARTITION` | require+force a partition from the operator's allowed SET; glued split (F14); force `--account`; **`--qos` and `--reservation` REJECTED** on CLI and in the body | forced value wins; mismatch rejected. The set makes the guarantee the WEAKEST member's, so an operator adding a partition widens the envelope — see below |
 | **uenv/repo mount** (root, via slurmstepd) | `--uenv/--view/--repo` · `#SBATCH` · `SBATCH_UENV*` | strip CLI; **reject** body/env selection that differs from session or names `--repo` (F26) | reject dominates (never rewrite the body) |
@@ -377,8 +377,12 @@ On a shared cluster the realistic harm from a misbehaving agent is not reading
 production run. That is a different axis from containment, and husk answers it in one
 line rather than with parameter caps.
 
-**The forced partition is the control.** Every brokered job is required to request, and
-is forced onto, a single partition (`HUSK_SLURM_PARTITION`, recorded at install). Choose
+**The forced partition is the control.** Every brokered job is required to request, and is
+forced onto, one of the partitions in `HUSK_SLURM_PARTITION` (recorded at install). That
+setting is a **list**, not a single name — one partition is not enough on a real cluster
+(Balfrin needs a GPU one and a post-processing one) — and the envelope is therefore only as
+strong as the **weakest member of the list**. Nothing in husk checks the weakest member, or
+any member. Choose
 a **preemptible** one and the property is structural: a job on a preemptible partition is
 interrupted by any job on any other partition, so an agent's work **cannot block the
 machine** no matter how much of it there is. No cap, no accounting logic, no per-option
@@ -390,11 +394,13 @@ both of which exist whether husk does or not.
 
 Two things follow, and both matter:
 
-1. **The guarantee is a property of the CONFIGURED partition, not of husk.** If the
-   partition recorded at install is not actually preemptible, this control silently is
-   not there. It is worth confirming per site — `scontrol show partition <name>` and the
-   QOS's preempt settings — because nothing in husk can check it and nothing will fail
-   loudly if it is untrue.
+1. **The guarantee is a property of the CONFIGURED partitions, not of husk.** If any
+   partition in the list is not actually preemptible, this control silently is not there
+   for jobs that request it. Confirm per site and **per member** — `scontrol show partition
+   <name>` and the QOS's preempt settings. Nothing in husk checks it, and **nothing fails
+   loudly if it is untrue**, which makes it an open instance of *a control that can fail
+   silently has already failed* (`P7`) and the reason H11 is in the harm catalog. An
+   install-time or startup-time check is the natural home; see `context.md`.
 
    **Choosing it is a supervision-mode decision, and operators should make it
    deliberately:**

@@ -99,10 +99,15 @@ pub fn pidns_path(pid: u32) -> String {
 
 /// The path a rank passes to `bwrap --userns`, given the holder's pid.
 ///
-/// Requires the holder to be **dumpable**: reading `/proc/<pid>/ns/*` goes through
-/// `ptrace_may_access`, so a holder that had cleared `PR_SET_DUMPABLE` would be one whose
-/// namespace no rank can open. That is why the holder, unlike the broker, does not call
-/// `refuse_to_be_read`.
+/// The holder is left **dumpable**, unlike the broker, which does call `refuse_to_be_read`.
+///
+/// Reading `/proc/<pid>/ns/*` goes through `ptrace_may_access`, so clearing the flag is a
+/// plausible way to lose the join — but that is reasoning, not the measurement. Measured on
+/// kernel 6.8, a non-dumpable holder is still openable and joinable via `bwrap --userns`.
+/// The flag stays set anyway, because the failure mode is what matters: if a kernel *does*
+/// enforce it, every rank of every step fails to build its cage. That is fail-closed on the
+/// MPI path, in exchange for a third layer on a process that is already unreadable and holds
+/// nothing. Not a cheap win. Measure on the target kernel before trading it.
 pub fn userns_path(pid: u32) -> String {
     format!("/proc/{pid}/ns/user")
 }

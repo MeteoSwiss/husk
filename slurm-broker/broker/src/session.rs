@@ -142,7 +142,22 @@ impl Session {
                 .map(|v| parse_partition_list(&v))
                 .filter(|v: &Vec<String>| !v.is_empty())
                 .unwrap_or_else(|| vec![DEFAULT_PARTITION.to_string()]),
-            account: nonempty("HUSK_SLURM_ACCOUNT"),
+            // Grammar-checked like every other value that reaches sbatch's command line.
+            // `HUSK_SLURM_PARTITION` has had one since it shipped; this one did not, purely
+            // because it arrived later — an asymmetry with no reason behind it (B6-F9). The
+            // source is trusted (operator-set, agent-inaccessible), so this is not a
+            // boundary; it is the difference between a typo that SLURM explains and a typo
+            // that becomes an argument nobody validated.
+            account: nonempty("HUSK_SLURM_ACCOUNT").filter(|a| {
+                let ok = crate::sbatch::is_valid_account(a);
+                if !ok {
+                    eprintln!(
+                        "broker: ignoring HUSK_SLURM_ACCOUNT={a:?} — not a SLURM account name \
+                         (letters, digits, `._+-`, max 64). No --account will be forced."
+                    );
+                }
+                ok
+            }),
             limits: Default::default(),
         }
     }
@@ -174,6 +189,29 @@ fn normalize_view(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{normalize_view, PartitionLimits};
+
+    #[test]
+    fn the_account_env_var_is_held_to_the_same_grammar_as_the_option() {
+        // B6-F9. `HUSK_SLURM_PARTITION` has had a value grammar since it shipped and
+        // `HUSK_SLURM_ACCOUNT` did not — an asymmetry with no reason behind it, just an
+        // order of arrival. The source is trusted, so this is not a boundary; it is the
+        // difference between a typo SLURM explains and a typo that becomes an argument
+        // nobody validated. Asserted against the SAME predicate the registry uses, so the
+        // two cannot drift apart (P8).
+        for ok in ["s83", "csstaff", "pr-tst-1", "a_b.c+d"] {
+            assert!(crate::sbatch::is_valid_account(ok), "must accept {ok}");
+        }
+        for bad in ["", "has space", "semi;colon", "$(id)", "a/b", &"x".repeat(65)] {
+            assert!(!crate::sbatch::is_valid_account(bad), "must refuse {bad:?}");
+        }
+        // An option-SHAPED value is accepted here, deliberately, and the contrast is worth
+        // keeping: `--account` is always emitted as ONE argv element (`--account=VALUE`), so
+        // a leading dash is data and cannot become a flag. Compare `rank.rs`, where env
+        // NAMES become bare arguments to bwrap and an option-shaped name is therefore
+        // refused outright. Same charset question, opposite answer, because the emission
+        // differs — which is the argument for canonical re-emission (P4/P5).
+        assert!(crate::sbatch::is_valid_account("--flag"));
+    }
 
     // Real `scontrol show partition` output: one PartitionName= line then indented
     // key=value tokens. DefaultTime and MaxTime are DIFFERENT numbers and live on

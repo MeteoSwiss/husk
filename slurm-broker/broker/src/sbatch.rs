@@ -60,6 +60,9 @@ fn v_time(s: &str) -> bool { bounded(s, 15, |c| c.is_ascii_digit() || c == ':' |
 fn v_time_at(s: &str) -> bool { bounded(s, 32, |c| c.is_ascii_alphanumeric() || ":+.-".contains(c)) }
 fn v_size(s: &str) -> bool { bounded(s, 16, |c| c.is_ascii_digit() || c == '.' || "KMGTPEkmgtpe".contains(c)) }
 fn v_name(s: &str) -> bool { bounded(s, 64, |c| c.is_ascii_alphanumeric() || "._+-".contains(c)) }
+/// The `--account` grammar, exposed so the operator's `HUSK_SLURM_ACCOUNT` is held to the
+/// same rule as an account arriving on the command line. One grammar, one definition.
+pub fn is_valid_account(s: &str) -> bool { v_name(s) }
 fn v_nodelist(s: &str) -> bool { bounded(s, 256, |c| c.is_ascii_alphanumeric() || "_,-[]".contains(c)) }
 fn v_gres(s: &str) -> bool { bounded(s, 128, |c| c.is_ascii_alphanumeric() || "_,:.-".contains(c)) }
 fn v_array(s: &str) -> bool { bounded(s, 64, |c| c.is_ascii_digit() || "-,:%".contains(c)) }

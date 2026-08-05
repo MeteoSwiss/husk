@@ -120,10 +120,13 @@ pub(crate) const CREDENTIAL_SOCKET_DIRS: &[&str] = &["/run/munge", "/var/run/mun
 /// - Masking the DIRECTORY rather than each known file means a new agent-config feature
 ///   (upstream keeps adding them: skills, workflows, routines, scheduled tasks…) is
 ///   covered the day it ships, with no list to keep in sync.
-/// - Per-file `--ro-bind /dev/null` would also be absent-safe, but bwrap has to create
-///   the mount point, and since the workdir is a bind of the real directory that leaves
-///   an EMPTY `settings.json` behind on the host — i.e. invalid JSON in the user's
-///   project. A tmpfs leaves at most an empty directory, which is harmless.
+/// - Per-file `--ro-bind /dev/null` survives an absent DESTINATION only where bwrap can
+///   create the mount point — true inside the bound workdir, false under the read-only
+///   root, where it fails and takes the cage with it. Even in the workdir it is the wrong
+///   trade: the bind leaves an EMPTY `settings.json` on the host, i.e. invalid JSON in the
+///   user's project. A tmpfs leaves at most an empty directory, which is harmless.
+///   (An absent SOURCE is a separate failure and always fatal — see `--ro-bind-try` and the
+///   ghost-file incident at the denyWrite loop.)
 ///
 /// A compute job has no legitimate need to read or write the agent's config, so hiding
 /// the directory outright costs nothing. Writes inside the tmpfs are discarded when the
@@ -856,16 +859,15 @@ impl FsPolicy {
             // NAME them, so there is nothing to check. `--proc /proc` then shows only the
             // job's own tree (measured: 5 entries instead of 429).
             //
-            // Why NOT for a rank. `bwrap --pidns FD` is parent-only — with `--unshare-pid`
-            // it makes the given namespace the PARENT of a fresh one, and without it bwrap
-            // fails outright ("Can't send pid: Invalid argument", measured on 0.6.1). So
-            // ranks cannot JOIN a shared PID namespace the way they join the shared user
-            // namespace, and giving each rank `--unshare-pid` would put every rank in its
-            // own namespace where it cannot even name its peers. That is precisely how
-            // sibling USER namespaces broke Cray MPICH's Cross Memory Attach, and it is the
-            // same mistake one layer down. The job cage holds no ranks, so this costs
-            // nothing there; MPI started directly from the batch script stays in ONE
-            // namespace and keeps CMA.
+            // Why the RANK cage does not add it. A rank JOINS the holder's PID namespace
+            // (`bwrap --pidns <fd>`, see rank.rs) and must not also `--unshare-pid`, which
+            // would nest it in a fresh namespace of its own where it cannot name its peers.
+            // That is precisely how sibling USER namespaces broke Cray MPICH's Cross Memory
+            // Attach — the same mistake one layer down (P1). Verified on hardware by two
+            // arms that must both hold: `steps.pidns` (a rank sees its own namespace, not
+            // the node) and `steps.pidns_peers` (ranks can name each other, so CMA has
+            // peers). The job cage holds no ranks, so unsharing costs nothing there, and MPI
+            // started directly from the batch script stays in ONE namespace and keeps CMA.
             a.push("--unshare-pid".into());
         }
         if kind == CageKind::Rank {
@@ -1991,13 +1993,11 @@ mod tests {
     // step-broker and egress proxy — which is stronger than the PR_SET_DUMPABLE credentials
     // check that defends them otherwise, because there is nothing left to name.
     //
-    // A RANK must not have one. `bwrap --pidns FD` is parent-only (with `--unshare-pid` it
-    // makes the given namespace the parent of a fresh one; without it bwrap fails outright,
-    // "Can't send pid: Invalid argument", measured on 0.6.1), so ranks cannot join a shared
-    // PID namespace the way they join the shared user namespace. Giving each rank
-    // `--unshare-pid` would put every rank in its own namespace, unable to name its peers —
-    // which is exactly how sibling USER namespaces broke Cray MPICH's Cross Memory Attach
-    // and killed ICON. Same mistake, one layer down.
+    // A RANK joins that namespace rather than unsharing into one of its own: `--pidns <fd>`
+    // without `--unshare-pid`, so every rank of a step lands in the holder's namespace and
+    // can name its peers. Adding `--unshare-pid` there would nest each rank alone, unable to
+    // see the others — exactly how sibling USER namespaces broke Cray MPICH's Cross Memory
+    // Attach and killed ICON. Same mistake, one layer down (P1).
     #[test]
     fn only_the_job_cage_unshares_pids_because_a_rank_must_still_name_its_peers() {
         let job = joined(&FsPolicy::default(), "/work");

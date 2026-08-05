@@ -695,9 +695,11 @@ surfaces as an obscure MPI abort rather than as the containment change it actual
 **Holder lifetime.** One per JOB, not per step: nothing in it is step-specific, and a
 namespace per step is a process per step to leak. It dies two ways — EOF on stdin when the
 step-broker drops the pipe, and `PDEATHSIG` if the step-broker dies without dropping
-anything. It must stay **dumpable**: reading `/proc/<pid>/ns/user` goes through
-`ptrace_may_access`, so a holder that cleared `PR_SET_DUMPABLE` like the broker does would
-be one whose namespace no rank could open.
+anything. It stays **dumpable**, unlike the broker. Reading `/proc/<pid>/ns/user` goes
+through `ptrace_may_access`, so clearing `PR_SET_DUMPABLE` is a plausible way to lose the
+join — but measured on kernel 6.8 a non-dumpable holder is still joinable, so that is
+reasoning rather than result. It stays set because of the failure mode: on a kernel that
+does enforce it, every rank of every step fails to build its cage.
 
 **Consequence for the network phase.** Ranks keep separate network namespaces, so the
 *relay* into a cage stays per rank. The filtering proxy — the allowlist, the TLS
