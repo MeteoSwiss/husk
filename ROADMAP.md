@@ -106,12 +106,34 @@ and it is now routine: read the "not forwarded" line.
 
 ---
 
-## Track D — multi-node MPI
+## Track D — multi-node MPI — **MEASURED 2026-08-05: days, not weeks**
 
-**Scope it before committing.** One 2-node experiment decides between *days* and *weeks*:
-netns is exonerated, the Slingshot data path is a device rather than a socket, and VNI
-isolation is already Slurm's. Do the experiment early; the answer changes the shape of
-everything after it.
+The experiment ran (`fabric-probe.sh` C10, Balfrin, real 2-node allocation, job 5019306).
+**Exactly one thing blocks multi-node: `--unshare-net` per rank.** `cs_2node4rank_nonet`
+gives a real 4-rank communicator — the ICON shape, intra-node shared memory and the
+inter-node NIC at once — while `cs_2node4rank_netns` fails with `_pmi_set_af_in_use:
+Unable to obtain IP address`. `cray_shasta` PMI is TCP, and a rank alone in a netns has no
+IP to bind.
+
+Everything else is clear: the **fabric is orthogonal** (proven twice — the no-unshare arm
+failed identically, and `C11` shows a caged job really is on CXI, not degraded to TCP);
+**`/dev/shm` must be shared per node** (private tmpfs *hangs*; the per-job-subdir design is
+now measured); AF_UNIX can stay blocked at no functional cost; steps run concurrently.
+**The escape hatch is closed** — `pmix_2rank_UNCAGED` is also wrong-size, so this MPICH does
+not speak Slurm pmix at all, and `pmi2` fails the same at two nodes.
+
+**The open decision, and it is a real one.** Dropping `--unshare-net` gives those ranks the
+HOST network, so the egress proxy and allowlist stop applying — on the largest jobs. Three
+shapes: (1) accept it and document it as a capability difference between cage profiles, the
+way `single-node` and `multi-node` already differ; (2) **one netns per job-on-a-node** rather
+than per rank, with an address PMI can bind — consistent with `P1`, looks right on principle,
+needs its own measurement; (3) treat the fabric as the checked hole VNIs already make it.
+
+**Security item surfaced by the same run:** `SLINGSHOT_VNIS` is in the step environment and
+steers which VNI a process uses, while `SLINGSHOT_` is not in `RESERVED_ENV_PREFIXES` — so a
+caged rank can set it. Whether the NIC validates it against Slurm's grant is the
+AV8-over-fabric question, which needs a libfabric program rather than shell. Reserve the
+prefix regardless.
 
 ---
 
