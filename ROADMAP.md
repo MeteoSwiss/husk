@@ -159,6 +159,59 @@ broker, which session, which policy, which partitions, is the boundary actually 
 
 ---
 
+## Track F — the guard becomes a program
+
+**Decided 2026-08-06: the job guard should be compiled Rust, not generated bash.** This
+supersedes the "deferred typed shell builder" that `review-v0.5/B5-guard-generation.md` left
+open — that option is now judged to be aimed at the wrong bug class.
+
+**Why the builder is not enough.** B5's own verdict: the emitted shell is auditable, the
+generator is not, and *4 of 7 shipped guard bugs were quoting, interpolation or scoping*. But
+it also found that a builder "would not have caught the two most severe findings, which are
+semantic, not syntactic." 2026-08-06 confirmed that from the other direction: srun hung in
+five or six jobs because a nested `if` had no `else` and a backgrounded child was never
+checked. Both semantic. A builder that owns quoting would have shipped both.
+
+**Why a binary, specifically.** Not for speed and not for elegance — for the acquisition-side
+twin of [`PRINCIPLES.md` P6](doc/PRINCIPLES.md): *make the unverified state unrepresentable*.
+husk already does this on the login side, where `SandboxReady` (`husk-slurm-wrapper.rs`) can
+only be minted by a verified bind, so the agent exec cannot be reached without proof. The
+compute side has no such thing, because a shell cannot carry a proof. In Rust the guard's
+sharp edges become types:
+
+| today, in shell | as a program |
+|---|---|
+| `mkdir -p … \|\| _husk_spool=` — error becomes an empty string | a `Result` that must be handled |
+| broker started, never checked; `if` with no `else` | entering the cage needs a `StepBrokerReady` witness |
+| `trap` per exit path, correct only while maintained | `Drop`, which runs on every path including unwind |
+| a resource released in one branch and not another | acquiring *is* registering the release |
+
+**The feasibility question is settled and was never actually asked.** No document anywhere
+argues the guard must be bash. The recorded constraint is different: late-binding facts (GPU
+devices, MUNGE sockets, credential dirs) can only be resolved on the compute node — which is
+why guard *logic* exists, not why it is *shell*. And the binary is already there: the same
+artifact runs on compute nodes as `--step-broker`, which is how the step pair works at all.
+Observed on Balfrin 2026-08-06: `/users/cmueller/.local/bin/husk-slurm-broker --net-proxy`
+running on nid001231. SLURM needs a script as the entry point; that script can be one `exec`
+line. There is also a recorded decision *against* adding more compute-side guard shell, on
+fragility grounds — which points the same way.
+
+**The oracle changes, and this is the part to get right before starting.** The goldens
+(`tests/golden/guard-net-{on,off}.sh`) were built specifically to make this rewrite checkable
+— "prove the bytes are identical" instead of "hope the refactor was faithful". **That works
+for a builder and not for a binary**, which emits no bytes to compare. A Rust guard needs a
+*behavioural* oracle: drive both implementations through the same scenarios and compare what
+is observable — mount table, processes, exit status, messages, what survives cleanup. Building
+that harness is the first deliverable, not the second; without it this is the act of faith the
+goldens exist to prevent.
+
+**Sequencing.** After v0.5 ships. The current guard is freshly hardware-verified on both
+clusters and the pen-test re-run targets it; rewriting it now would discard that verification
+and invalidate briefs that were just refreshed against it. It likely lands with or before 6a,
+since both are "husk owns this layer rather than driving someone else's".
+
+---
+
 ## Cross-cutting — profiles as first-class
 
 Today site knowledge is scattered across install flags, Rust constants, env vars and a shipped
