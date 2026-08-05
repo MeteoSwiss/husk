@@ -95,6 +95,35 @@ a job, `SBATCH_*` env, anything.
 
 ---
 
+### N5. The `#SBATCH` directive interpretation path ★★ ADDED 2026-08-05 — TOP PRIORITY
+
+`da7a6e6` made husk interpret body directives and merge them with CLI options. **This is the
+newest code on the submission surface, it was written under production pressure the same day,
+and it is exactly the shape that produced three CRITICALs before: one parser, two channels,
+a precedence rule between them.** F13/F14/F24/F26/F27 all lived here.
+
+- Can a body directive reach slurmd in a form the CLI path would have refused? The two
+  channels now go through the same `interpret_cli`, but they are *tokenised* differently —
+  `sbatch_directives` splits on whitespace, argv arrives pre-split. Is there a spelling where
+  those disagree?
+- The merge is by option NAME, computed by splitting on the first `=`. Attack that: a flag
+  with no value, a value containing `=`, a short option, the same option spelled long in one
+  channel and short in the other (`--ntasks` vs `-n` — **do those collide in the override
+  check, or does the body copy survive beside the CLI one?**).
+- Can a body directive override a husk-FORCED option? `interpret_cli` should drop
+  Forced/Ignored from both channels — verify rather than assume.
+- Directives are now scanned only in the leading header block (A3). Combined with the merge:
+  is there a placement that husk reads and slurmd does not, or vice versa?
+
+### N6. The `-try` conversions (`396ae7b`)
+
+Every carve-out and deny bind below the workdir became `--ro-bind-try`, so a missing source is
+skipped rather than fatal. That is right for the ghost-file race, but it converts a loud
+failure into a silent one: **a denyWrite whose path is absent at run time simply does not
+apply.** Can an agent arrange for that — remove the file between submit and job start, then
+create it inside the job? The auto-exec masks are supposed to cover the absent case; check
+they actually do for a path the operator denied explicitly.
+
 ## Tier 3 — skip, or a cheap confirmation only
 
 | Brief | Why |
