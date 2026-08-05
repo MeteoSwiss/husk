@@ -1,5 +1,13 @@
 # Compute-job threat model — husk SLURM broker
 
+> **Scope.** This is **L4 mechanism** for the compute side. The harm catalog (H1–H11) and
+> the AV routes live in [`../doc/threat-model.md`](../doc/threat-model.md); the reasoning
+> that generalises beyond SLURM lives in [`../doc/PRINCIPLES.md`](../doc/PRINCIPLES.md).
+> Sections below that used to be headed "Design principle" are instances of those
+> principles, kept here for the compute-specific mechanism and cited by number — the
+> argument itself is not repeated, because the same rationale in two files is the drift
+> `P8` warns about.
+
 ## Base cage
 When the broker submits a job, the injected re-exec guard re-sandboxes it on the
 compute node (`seccomp-wrapper bwrap …`):
@@ -26,7 +34,7 @@ compute node (`seccomp-wrapper bwrap …`):
 - `--unshare-net` — no network by default; with an allowlist configured, **one hole**: a
   unix socket to husk's egress proxy, which runs outside the cage (see below)
 
-## Design principle (confine, do not merely forbid)
+## Confine, do not merely forbid — the compute-side shape of `P1`
 
 Some options cannot simply be forced to a constant without breaking the workflows husk
 exists to serve. `--output`/`--error`/`--chdir` are the case in point: HPC run scripts
@@ -76,12 +84,7 @@ inside ICON's initialisation with nothing pointing at husk. Same family as *capt
 values, don't trust references*: the reference was fine until the thing it referred to
 could move.
 
-## Design principle (announce the boundary)
-
-A cage whose denials are indistinguishable from filesystem or quota errors sends agents
-down expensive wrong paths. Worse for an LLM specifically: an unattributed error does not
-merely slow it down, it invites *confident wrong remediation* — rewriting a runscript that
-was never broken, or blaming Lustre.
+## Announcing the boundary (`P11`) — what a caged job is told
 
 Measured, 2026-07-31, from a caged agent running a production KENDA experiment: the job
 died with 22 `Read-only file system` lines across a 390-line log, **none** of which
@@ -105,12 +108,11 @@ The partition guard is the standard to match: it names the constraint, names the
 fires at submit time before compute is burned. The same agent complied with it in one step,
 with no investigation.
 
-## Design principle (the unit of confinement) — one cage per job-on-a-node
+## One cage per job-on-a-node (`P1`) — the mechanism
 
-**The security border is the job on a node, not the process.** All ranks of one MPI
-job are a **single trust domain**: same uid, same allocation, same files, same data,
-launched from the same script. There is no boundary between rank 0 and rank 3 to
-defend — the boundary that exists is *job ↔ host*.
+All ranks of one MPI job are a **single trust domain**: same uid, same allocation, same
+files, same data, launched from the same script. There is no boundary between rank 0 and
+rank 3 to defend — the boundary that exists is *job ↔ host*.
 
 So the job gets **one shared user namespace**, created once per job and used by every
 task of every step. A cage per *task* does not add a boundary; it makes **N redundant
@@ -241,7 +243,7 @@ Two consequences to hold to:
 Generalises beyond MPI: the question to ask of any new cage is *what is the trust
 domain here*, and to put exactly one wall around it.
 
-## Design principle (the network hole)
+## The network hole — compute-side egress
 
 Egress is off by default and, when configured, is **one hole of a shape husk chooses**:
 
@@ -284,13 +286,13 @@ husk tunnels bytes after authorising the destination and never inspects them. Co
 control needs TLS termination — ROADMAP 6b, where it also buys credential injection so an
 agent can use an API key it never sees.
 
-## Design principle (the cage)
+## The cage
 Layers must be **independent**. `--unshare-net` *will* be relaxed (allowlisted
 socat at best, open internet at worst), so the **filesystem cage must protect
 confidentiality on its own, assuming exfiltration is possible.** No secret's
 safety may depend on "there's no network."
 
-## Design principle (the gate) — deny by construction on the submission surface
+## The gate (`P4`, `P5`) — deny by construction on the submission surface
 The cage principle above protects a job *once it runs*. This one governs *what the
 broker agrees to submit*. It exists because every critical we found (F13, F14, F24,
 F26, F27) was the **same bug wearing different clothes: the broker secured its
@@ -443,7 +445,7 @@ not instance by instance.
 5. *Enforce invariants, not mechanisms*, as close to slurmd as you can reach (job/task prolog or SPANK is the privileged ideal; the re-exec guard is the unprivileged approximation). (F27)
 6. *Clean architecture only proves the axes you thought about* — transport-trust, memory-safety and fail-closed control-flow were all clean; the bugs lived on **input-language coverage**, an orthogonal axis. Assume the policy is incomplete over any rich interface and buy coverage adversarially (the multi-agent + docs-vs-code passes are that budget).
 
-## Design principle (what we rely on) — the load-bearing set
+## The load-bearing set — what husk relies on
 
 A command from the agent passes several gates. Only some are ours, and only some are
 **load-bearing**: husk's guarantee must hold even if every cooperative layer fails.
@@ -617,7 +619,7 @@ these were things this document previously asserted were already safe.
   `--unshare-net` *only* together with compute-side SLURM re-blocking).
 - Network target: **allowlisted socat, `slurmctld` excluded.**
 
-## Design decisions (from the threat discussion)
+## Design decisions taken during the threat discussion
 - **One parameterized fs-sandbox generator.** `settings.rs` is *the* bwrap-arg
   builder, parameterized by a profile (`Login | Compute`) so that when husk goes
   standalone (diverges from Anthropic) it does NOT fork into two near-identical
