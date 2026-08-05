@@ -391,6 +391,40 @@ else
   check FAIL policy sbatch.output_confined "status=$p5b_st msg=$p5b_msg (an uncaged write path was not refused)"
 fi
 
+# P5b2 — A1, the escape a live reviewer walked out with (Balfrin, 2026-08-04). The parent
+# of --output is confined on disk, but the LEAF cannot be canonicalised (it may be `%j`), so
+# it used to be appended as text — and a leaf that is already a SYMLINK is followed by
+# slurmd's open(), as you, outside the cage. The symlink lives INSIDE the writable workdir,
+# so every check on the parent passes; the file lands wherever it points.
+#
+# On disk on purpose: this is the one arm that cannot be checked from a request alone, and
+# it must run where /scratch really is (a canonicalisation on Lustre is not a unit test).
+A1LINK="$PWORK/husk-selftest-a1-link.out"
+A1TGT="$(dirname "$PWORK")/husk-selftest-a1-WITNESS.out"
+ln -sfn "$A1TGT" "$A1LINK" 2>/dev/null || true
+mkreq p5b2 sbatch "[\"--partition=$PART\",\"--output=$A1LINK\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p5b2"
+p5b2_st="$(respfield p5b2 status)"; p5b2_msg="$(respfield p5b2 message)"
+if [ "$p5b2_st" = rejected ]; then
+  check PASS policy sbatch.output_symlink_leaf "a symlink leaf in --output is refused (A1): ${p5b2_msg:0:60}"
+else
+  check FAIL policy sbatch.output_symlink_leaf "status=$p5b2_st - the A1 arbitrary-write escape is OPEN"
+fi
+# The refusal must teach without answering questions about the host filesystem: no resolved
+# target, no errno, no present-vs-absent tell (A7-1 — husk's message was an existence oracle
+# for paths the cage hides). Anchored on p5b, whose rejection is unconditional: asserting
+# "no leak" on a message that is EMPTY because the request was accepted is a vacuous pass,
+# and this arm exists precisely for the case where the other one has failed.
+if [ -z "$p5b_msg" ]; then
+  check FAIL policy sbatch.confine_msg_opaque "no refusal message to inspect (see output_confined)"
+elif grep -qE 'resolves to|os error|No such file' <<<"$p5b_msg"; then
+  check FAIL policy sbatch.confine_msg_opaque "the refusal leaks host filesystem state: $p5b_msg"
+else
+  check PASS policy sbatch.confine_msg_opaque "the refusal names no host fact (A7-1)"
+fi
+rm -f "$A1LINK" 2>/dev/null || true
+[ -e "$A1TGT" ] && check FAIL containment sbatch.output_symlink_leaf "A WITNESS FILE WAS CREATED AT $A1TGT - the escape ran"
+
 mkreq p5c sbatch "[\"--partition=$PART\",\"--chdir=/evil\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p5c"
 p5c_st="$(respfield p5c status)"
@@ -904,12 +938,12 @@ if [ ! -s "$GSCRIPT" ]; then
 else
   GRC=0
   ( export PATH="$GJOB/bin:$PATH" HOME="$GJOB/home" SLURM_JOB_ID=990001
-    cd "$GJOB/work" && bash "$GSCRIPT" ) >"$GJOB/job.out" 2>"$GJOB/job.err" || GRC=$?
+    cd "$GJOB/work" && bash "$GSCRIPT" ) >"$GJOB/work/job.out" 2>"$GJOB/work/job.err" || GRC=$?
 
-  if [ "$GRC" = 0 ] && grep -q GUARD-INNER-RAN "$GJOB/job.out"; then
+  if [ "$GRC" = 0 ] && grep -q GUARD-INNER-RAN "$GJOB/work/job.out"; then
     check PASS lifecycle guard.runs "the generated guard runs and reaches the job body"
   else
-    check FAIL lifecycle guard.runs "rc=$GRC — $(tail -3 "$GJOB/job.err" | tr '\n' ' ')"
+    check FAIL lifecycle guard.runs "rc=$GRC — $(tail -3 "$GJOB/work/job.err" | tr '\n' ' ')"
   fi
 
   # G1 — the job takes its step spool with it, egress and all.
@@ -932,7 +966,7 @@ else
 
   # G3 — and the job output says where that log is. A record nobody can find is not a
   # record; this is the same reasoning as the cage banner naming the writable paths.
-  if grep -q "husk's own log for this job: .*/\.husk/log/job-990001\.log" "$GJOB/job.err"; then
+  if grep -q "husk's own log for this job: .*/\.husk/log/job-990001\.log" "$GJOB/work/job.err"; then
     check PASS lifecycle guard.log_announced "the job output names its husk log"
   else
     check FAIL lifecycle guard.log_announced "the job never said where its husk log is"
@@ -974,12 +1008,12 @@ JSON
     check FAIL lifecycle guard.preempt_warned "the broker staged no script for the signal probe"
   else
     ( cd "$GJOB/work" && PATH="$GJOB/bin:$PATH" HOME="$GJOB/home" SLURM_JOB_ID=990003 \
-        timeout -s TERM 3 bash "$GJOB/spool/dry-sig.sh" ) >"$GJOB/sig.out" 2>"$GJOB/sig.err"
+        timeout -s TERM 3 bash "$GJOB/spool/dry-sig.sh" ) >"$GJOB/work/sig.out" 2>"$GJOB/work/sig.err"
     SIGLOG="$GJOB/home/.husk/log/job-990003.log"
-    if grep -q "TERMINATED EARLY" "$GJOB/sig.err" && grep -q "TERMINATED EARLY" "$SIGLOG" 2>/dev/null; then
+    if grep -q "TERMINATED EARLY" "$GJOB/work/sig.err" && grep -q "TERMINATED EARLY" "$SIGLOG" 2>/dev/null; then
       check PASS lifecycle guard.preempt_warned "a signalled job warns that its output is incomplete, in the job output AND the husk log"
     else
-      check FAIL lifecycle guard.preempt_warned "stderr=$(grep -c 'TERMINATED EARLY' "$GJOB/sig.err") log=$(grep -c 'TERMINATED EARLY' "$SIGLOG" 2>/dev/null || echo 0) — a preempted run can be read as a finished one"
+      check FAIL lifecycle guard.preempt_warned "stderr=$(grep -c 'TERMINATED EARLY' "$GJOB/work/sig.err") log=$(grep -c 'TERMINATED EARLY' "$SIGLOG" 2>/dev/null || echo 0) — a preempted run can be read as a finished one"
     fi
     # The trap is what makes the cleanup reachable at all: an untrapped SIGTERM kills the
     # guard shell outright, so before it existed EVERY signalled job leaked its step spool.
@@ -1021,7 +1055,7 @@ JSON
     check FAIL lifecycle guard.sock_deep "the broker staged no script for the deep workdir"
   else
     ( export PATH="$GD/bin:$PATH" HOME="$GD/home" SLURM_JOB_ID=990002
-      cd "$GDEEP" && bash "$GD/spool/dry-deep.sh" ) >"$GD/job.out" 2>"$GD/job.err"
+      cd "$GDEEP" && bash "$GD/spool/dry-deep.sh" ) >"$GDEEP/job.out" 2>"$GDEEP/job.err"
     OLDLEN=$(( ${#GDEEP} + 34 ))   # what <workdir>/.husk-step-spool-<jobid>/net.sock would be
     if grep -q "husk-proxy: listening on" "$GD/home/.husk/log/job-990002.log" 2>/dev/null; then
       check PASS lifecycle guard.sock_deep "egress came up from a ${#GDEEP}-byte workdir (old layout would have needed $OLDLEN of 107)"
