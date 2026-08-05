@@ -985,6 +985,28 @@ impl FsPolicy {
             // helper F22 introduced for exactly this, and it also gets `~/x` right (there
             // is nothing to re-bind under a hidden home).
             let Some(p) = abs_for_cage(p, workdir) else { continue };
+            // …and ONLY when the path is really there. **A BIND WHOSE SOURCE IS MISSING
+            // KILLS THE CAGE OUTRIGHT** — bwrap exits before the job runs, with a message
+            // that never says "husk". Balfrin 5014767/5014768/5014769, three dead jobs:
+            //
+            //   bwrap: Can't find source path <workdir>/.claude/settings.json: No such file
+            //
+            // The latent bug was always here (an absolute denyWrite of an absent path did
+            // the same); resolving relative entries is what made it fire, because the
+            // SHIPPED config lists `.claude/settings.json` and most projects have no such
+            // file. Fail-closed, and still an outage on every brokered job.
+            //
+            // Skipping the absent case is not a hole. denyWrite's job is to make an
+            // EXISTING readable path unwritable; stopping a dangerous path from being
+            // CREATED is the auto-exec mask's job below, which is shape-aware and
+            // absent-safe by construction and already covers `.claude`, `.git`, `.hg`,
+            // `.Rprofile` and `.mcp.json` — `.claude/settings.json` is inside a `--tmpfs`
+            // there, which is strictly stronger than a read-only bind. What B3-F8 actually
+            // buys is a relative deny on something the auto-exec set does NOT cover
+            // (`notes/secret.txt`), and that case is honoured exactly when the file exists.
+            if !std::path::Path::new(&p).exists() {
+                continue;
+            }
             if p.starts_with('/') && !path_under_floor(&p) {
                 a.push("--ro-bind".into());
                 a.push(p.clone());
@@ -1738,13 +1760,20 @@ mod tests {
     /// the job sees the host's real /dev and /proc despite --unshare-pid.
     #[test]
     fn config_paths_are_filtered_before_they_become_mounts() {
-        let p = FsPolicy { deny_write: vec!["/users".into(), "/scratch/x".into()], ..Default::default() };
+        // A REAL path for the ordinary case: a denyWrite is emitted only when its source
+        // exists, because a bind with a missing source kills the cage (Balfrin 5014767).
+        let real = std::env::temp_dir().join(format!("husk-dwreal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&real);
+        std::fs::create_dir_all(&real).unwrap();
+        let realp = real.to_string_lossy().to_string();
+        let p = FsPolicy { deny_write: vec!["/users".into(), realp.clone()], ..Default::default() };
         let a = p.compute_bwrap_args("/proj").join(" ");
         assert!(
             !a.contains("--ro-bind /users /users"),
             "a denyWrite under the floor must not bind the floor back into the cage: {a}"
         );
-        assert!(a.contains("--ro-bind /scratch/x /scratch/x"), "ordinary denyWrite still works: {a}");
+        assert!(a.contains(&format!("--ro-bind {realp} {realp}")), "ordinary denyWrite still works: {a}");
+        let _ = std::fs::remove_dir_all(&real);
 
         for bad in ["/", "//", "/."] {
             let p = FsPolicy { allow_write: vec![bad.into()], ..Default::default() };
@@ -2207,18 +2236,82 @@ mod tests {
     fn deny_write_rebinds_read_only_after_allow_write() {
         // denyWrite takes precedence: a subpath of a writable root is re-bound
         // read-only, and that ro-bind must come AFTER the allowWrite --bind.
+        // Real directories on disk: a denyWrite is emitted only when its source exists,
+        // because bwrap exits when a bind source is missing (Balfrin 5014767).
+        let scr = std::env::temp_dir().join(format!("husk-dworder-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scr);
+        std::fs::create_dir_all(scr.join("protected")).unwrap();
+        let (s_scr, s_prot) = (
+            scr.to_string_lossy().to_string(),
+            scr.join("protected").to_string_lossy().to_string(),
+        );
         let p = FsPolicy {
-            allow_write: vec!["/scr".into()],
-            deny_write: vec!["/scr/protected".into()],
+            allow_write: vec![s_scr.clone()],
+            deny_write: vec![s_prot.clone()],
             ..Default::default()
         };
         let args = p.compute_bwrap_args("/work");
-        assert!(args
-            .join(" ")
-            .contains("--ro-bind /scr/protected /scr/protected"));
-        let wr = args.iter().position(|a| a == "/scr").unwrap();
-        let ro = args.iter().position(|a| a == "/scr/protected").unwrap();
+        assert!(args.join(" ").contains(&format!("--ro-bind {s_prot} {s_prot}")));
+        let wr = args.iter().position(|a| a == &s_scr).unwrap();
+        let ro = args.iter().position(|a| a == &s_prot).unwrap();
         assert!(wr < ro, "denyWrite ro-bind must follow the allowWrite bind to win");
+        let _ = std::fs::remove_dir_all(&scr);
+    }
+
+    #[test]
+    fn every_bind_husk_emits_has_a_source_that_exists() {
+        // **THE REGRESSION THIS EXISTS FOR (Balfrin, jobs 5014767/8/9).** A bind whose
+        // SOURCE is missing does not degrade — bwrap exits before the job runs, with a
+        // message that never mentions husk. Three real compute jobs died with:
+        //
+        //   bwrap: Can't find source path <workdir>/.claude/settings.json: No such file
+        //
+        // because relative denyWrite entries started resolving and the shipped config lists
+        // a file most projects do not have.
+        //
+        // It reached hardware because NOTHING off-cluster runs bwrap: the selftest's guard
+        // arm substitutes a stub for `seccomp-wrapper` that drops its arguments and execs,
+        // so the cage is never actually built and a malformed argument list looks perfect.
+        // This test is the off-cluster substitute — it checks the one property that makes an
+        // argument list survive contact with bwrap.
+        //
+        // `-try` variants are exempt: tolerating a missing source is exactly what they are
+        // for, which is also why they must never be used for a DENY (a silently skipped deny
+        // is a deny that did not happen).
+        let root = std::env::temp_dir().join(format!("husk-binds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/real.txt"), b"").unwrap();
+        let w = root.to_string_lossy().to_string();
+
+        let p = FsPolicy {
+            // One that exists, three that do not — the shipped config's own shape.
+            deny_write: vec![
+                "notes/real.txt".into(),
+                ".claude/settings.json".into(),
+                ".claude/settings.local.json".into(),
+                "/nowhere/absolute/absent".into(),
+            ],
+            ..Default::default()
+        };
+        let args = p.compute_bwrap_args(&w);
+        let mut i = 0;
+        while i < args.len() {
+            let op = args[i].as_str();
+            // Ops of the form `<op> SOURCE DEST` that REQUIRE the source to be there.
+            if matches!(op, "--bind" | "--ro-bind" | "--dev-bind") {
+                let src = &args[i + 1];
+                assert!(
+                    std::path::Path::new(src).exists(),
+                    "`{op} {src} …` would kill the cage: bwrap exits when a bind source is \
+                     missing, before the job runs. Full args: {args:?}"
+                );
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2229,29 +2322,51 @@ mod tests {
         // `.Rprofile` and `.hg/hgrc` — was silently dropped on compute while the login cage
         // honoured it. One policy line, two cages, two answers, and the disagreement fails
         // OPEN: the user wrote a deny, read a deny back, and got one on login only.
+        // On disk, because a denyWrite is emitted only for a path that EXISTS — bwrap exits
+        // when a bind source is missing, which is what killed three Balfrin jobs (5014767/8/9)
+        // the first time relative entries started resolving.
+        let root = std::env::temp_dir().join(format!("husk-relwrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::create_dir_all(root.join(".claude")).unwrap();
+        std::fs::write(root.join(".claude/settings.json"), b"{}").unwrap();
+        std::fs::write(root.join("notes/protected.txt"), b"").unwrap();
+        let abs = std::env::temp_dir().join(format!("husk-relwrite-abs-{}", std::process::id()));
+        std::fs::create_dir_all(&abs).unwrap();
+        let (w, a_abs) = (root.to_string_lossy().to_string(), abs.to_string_lossy().to_string());
+
         let p = FsPolicy {
             deny_write: vec![
                 ".claude/settings.json".into(),
                 "./notes/protected.txt".into(),
-                "/scr/absolute".into(),
+                a_abs.clone(),
                 "~/.ssh/config".into(),
             ],
             ..Default::default()
         };
-        let args = p.compute_bwrap_args("/work/proj").join(" ");
+        let args = p.compute_bwrap_args(&w).join(" ");
         assert!(
-            args.contains("--ro-bind /work/proj/.claude/settings.json /work/proj/.claude/settings.json"),
+            args.contains(&format!("--ro-bind {w}/.claude/settings.json {w}/.claude/settings.json")),
             "a relative denyWrite must be resolved against the workdir: {args}"
         );
         assert!(
-            args.contains("--ro-bind /work/proj/notes/protected.txt"),
+            args.contains(&format!("--ro-bind {w}/notes/protected.txt")),
             "`./` is the same spelling: {args}"
         );
-        assert!(args.contains("--ro-bind /scr/absolute"), "absolute still works: {args}");
+        assert!(args.contains(&format!("--ro-bind {a_abs}")), "absolute still works: {args}");
         // `~/x` stays dropped, and that is correct rather than an oversight: a bind EXPOSES
         // ITS SOURCE, so re-binding a home path would punch it back through the `--tmpfs
         // /users` floor that exists to remove it — a deny that grants.
         assert!(!args.contains(".ssh/config"), "a home path must not be bound back in: {args}");
+        // And the case that killed the Balfrin jobs: a relative entry naming a file that is
+        // NOT there must be silently skipped, never emitted as a bind bwrap cannot satisfy.
+        let p2 = FsPolicy { deny_write: vec![".claude/settings.local.json".into()], ..Default::default() };
+        assert!(
+            !p2.compute_bwrap_args(&w).join(" ").contains("settings.local.json"),
+            "an absent denyWrite must not become a bind — bwrap would exit before the job ran"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&abs);
     }
 
     // ── F6a: bounded credential auto-scan ───────────────────────────────────

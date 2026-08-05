@@ -469,7 +469,32 @@ const SUBMIT_ENV_ALLOW_EXACT: &[&str] = &[
     // Threading. Dropping these silently changes how a run PERFORMS, which is the hardest
     // kind of difference to trace back to a sandbox.
     "OMP_NUM_THREADS", "OMP_PLACES", "OMP_PROC_BIND", "OMP_STACKSIZE", "MKL_NUM_THREADS",
+    // Build toolchain. Measured on Balfrin: all of these are set in a real login shell and
+    // all were dropped by the first version of this list.
+    "ACLOCAL_PATH", "CMAKE_PREFIX_PATH", "BOOST_ROOT", "PROJ_LIB", "NVHPC_CUDA_HOME",
+    "MPICC", "MPICXX", "MPIF77", "MPIF90",
+    "JAVA_HOME", "JAVA_BINDIR", "JDK_HOME", "JRE_HOME", "SDK_HOME",
+    "CARGO_HOME", "RUSTUP_HOME", "LM_SETUP_DIR",
+    // The module system's version pair — `MODULEPATH` and friends were here from the start,
+    // these two were not, and `module` is not obliged to work with half its state.
+    "MODULE_VERSION", "MODULE_VERSION_STACK",
+    // uenv's squashfs mount forwards its library path in this one variable. A uenv job that
+    // loses it loses the stack it was launched with, which is the entire point of the uenv.
+    "SQFSMNT_FWD_LD_LIBRARY_PATH",
+    // Node/site identity. Cheap, non-secret, and run scripts branch on them.
+    "CLUSTER_NAME", "INFRANAME", "HOST", "HOSTTYPE", "MACHTYPE", "OSTYPE", "CPU",
+    "LUSTRE_JOB_ID",
 ];
+
+/// Site paths and site-specific families. **Split out from the list above on purpose**: that
+/// one is "what any HPC job needs", this one is "what THIS site's job scripts reference", and
+/// the two rot at different rates. An operator on another cluster extends this — or, without
+/// a rebuild, `HUSK_SUBMIT_ENV_ALLOW`.
+///
+/// Derived from a measured Balfrin login shell (2026-08-05), not from imagination: the first
+/// version of the allowlist dropped 82 variables and this is the subset a real run needs.
+/// `$SCRATCH` alone appears in nearly every run script CSCS ships.
+const SUBMIT_ENV_ALLOW_SITE: &[&str] = &["SCRATCH", "PROJECT", "STORE", "APPS"];
 
 /// Families that may cross, matched by prefix. Every one of these is a SETTING namespace —
 /// scheduler, fabric, MPI, GPU runtime, module system, I/O library, or husk's own.
@@ -489,6 +514,9 @@ const SUBMIT_ENV_ALLOW_PREFIX: &[&str] = &[
     "HDF5_", "NETCDF", "ECCODES_", "GRIB_",  // I/O libraries a weather model needs
     "OMP_", "GOMP_", "KMP_",                 // threading
     "SPACK_", "EBROOT", "EBVERSION",         // package managers
+    "GT4PY_",                                // GridTools4Py — ICON's Python dycore path
+    "OPR_",                                  // MeteoSwiss operational environment
+    "XDG_",                                  // config/data search paths some tools require
 ];
 
 /// Split `HUSK_SUBMIT_ENV_ALLOW` (colon-separated, `NAME` or `PREFIX*`) into extra rules.
@@ -512,6 +540,7 @@ fn submit_env_allows(name: &str, extra_exact: &[String], extra_prefix: &[String]
         return false;
     }
     SUBMIT_ENV_ALLOW_EXACT.contains(&name)
+        || SUBMIT_ENV_ALLOW_SITE.contains(&name)
         || SUBMIT_ENV_ALLOW_PREFIX.iter().any(|p| name.starts_with(p))
         || extra_exact.iter().any(|e| e == name)
         || extra_prefix.iter().any(|p| name.starts_with(p.as_str()))
@@ -1016,6 +1045,38 @@ mod tests {
         ] {
             assert!(kept_names.contains(&needed), "{needed} must still reach the job");
         }
+    }
+
+    #[test]
+    fn the_allowlist_carries_what_a_measured_balfrin_login_shell_actually_provides() {
+        // Written from the FIRST HARDWARE RUN, not from imagination: the first version of
+        // this allowlist dropped 82 variables from a real Balfrin login shell, and this is
+        // the subset a real run needs. `$SCRATCH` alone appears in nearly every run script
+        // CSCS ships, and losing `SQFSMNT_FWD_LD_LIBRARY_PATH` costs a uenv job the stack it
+        // was launched with — the entire point of the uenv.
+        let env: Vec<(String, String)> = [
+            "SCRATCH", "PROJECT", "STORE", "APPS",
+            "SQFSMNT_FWD_LD_LIBRARY_PATH", "MODULE_VERSION", "MODULE_VERSION_STACK",
+            "CMAKE_PREFIX_PATH", "BOOST_ROOT", "MPICC", "MPIF90", "NVHPC_CUDA_HOME",
+            "OPR_HOME", "OPR_MODULEFILES", "GT4PY_BUILD_JOBS", "CLUSTER_NAME", "LUSTRE_JOB_ID",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), "v".to_string()))
+        .collect();
+        let (kept, dropped) = filter_submit_env(env.into_iter(), &[], &[]);
+        assert!(dropped.is_empty(), "a real run still needs these: {dropped:?}");
+        assert_eq!(kept.len(), 17);
+
+        // …and the same run confirms what the allowlist is FOR. `SSH_AUTH_SOCK` is a live
+        // agent-forwarding socket — a credential by any measure — and the old denylist
+        // handed it to every job. It stays dropped, along with the desktop noise.
+        let noise: Vec<(String, String)> = ["SSH_AUTH_SOCK", "SSH_CLIENT", "DBUS_SESSION_BUS_ADDRESS",
+                                            "DISPLAY", "LS_COLORS", "XAUTHLOCALHOSTNAME"]
+            .iter()
+            .map(|k| (k.to_string(), "v".to_string()))
+            .collect();
+        let (kept, _) = filter_submit_env(noise.into_iter(), &[], &[]);
+        assert!(kept.is_empty(), "a batch job needs none of these: {kept:?}");
     }
 
     #[test]
