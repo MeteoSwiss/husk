@@ -241,10 +241,24 @@ fn spawn_broker(broker: &Path, spool: &Path, log_path: &Path) -> io::Result<Brok
             io::Error::new(e.kind(), format!("cannot open session log '{}': {e}", log_path.display()))
         })?;
     let errlog = log.try_clone()?;
+    // Does the broker's own log land somewhere the CONFINED side can read?
+    //
+    // Normally no: it is `~/.husk/log/...`, and the cage tmpfs-masks the home (a caged
+    // agent measures `~/.husk` as ENOENT). The broker relies on that to write refusal
+    // DETAIL — the resolved host path, the errno — to its stderr while handing the agent
+    // a message with no host fact in it (A7-1). In the `$HOME`-unusable fallback above the
+    // log moves INTO THE SPOOL, which the agent can read, and that detail would become
+    // exactly the existence oracle the sanitised message removed.
+    //
+    // So tell the broker which mode it is in, DERIVED from where the log actually went
+    // rather than tracked as a second flag that could drift from it. The agent cannot
+    // reach this env: the wrapper is outside the cage and starts before the agent exists.
+    let reachable = log_path.starts_with(spool);
     let child = Command::new(broker)
         .arg("--spool")
         .arg(spool)
         .env("HUSK_SLURM_SPOOL", spool)
+        .env("HUSK_LOG_AGENT_READABLE", if reachable { "1" } else { "0" })
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(errlog))

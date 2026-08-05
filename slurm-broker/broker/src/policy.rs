@@ -360,6 +360,24 @@ pub fn decide(
     options.push(format!("--chdir={chdir}"));
     options.push(format!("--output={out}"));
     options.push(format!("--error={err}"));
+    // APPEND, never truncate — the first half of A1's run-time defence.
+    //
+    // husk validates these paths at SUBMISSION; slurmd opens them when the job STARTS,
+    // which may be hours later, in a directory the agent can still write. The submit-time
+    // leaf check (`confine_output_pattern`) refuses a path that is a symlink *now*; it
+    // cannot refuse one that becomes a symlink while the job sits PENDING, and husk has no
+    // way to make slurmd open with O_NOFOLLOW.
+    //
+    // Under the default `truncate` that race costs the target file its contents before a
+    // single line of husk's runs — an unconditional destroy primitive aimed at any file the
+    // user can write. `append` removes the destruction: the swapped-in target is opened, not
+    // emptied, and the guard below then refuses to run the agent's body at all, so the only
+    // bytes that can reach it are husk's own refusal text. Content injection needs the body.
+    //
+    // Cost: two runs writing to the same literal output filename accumulate instead of
+    // overwriting. Every husk default is `%j`-unique, so this is visible only to a job that
+    // names a fixed file and runs twice.
+    options.push("--open-mode=append".to_string());
 
     // ---- resource options: ALLOWLIST, not passthrough ----
     // Interpret the agent's CLI against the option registry: Forced/Ignored options
@@ -1148,6 +1166,95 @@ fi
     );
     let banner = format!("{writable_env}{banner}");
 
+    // ---- A1, run-time half: the file SLURM actually opened must be inside the set -------
+    //
+    // The submit-time check (`settings::confine_output_pattern`) refuses an `--output` whose
+    // last component is a symlink. It runs on the login node, at submission. slurmd opens
+    // the file when the job STARTS — pending for hours, in a directory the job's own agent
+    // can write the whole time — and husk cannot make that `open()` use `O_NOFOLLOW`. So a
+    // path that was a plain file at check time and a symlink at open time defeats the
+    // check by construction, however carefully the check is written. Validation cannot win
+    // a race against the party it is validating.
+    //
+    // What CAN win is asking a different question at a different time: not "is this path
+    // acceptable?" before the fact, but "where did this descriptor actually land?" after
+    // it. This runs in the guard's outer half, before the agent's body exists as a
+    // process, so a hijacked descriptor costs the attacker the job instead of buying it an
+    // arbitrary write. Together with `--open-mode=append` (nothing truncated) the swapped
+    // target receives husk's refusal and nothing else.
+    //
+    // Three details are load-bearing:
+    //   * the roots are canonicalised HERE, on the compute node. `/scratch` is a symlink to
+    //     `/capstor/scratch` on Santis; `readlink /proc/self/fd/1` reports the resolved
+    //     path, so comparing against an unresolved root would fail for EVERY job. A check
+    //     that cries wolf gets switched off, which is worse than no check.
+    //   * the comparison is component-wise (`$r` or `$r/*`), never a string prefix, so
+    //     `/work2` does not count as being under `/work`. Same rule as the floor check.
+    //   * the report goes to `$_husk_log`, which is under `$HOME` and out of the job's
+    //     reach. Writing it to stderr would put it in the very file under suspicion.
+    //
+    // A descriptor that is NOT a regular file (a pipe, a tty, /dev/null) is not the case
+    // this defends and is left alone — but it is announced, because on a site where
+    // slurmstepd holds the output file and pipes to the batch script this check cannot see
+    // the file at all, and silent non-enforcement is the failure mode husk keeps fixing.
+    let roots_sh =
+        writable.iter().map(|r| settings::sh_quote(r)).collect::<Vec<_>>().join(" ");
+    // A raw string with `.replace`, not `format!`: this is shell full of `${...}` and every
+    // brace would need doubling — which is exactly how a literal `{socat_q}` once shipped.
+    let fd_guard = r#"  # --- husk: stdout/stderr must resolve INSIDE the writable set (A1) ---
+  # `/proc/$$/fd`, never `/proc/self/fd`: this runs inside `$(...)`, and a command
+  # substitution is a FORKED subshell whose OWN stdout is the substitution pipe. `self`
+  # therefore reports `pipe:[…]` for every job — the check would have looked present,
+  # passed its tests, and enforced nothing. `$$` stays the invoking shell's pid in a
+  # subshell, so it names the descriptor slurmd actually handed us.
+  _husk_fd_outside() {
+    _husk_fd_p=$(readlink "/proc/$$/fd/$1" 2>/dev/null) || return 1
+    case "$_husk_fd_p" in
+      /*) ;;
+      *) return 1 ;;
+    esac
+    _husk_fd_p=${_husk_fd_p% (deleted)}
+    [ -f "$_husk_fd_p" ] || return 1
+    for _husk_fd_r in {roots}; do
+      _husk_fd_c=$(readlink -f "$_husk_fd_r" 2>/dev/null || echo "$_husk_fd_r")
+      case "$_husk_fd_p" in
+        "$_husk_fd_c"|"$_husk_fd_c"/*) return 1 ;;
+      esac
+    done
+    return 0
+  }
+  _husk_fd_checked=
+  for _husk_fd in 1 2; do
+    _husk_fd_t=$(readlink "/proc/$$/fd/$_husk_fd" 2>/dev/null || true)
+    case "$_husk_fd_t" in /*) [ -f "${_husk_fd_t% (deleted)}" ] && _husk_fd_checked=1 ;; esac
+    _husk_fd_outside "$_husk_fd" || continue
+    {
+      echo "husk: ================== JOB REFUSED =================="
+      echo "husk: file descriptor $_husk_fd of this job resolves to"
+      echo "husk:   $_husk_fd_p"
+      echo "husk: which is OUTSIDE the set this job may write:"
+      echo "husk:   {roots}"
+      echo "husk: husk confines --output/--error when the job is SUBMITTED. A path that"
+      echo "husk: was inside the set then and outside it now was replaced in between -"
+      echo "husk: a symlink swapped in while the job sat pending, which is the one thing"
+      echo "husk: a submit-time check cannot catch. SLURM opens these files as you and"
+      echo "husk: OUTSIDE the sandbox, so husk refuses the job instead."
+      echo "husk: The agent's body has NOT been run: nothing it controls was written"
+      echo "husk: there, and --open-mode=append means nothing was truncated either."
+      echo "husk:   job  : ${SLURM_JOB_ID:-nojob}"
+      echo "husk:   node : $(hostname 2>/dev/null || echo '?')"
+      echo "husk: ================================================="
+    } >>"$_husk_log" 2>/dev/null
+    exit 1
+  done
+  if [ -z "$_husk_fd_checked" ]; then
+    echo "husk: stdout/stderr are not regular files on this node, so husk could not \
+verify where its output lands; --output confinement rests on the submit-time check alone." \
+      >>"$_husk_log" 2>/dev/null
+  fi
+"#
+    .replace("{roots}", &roots_sh);
+
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
@@ -1213,6 +1320,7 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
     echo \"husk: job is merged into the job's own stderr instead of kept outside it.\" >&2\n\
   fi\n\
   export HUSK_JOB_LOG=\"$_husk_log\"\n\
+{fd_guard}\
 {net_start}  _husk_step_pid=\n\
   _husk_stub={stub_q}\n\
   _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
@@ -2147,6 +2255,122 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A1's run-time half.** The submit-time check refuses an `--output` whose leaf is a
+    /// symlink *at submission*; it cannot refuse one that becomes a symlink while the job
+    /// sits PENDING, and husk cannot make slurmd's `open()` use `O_NOFOLLOW`. So the guard
+    /// asks the question again at the only moment that cannot be raced: after the file is
+    /// already open, before the agent's body is a process.
+    ///
+    /// This drives the REAL generated guard through a real shell with stdout redirected to
+    /// a file — which is precisely what slurmd does to a batch script — and asserts both
+    /// directions, because a check that only ever says no is a denial of service and a
+    /// check that only ever says yes is decoration.
+    #[test]
+    fn a_hijacked_stdout_stops_the_job_before_the_agents_body_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("husk-fdguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inside = dir.join("project");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Stands in for seccomp-wrapper, i.e. for everything downstream of the check. If
+        // this marker reaches the output file, the guard let the job proceed.
+        let stub = dir.join("seccomp-wrapper");
+        std::fs::write(&stub, "#!/bin/bash\necho MARKER_BODY_RAN\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let root = inside.to_string_lossy().to_string();
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &[],
+            profile::Profile::SingleNode,
+            &root,
+            false,
+            &[root.clone()],
+        );
+        let path = dir.join("job.sh");
+        std::fs::write(&path, &script).unwrap();
+
+        let run = |out_file: &std::path::Path| -> (i32, String) {
+            let f = std::fs::File::create(out_file).unwrap();
+            let st = std::process::Command::new("/bin/bash")
+                .arg(&path)
+                .current_dir(&inside)
+                .env("HOME", &home)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+                .stdout(std::process::Stdio::from(f))
+                .stderr(std::process::Stdio::piped())
+                .status()
+                .unwrap();
+            (st.code().unwrap_or(-1), std::fs::read_to_string(out_file).unwrap_or_default())
+        };
+
+        // 1. The honest job: stdout lands inside the writable set, so it runs.
+        let (code, body) = run(&inside.join("slurm-1.out"));
+        assert_eq!(code, 0, "a job writing inside the writable set must still run: {body}");
+        assert!(body.contains("MARKER_BODY_RAN"), "the body must be reached: {body}");
+
+        // 2. The escape: stdout lands OUTSIDE it — what the agent gets by swapping a
+        // symlink under the already-validated `--output` while the job is pending. The job
+        // must die before the body runs, and the target must receive NONE of its bytes.
+        let hijacked = elsewhere.join("VICTIM");
+        let (code, body) = run(&hijacked);
+        assert_eq!(code, 1, "a job whose stdout escaped the writable set must be refused");
+        assert!(
+            !body.contains("MARKER_BODY_RAN"),
+            "the agent's body ran anyway — its output reached a file outside the cage: {body}"
+        );
+
+        // 3. The refusal is REPORTED, and reported where the job cannot rewrite it: husk's
+        // own log under $HOME, which the cage tmpfs-masks. A silent abort here would look
+        // exactly like a node failure, and this is the one event that must not be guessed at.
+        let logdir = home.join(".husk/log");
+        let logs: String = std::fs::read_dir(&logdir)
+            .expect("husk must keep a job log")
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+            .collect();
+        assert!(logs.contains("JOB REFUSED"), "the refusal must be recorded: {logs}");
+        assert!(
+            logs.contains(&hijacked.to_string_lossy().to_string()),
+            "the record must name the descriptor's real destination: {logs}"
+        );
+        // The victim file itself may hold husk's refusal text but never the job's own — and
+        // `--open-mode=append` means whatever was in it is still there.
+        assert!(!std::fs::read_to_string(&hijacked).unwrap().contains("MARKER_BODY_RAN"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_files_are_opened_append_so_a_swapped_target_cannot_be_truncated() {
+        // The other half of the pending-window defence, and the one that protects a file
+        // husk never gets to inspect. Under SLURM's default `truncate`, slurmd opens the
+        // (swapped) target with O_TRUNC and empties it before a single line of husk's runs
+        // — an unconditional destroy primitive aimed at any file the user can write, and
+        // one no in-job check can undo. `append` leaves nothing to destroy.
+        //
+        // Asserted on the emitted OPTIONS, not on a comment: this is a property of what
+        // reaches sbatch's command line.
+        let opts = opts_in(work(), req(&["--partition=preemptible"], "echo hi\n"), &no_uenv());
+        assert!(has(&opts, "--open-mode=append"), "husk must force append mode: {opts:?}");
+        // And the agent must not be able to put a second, later `--open-mode` on the line:
+        // sbatch takes the last one, so an option husk emits must be one the agent cannot.
+        let spec = sbatch::REGISTRY
+            .iter()
+            .find(|s| s.long == "--open-mode")
+            .expect("--open-mode must be in the registry, not merely unknown");
+        assert_eq!(
+            spec.class,
+            sbatch::Class::Forced,
+            "--open-mode decides whether a hijacked output file gets truncated: broker-owned"
+        );
     }
 
     #[test]

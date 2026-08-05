@@ -230,20 +230,72 @@ pub fn confine_under_any(path: &str, roots: &[String]) -> Result<String, String>
     })
 }
 
+/// The ONE refusal every confinement failure gives back to the agent.
+///
+/// **A7-1.** This used to be two messages, and telling them apart was an existence oracle
+/// for the host filesystem. The broker canonicalises OUTSIDE the cage — correctly, that is
+/// where SLURM writes — so `canonicalize` answers about paths the cage deliberately hides.
+/// A caged agent that asked for `--output=/users/me/.ssh/x` got back
+/// `"…" resolves to /users/me/.ssh which is outside …`, and for `/users/me/.gnupg/x` got
+/// `"…" cannot be resolved (No such file or directory)`. One probe per candidate, no read
+/// permission needed, and `ls` inside the cage says ENOENT to both. Husk's own refusal was
+/// the only in-cage channel that confirmed `~/.ssh` exists (measured, A7).
+///
+/// So: identical bytes for "the workdir will not resolve", "the path will not resolve",
+/// "it resolves outside the set" and "its last component is a symlink". The message may
+/// still echo the agent's OWN input and name the directory it was confined to — the agent
+/// supplied one and was told the other — but it carries no host fact it did not already
+/// have: no resolved target, no errno, no present-vs-absent tell.
+///
+/// The detail is not lost, it is REDIRECTED: `confine_detail` writes it to the broker's own
+/// stderr, outside the cage, where the operator reads it and the agent cannot. An
+/// unattributed denial invites confident wrong remediation; an attributed one aimed at the
+/// wrong party is a disclosure. Both audiences get what they need, separately.
+///
+/// `confine_under_any` already worked this way (it discards the inner error and reports the
+/// writable SET); this makes the primitive itself safe, so the next caller cannot re-open
+/// the oracle by forwarding what it returns.
+fn confine_refusal(path: &str, workdir: &str) -> String {
+    format!(
+        "{path:?} is not a path this job may write. husk confines --chdir/--output/--error \
+         to {workdir:?} and below, because SLURM writes those files as you and OUTSIDE the \
+         sandbox. Such a path must already exist (SLURM does not create output \
+         directories), must still be inside that directory once every symlink is resolved, \
+         and its final component must not itself be a symlink."
+    )
+}
+
+/// The refusal detail, for the OPERATOR only. Broker stderr is outside the cage.
+///
+/// Suppressed in the one mode where it is not: the wrapper falls back to a log inside the
+/// SPOOL when `$HOME` is unusable, and the spool is agent-readable by construction (the
+/// stub has to reach it). It sets `HUSK_LOG_AGENT_READABLE` from where the log actually
+/// went. Unset is treated as reachable — a broker started by hand, or by a future caller
+/// that forgets, must not silently start narrating host paths into the agent's log.
+fn confine_detail(path: &str, workdir: &str, why: &str) {
+    if std::env::var("HUSK_LOG_AGENT_READABLE").as_deref() == Ok("0") {
+        eprintln!("husk-broker: refused {path:?} under {workdir:?}: {why}");
+    } else {
+        eprintln!("husk-broker: refused {path:?} (detail withheld: this log is agent-readable)");
+    }
+}
+
 pub fn confine_under_workdir(path: &str, workdir: &str) -> Result<String, String> {
-    let root = std::fs::canonicalize(workdir)
-        .map_err(|e| format!("cannot resolve the working directory {workdir:?}: {e}"))?;
+    let root = std::fs::canonicalize(workdir).map_err(|e| {
+        confine_detail(path, workdir, &format!("the working directory does not resolve: {e}"));
+        confine_refusal(path, workdir)
+    })?;
     let target = std::fs::canonicalize(path).map_err(|e| {
-        format!(
-            "{path:?} cannot be resolved ({e}). It must already exist — SLURM does not              create output directories."
-        )
+        confine_detail(path, workdir, &format!("does not resolve: {e}"));
+        confine_refusal(path, workdir)
     })?;
     if !target.starts_with(&root) {
-        return Err(format!(
-            "{path:?} resolves to {} which is outside the job's working directory {}.              husk confines --chdir/--output/--error to that directory and below, because              SLURM writes those files as you and OUTSIDE the sandbox.",
-            target.display(),
-            root.display()
-        ));
+        confine_detail(
+            path,
+            workdir,
+            &format!("resolves to {}, outside {}", target.display(), root.display()),
+        );
+        return Err(confine_refusal(path, workdir));
     }
     Ok(target.to_string_lossy().to_string())
 }
@@ -254,11 +306,43 @@ pub fn confine_under_workdir(path: &str, workdir: &str) -> Result<String, String
 /// checked as a pattern. A `%` anywhere in the DIRECTORY part is refused rather than
 /// guessed at — husk cannot resolve a path it cannot expand, and validating an
 /// unexpanded string would be validating something other than what slurmd opens.
+///
+/// **A1 (CRITICAL, found 2026-08-04).** The split is the whole difficulty: the filename may
+/// carry `%j`, so it cannot be canonicalised, so only the PARENT went through
+/// `confine_under_workdir` and the leaf was appended as text. A leaf that already existed as
+/// a SYMLINK was therefore never resolved by husk — and slurmd, opening the path later as
+/// the user and outside the cage, follows it. One `ln -s` inside the writable workdir turned
+/// `--output` into an arbitrary write anywhere the user can write, with content the job
+/// controls. The witness landed in a directory husk itself refuses.
+///
+/// Two disagreeing notions of "the same path" (husk's canonicalise-the-parent vs the
+/// kernel's open-follows-the-final-symlink) is the F13/F14 shape again, and the fix is the
+/// same shape too: make the two agree. Because the parent is FULLY canonical by the time we
+/// get here, the leaf is the only unresolved component left, so one `symlink_metadata` on it
+/// closes the gap without re-walking the path.
+///
+/// It closes the gap **at submission**. It does not close the window between husk's check
+/// and slurmd's `open()` — the job may sit PENDING for hours in a directory the agent can
+/// still write, and husk cannot make slurmd use `O_NOFOLLOW`. That half is enforced at the
+/// other end, by the job guard, which refuses to run a body whose stdout/stderr does not
+/// resolve inside the writable set (`policy.rs`, `--open-mode=append` + the fd check). This
+/// check is the one that can TEACH; that one is the one that HOLDS.
 pub fn confine_output_pattern(value: &str, workdir: &str) -> Result<String, String> {
     let (dir, file) = match value.rsplit_once('/') {
         Some((d, f)) => (if d.is_empty() { "/" } else { d }, f),
         // A bare filename is relative to --chdir, which is itself confined.
         None => (workdir, value),
+    };
+    // A RELATIVE directory means "relative to the job's working directory" — that is what
+    // `--output=logs/x.out` means to SLURM. Resolve it against `workdir` explicitly instead
+    // of letting `canonicalize` resolve it against the BROKER's cwd, which is a different
+    // directory that the confinement result must not depend on.
+    let joined;
+    let dir = if dir.starts_with('/') {
+        dir
+    } else {
+        joined = format!("{}/{}", workdir.trim_end_matches('/'), dir);
+        &joined
     };
     if dir.contains('%') {
         return Err(format!(
@@ -271,7 +355,19 @@ pub fn confine_output_pattern(value: &str, workdir: &str) -> Result<String, Stri
         ));
     }
     let dir = confine_under_workdir(dir, workdir)?;
-    Ok(format!("{dir}/{file}"))
+    let full = format!("{dir}/{file}");
+    // The leaf, and only the leaf: everything left of it is already canonical, so this one
+    // `lstat` is the difference between the path husk validated and the path slurmd opens.
+    // `symlink_metadata` does NOT follow, which is the entire point — `metadata` here would
+    // report on the TARGET and pass a symlink pointing at the home directory.
+    //
+    // A leaf that does not exist is fine and must stay fine: `slurm-%j.out` never exists at
+    // submission, and neither does the file of a first run. Absent is not a symlink.
+    if std::fs::symlink_metadata(&full).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+        confine_detail(value, workdir, "its final component is a symlink");
+        return Err(confine_refusal(value, workdir));
+    }
+    Ok(full)
 }
 
 /// Every file the broker will read policy from: `(relative_to_home, path)`.
@@ -1217,6 +1313,159 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&sib);
     }
+
+    #[test]
+    fn output_pattern_refuses_a_leaf_that_is_a_symlink() {
+        // **A1 (CRITICAL).** THIS is the level the bug lived at, and it is why the test
+        // above is a FALSE FRIEND: `confinement_follows_symlinks_and_rejects_traversal`
+        // passes a whole path to `confine_under_workdir`, which canonicalises all of it and
+        // duly rejects a symlink. `confine_output_pattern` never passes the whole path —
+        // it SPLITS at the last `/`, confines only the parent, and appends the leaf as
+        // text, because the leaf may be `slurm-%j.out` and cannot be canonicalised. So the
+        // one component the attacker controls was the one component nothing resolved. The
+        // suite was green with an arbitrary-write escape open; a test one layer above the
+        // defect proves the layer, not the defect.
+        //
+        // Reproduces the reviewer's Balfrin escape in miniature: the symlink lives INSIDE
+        // the writable workdir (so its parent confines fine) and points OUTSIDE it.
+        let root = std::env::temp_dir().join(format!("husk-a1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let w = root.join("work").to_string_lossy().to_string();
+
+        // The escape, exactly: a leaf symlink inside the workdir aimed at a directory the
+        // broker itself refuses.
+        let target = outside.join("PWNED.out");
+        symlink(&target, std::path::Path::new(&w).join("link.out")).unwrap();
+        let err = confine_output_pattern(&format!("{w}/link.out"), &w)
+            .expect_err("a symlink leaf must be refused — this is A1");
+        assert!(
+            !err.contains("PWNED") && !err.contains(&outside.to_string_lossy().to_string()),
+            "the refusal must not name where the symlink pointed (A7-1): {err}"
+        );
+
+        // A relative spelling of the same thing reaches the same code path, so it must get
+        // the same answer. `--output=link.out` with the leaf pre-planted is the cheapest
+        // spelling of the escape and must not be the one that survives.
+        assert!(
+            confine_output_pattern("link.out", &w).is_err(),
+            "a bare filename naming a symlink leaf must be refused too"
+        );
+        assert!(
+            confine_output_pattern("./link.out", &w).is_err(),
+            "a `./`-prefixed symlink leaf must be refused too"
+        );
+
+        // …and everything legitimate must still pass, or the fix is a denial of service.
+        // A leaf that does not exist yet is the NORMAL case: no job's output file exists at
+        // submission, and `%j` never resolves to a real path at all.
+        for ok in ["fresh.out", "slurm-%j.out", "LOG.exp.mch_icon-ch1_small.run.%j.o"] {
+            assert!(
+                confine_output_pattern(ok, &w).is_ok(),
+                "an absent leaf is not a symlink and must still be accepted: {ok}"
+            );
+        }
+        // An existing REGULAR file is fine — a second run overwriting its own log is not
+        // an attack, and refusing it would break every fixed-name output.
+        std::fs::write(std::path::Path::new(&w).join("plain.out"), b"").unwrap();
+        assert!(
+            confine_output_pattern("plain.out", &w).is_ok(),
+            "an existing regular file must still be accepted"
+        );
+        // A symlink leaf pointing back INSIDE the writable set is still refused. The rule
+        // is deliberately the shape ("no symlink leaf"), not the destination: the
+        // destination is what the agent can change after we look at it.
+        symlink(
+            std::path::Path::new(&w).join("plain.out"),
+            std::path::Path::new(&w).join("inward.out"),
+        )
+        .unwrap();
+        assert!(
+            confine_output_pattern("inward.out", &w).is_err(),
+            "a symlink leaf is refused on shape, not on where it currently points"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_confinement_refusal_tells_the_agent_nothing_about_the_host_filesystem() {
+        // **A7-1.** The broker canonicalises OUTSIDE the cage, so its refusal used to
+        // answer questions the cage exists to refuse: "resolves to X" for a directory that
+        // is really there, "cannot be resolved (No such file or directory)" for one that is
+        // not. A caged agent measured `~/.ssh` and `~/.config` as EXISTING and `~/.gnupg`
+        // as ABSENT that way, while `ls` inside the cage said ENOENT to all three.
+        //
+        // The property: two probes that differ only in a path the agent typed must come
+        // back differing only in that path. Anything else is a bit of host state crossing
+        // the boundary. Asserted by normalising the echoed input away and comparing BYTES,
+        // so a future "helpful" addition of an errno or a resolved target fails here.
+        let root = std::env::temp_dir().join(format!("husk-a7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let w = root.to_string_lossy().to_string();
+
+        // Two sibling paths outside the workdir: one that exists on this host, one that
+        // does not. This is the exact discrimination the oracle offered.
+        let present = std::env::temp_dir().join(format!("husk-a7-PRESENT-{}", std::process::id()));
+        std::fs::create_dir_all(&present).unwrap();
+        let absent = std::env::temp_dir().join(format!("husk-a7-ABSENT-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&absent);
+
+        let e_present = confine_output_pattern(&format!("{}/x.out", present.display()), &w)
+            .expect_err("outside the workdir must be refused");
+        let e_absent = confine_output_pattern(&format!("{}/x.out", absent.display()), &w)
+            .expect_err("outside the workdir must be refused");
+        assert_eq!(
+            e_present.replace("PRESENT", "_"),
+            e_absent.replace("ABSENT", "_"),
+            "existent and non-existent host paths must be indistinguishable in the refusal"
+        );
+        // And the specific tells, named so the regression reads as prose.
+        for e in [&e_present, &e_absent] {
+            assert!(!e.contains("os error"), "no errno may reach the agent: {e}");
+            assert!(!e.contains("No such file"), "no errno text may reach the agent: {e}");
+            assert!(!e.contains("resolves to"), "no resolved host path may be quoted: {e}");
+        }
+
+        // A symlink must not have its TARGET printed either — that was the same leak in its
+        // most useful form, since a symlink is how an agent asks about an arbitrary path.
+        symlink("/etc", std::path::Path::new(&w).join("linkroot")).unwrap();
+        let e_link = confine_output_pattern(&format!("{w}/linkroot/passwd"), &w)
+            .expect_err("a path resolving outside must be refused");
+        assert!(!e_link.contains("/etc"), "the resolved target must not be echoed: {e_link}");
+
+        // Still teaching, though: silence would just move the failure. The message must say
+        // what husk did, why, and which directory the job may actually write.
+        assert!(e_link.contains("husk confines"), "must name the mechanism: {e_link}");
+        assert!(e_link.contains(&w), "must name the writable directory: {e_link}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&present);
+    }
+
+    #[test]
+    fn a_relative_output_directory_resolves_against_the_job_workdir_not_the_brokers_cwd() {
+        // `--output=logs/x.out` means "relative to --chdir" to SLURM. It used to reach
+        // `canonicalize` as the bare string "logs", which the kernel resolves against the
+        // BROKER's cwd — a different directory entirely. The confinement verdict then
+        // depended on where the broker happened to be started, which is not a boundary.
+        let root = std::env::temp_dir().join(format!("husk-relout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("logs")).unwrap();
+        let w = root.to_string_lossy().to_string();
+
+        let got = confine_output_pattern("logs/x.out", &w).expect("a real subdir must confine");
+        assert_eq!(got, format!("{}/logs/x.out", std::fs::canonicalize(&w).unwrap().display()));
+        // …and it is still CONFINEMENT, not concatenation: climbing out must fail.
+        assert!(confine_output_pattern("../x.out", &w).is_err(), "`..` must not escape");
+        assert!(confine_output_pattern("logs/../../x.out", &w).is_err(), "nor must a deeper one");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     use super::*;
     use std::os::unix::fs::symlink;
 

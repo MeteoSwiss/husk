@@ -107,6 +107,14 @@ pub const REGISTRY: &[OptSpec] = &[
     spec!("--output", "-o", true, Class::Forced, always_true),
     spec!("--error", "-e", true, Class::Forced, always_true),
     spec!("--chdir", "-D", true, Class::Forced, always_true),
+    // Forced to `append`, and Forced rather than merely absent from the allowlist because
+    // an option the broker EMITS must be one the agent cannot also emit — two copies on one
+    // command line and the last one wins. It decides whether slurmd opens the output file
+    // with O_TRUNC. Under `truncate`, a job whose --output was swapped for a symlink between
+    // husk's check and slurmd's open() empties the target before anything of husk's runs;
+    // under `append` there is nothing to destroy and nothing but husk's own bytes to add.
+    // (A1's run-time half; the fd check in the job guard is the other one.)
+    spec!("--open-mode", "", true, Class::Forced, always_true),
     spec!("--export", "", true, Class::Forced, always_true),
     spec!("--uenv", "", true, Class::Forced, always_true),
     spec!("--view", "", true, Class::Forced, always_true),

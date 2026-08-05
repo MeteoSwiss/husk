@@ -61,6 +61,57 @@ echo "husk: $HOME/.husk/log is not writable from this node, so husk's log for th
 echo "husk: job is merged into the job's own stderr instead of kept outside it." >&2
 fi
 export HUSK_JOB_LOG="$_husk_log"
+  # --- husk: stdout/stderr must resolve INSIDE the writable set (A1) ---
+  # `/proc/$$/fd`, never `/proc/self/fd`: this runs inside `$(...)`, and a command
+  # substitution is a FORKED subshell whose OWN stdout is the substitution pipe. `self`
+  # therefore reports `pipe:[…]` for every job — the check would have looked present,
+  # passed its tests, and enforced nothing. `$$` stays the invoking shell's pid in a
+  # subshell, so it names the descriptor slurmd actually handed us.
+  _husk_fd_outside() {
+    _husk_fd_p=$(readlink "/proc/$$/fd/$1" 2>/dev/null) || return 1
+    case "$_husk_fd_p" in
+      /*) ;;
+      *) return 1 ;;
+    esac
+    _husk_fd_p=${_husk_fd_p% (deleted)}
+    [ -f "$_husk_fd_p" ] || return 1
+    for _husk_fd_r in '/work/project' '/scratch/shared'; do
+      _husk_fd_c=$(readlink -f "$_husk_fd_r" 2>/dev/null || echo "$_husk_fd_r")
+      case "$_husk_fd_p" in
+        "$_husk_fd_c"|"$_husk_fd_c"/*) return 1 ;;
+      esac
+    done
+    return 0
+  }
+  _husk_fd_checked=
+  for _husk_fd in 1 2; do
+    _husk_fd_t=$(readlink "/proc/$$/fd/$_husk_fd" 2>/dev/null || true)
+    case "$_husk_fd_t" in /*) [ -f "${_husk_fd_t% (deleted)}" ] && _husk_fd_checked=1 ;; esac
+    _husk_fd_outside "$_husk_fd" || continue
+    {
+      echo "husk: ================== JOB REFUSED =================="
+      echo "husk: file descriptor $_husk_fd of this job resolves to"
+      echo "husk:   $_husk_fd_p"
+      echo "husk: which is OUTSIDE the set this job may write:"
+      echo "husk:   '/work/project' '/scratch/shared'"
+      echo "husk: husk confines --output/--error when the job is SUBMITTED. A path that"
+      echo "husk: was inside the set then and outside it now was replaced in between -"
+      echo "husk: a symlink swapped in while the job sat pending, which is the one thing"
+      echo "husk: a submit-time check cannot catch. SLURM opens these files as you and"
+      echo "husk: OUTSIDE the sandbox, so husk refuses the job instead."
+      echo "husk: The agent's body has NOT been run: nothing it controls was written"
+      echo "husk: there, and --open-mode=append means nothing was truncated either."
+      echo "husk:   job  : ${SLURM_JOB_ID:-nojob}"
+      echo "husk:   node : $(hostname 2>/dev/null || echo '?')"
+      echo "husk: ================================================="
+    } >>"$_husk_log" 2>/dev/null
+    exit 1
+  done
+  if [ -z "$_husk_fd_checked" ]; then
+    echo "husk: stdout/stderr are not regular files on this node, so husk could not \
+verify where its output lands; --output confinement rests on the submit-time check alone." \
+      >>"$_husk_log" 2>/dev/null
+  fi
   # The relay needs socat INSIDE the cage, and husk's own socat lives at
   # <prefix>/bin/socat — under the user's HOME, which the cage tmpfs-masks. So bind it in,
   # read-only, over an empty file in the spool. A copy would also work and be simpler, but
