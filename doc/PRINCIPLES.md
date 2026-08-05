@@ -138,6 +138,13 @@ foresight rather than as a bug — the shim-versus-broker decision, where a subm
 the cage is porous by construction and keeping the real binary outside is the only non-porous
 option.
 
+**A corollary worth stating, because it decides charset arguments.** Whether a value is
+dangerous depends on the EMISSION FORM, not on the value. An option-shaped account name is
+harmless as `--account=VALUE` — one argv element, so the leading dash is data — and dangerous
+as a bare argument, which is why `rank.rs` refuses option-shaped environment NAMES: those
+become arguments to bwrap. Same charset question, opposite answer. Controlling the form is
+what makes the value safe, which is the argument for canonical re-emission over filtering.
+
 **Shape of the fix:** husk submits its **own** script; the agent's body is data, run by an
 interpreter husk names, at a path husk chooses, inside the cage. The bytes slurmstepd executes are
 ours. Options are not forwarded but **constructed** — parsed, validated, re-emitted canonically
@@ -261,6 +268,11 @@ compute cage's masking *hid* the gap — brokered jobs looked protected, so the 
 covered. The fix was not "add two entries"; it was a constant asserted in both directions against
 the shipped config.
 
+**And once more, structurally, by this file.** Rationale that lived in both a code comment and
+a principle here is two copies of one argument, which is the same failure at documentation
+scale. Controls now cite (`P5`) instead of restating; `constraints.md` lost about a third of
+its length to the same move.
+
 ---
 
 # What your tests are actually telling you
@@ -326,6 +338,38 @@ quoted the resolved host path, which made it an existence oracle for paths the c
 hide — `~/.ssh` present, `~/.gnupg` absent, one probe each. Both constraints are real. The
 resolution is to **split the audience**: the confined party gets the teaching, the operator gets the
 detail, on a channel the confined party cannot read.
+
+## P12 — Documentation drifts toward the intent, and always over-claims
+
+A description of a control decays into a description of what the control was *meant* to do.
+The drift is directional: docs are written at the moment of maximum confidence — just after
+the thing was built or fixed — and the code moves on without them. So when auditing, read
+every claim as something to falsify, and start with the ones that promise the most.
+
+**Why it isn't obvious.** A stale doc is usually imagined as *out of date* — describing a
+feature that no longer exists, which is harmless because it fails loudly on first contact. The
+dangerous form is subtler: the doc describes the intent accurately, the code implements a
+subset, and both look right in isolation. It reads as a specification and functions as a wish.
+
+**Taught by** the sink matrix, which said `--output` values were "canonicalised, symlinks
+resolved". That was true of the intent and false of the implementation — the leaf was never
+resolved, because it may carry `%j` and cannot be canonicalised. **That gap was A1**, and a
+reviewer reading the matrix would have concluded the surface was covered.
+
+**Caught again** three times in one sweep, all in the same direction. `cage.rs` asserted that
+a non-dumpable holder's namespace "no rank can open", contradicting a 6.8 measurement recorded
+elsewhere in our own tree. `settings.rs` said twice that ranks cannot join a shared PID
+namespace, while `rank.rs` passes `--pidns` and two hardware arms confirm it. The submission
+env was documented as "stripped" when it was merely dominated. Not one of the four erred
+toward caution.
+
+**Corollary — a finding list is a document too.** The backlog entry for the `PR_SET_DUMPABLE`
+drift said three docs called it a "cheap win"; that phrase was already gone, and what had
+survived was the *opposite* overstatement, sitting in the code. Working from a stale list
+without re-deriving costs effort and can miss the live defect entirely. The same applies to
+review output that was produced from documentation rather than from source: it inherits every
+overstatement the docs had, which is why an outside review's mechanism claims are checked
+against the suite before they are believed.
 
 ---
 
