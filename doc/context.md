@@ -136,6 +136,15 @@ consolidated from `review-v0.5/SYNTHESIS.md`.
 Gaps that are *architectural* rather than bugs. Bug-shaped items live in the review
 directory.
 
+**husk does not yet meet three clauses of its own interface spec**, and that is deliberate
+rather than discovered — see [`sandbox-interface.md` §8.1](sandbox-interface.md), which is
+the authoritative list. In short: the login side wraps each *command* rather than the
+harness (§2.1, the reason a tool allowlist exists at all); there is no integration profile
+artifact (§5); and policy is still expressed in the vendor's configuration shape with no
+adapter layer (§6). The first and third close with ROADMAP 6a. They are written as
+requirements in the spec on purpose — a clause softened to match today's implementation
+stops being a contract — and each row is deleted when closed, never reworded.
+
 **H4 — data destruction in the writable set.** No in-cage defence, by design: the
 project directory *is* the agent's working surface. Disposition is operational —
 see the table at the end of `constraints.md`. No sandbox-layer fix exists without

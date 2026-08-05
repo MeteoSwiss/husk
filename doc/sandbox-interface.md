@@ -237,11 +237,43 @@ An agent meeting all five is wrappable. An agent failing one is not "partially w
 is an agent whose gap husk must state plainly, in its integration row, so that nobody reads
 a boundary into a place where there is none.
 
-## 8. Integrations
+## 8. Conformance status
+
+Conformance runs in **both directions**, and both belong in the same place. §3 and §7 ask
+whether an agent tolerates the boundary. This section asks whether **husk delivers the
+boundary it specifies** — and holds husk to its own table rather than to a footnote.
+
+### 8.1 husk
+
+Several clauses above are **requirements husk does not yet meet**. They are written as
+requirements anyway, because a contract states what anything conforming must provide; a
+clause quietly softened to match today's implementation stops being a contract and becomes a
+description. The gap is therefore scheduled, listed, and visible:
+
+| clause | status | gap |
+|---|---|---|
+| §2.1 wrapped layers, applied to the whole process tree | **compute: yes · login: no** | On the login side the vendor runtime wraps each *command*, not the harness, so in-process file tools run beside the cage rather than inside it (§4.1). Worked around by restricting the agent to a single subprocess tool. Closed by husk owning the outer boundary — ROADMAP 6a. |
+| §2.2 mediated services | yes | The broker ships: stub inside, credentials and daemon route outside. |
+| §2.3 context channel | yes | Banner, `HUSK_WRITABLE`, attributed refusals. |
+| §5 integration profile | **no** | The concept is specified; no profile artifact exists and nothing consumes one. Today an integration's requirements live in the shipped config and in operators' heads. |
+| §6 husk-owned policy schema | **no** | Policy is expressed in the vendor's configuration shape and consumed directly — there is no adapter layer, so the coupling §6 exists to remove is still present. ROADMAP 6a. |
+
+**Deliberately not specified yet: the schema's field names.** §6 states a *property* — husk
+owns the vocabulary, a vendor format maps onto it, the source is unwritable by the agent.
+Properties are stable; a field list designed before 6a's implementation constraints are known
+would be a field list we then have to change, and a spec that changes under its own
+implementation teaches nobody anything. The property is the commitment; the encoding is 6a's
+to choose.
+
+**These rows are deleted when closed, never edited.** A gap that is quietly reworded into
+compliance is the failure mode `P12` describes, running in the direction where a document
+under-claims: nobody re-reads a clause that no longer looks aspirational.
+
+### 8.2 Integrations
 
 | integration | status | known gap |
 |---|---|---|
-| Claude Code | reference integration, shipped | in-process file tools are not covered while the vendor runtime owns the outer boundary; worked around with a tool allowlist until husk owns it |
+| Claude Code | reference integration, shipped | Inherits §2.1 above: in-process file tools are not covered while the vendor runtime owns the outer boundary. |
 
 The reference integration is one row. Everything above this table is the contract, and the
 contract does not know what is in it.
