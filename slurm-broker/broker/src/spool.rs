@@ -343,8 +343,15 @@ fn run_query_cmd(
     // subtree. Killing just the direct child would leave a grandchild (e.g. the `sleep`
     // a shell spawned) alive holding the stdout pipe, so wait_with_output would still
     // block for the full runtime — defeating the timeout.
+    // The same allowlist as a submission (B6-F6). These are read-only queries and `scancel`,
+    // so nothing here reaches a compute node — but they run with the broker's credentials
+    // against the same daemons, and `SCANCEL_*`/`SQUEUE_*` are an unlisted channel into the
+    // same decision. One env policy for everything the broker execs, so there is no second
+    // path to keep in sync.
     let child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .env_clear()
+        .envs(submit_env("running a query"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -416,12 +423,144 @@ fn cap_output(bytes: &[u8]) -> String {
 /// This is the submission surface only. Preventing the AGENT from redirecting its own
 /// model traffic — `ANTHROPIC_BASE_URL` pointed at a host husk did not intend — needs husk
 /// to own the login environment, which is ROADMAP step 6a.
+/// **Superseded by the allowlist below — kept only as the list of names that must never
+/// come back**, so a future widening of `SUBMIT_ENV_ALLOW_*` cannot silently re-admit them.
 const STRIPPED_SUBMIT_ENV: &[&str] = &[
     "SECCOMP_WRAPPER_DEBUG",
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CSCS_INFERENCE_API_KEY",
 ];
+
+/// What may cross from the broker's login environment into a job. **An allowlist.**
+///
+/// The four names above were a denylist, and a denylist is a bug list: it protected exactly
+/// the four credentials someone had thought of. `--export=ALL` hands slurmd the broker's
+/// whole environment, and the broker inherits the human's login shell — so every OTHER
+/// secret in it rode into the job unremarked. The reviewer's case was `GH_TOKEN`, but the
+/// shape is general: `*_TOKEN`, a cloud key, a database URL with a password in it, anything
+/// a scientist exported once. And the job that receives it is the AGENT's job: it reads its
+/// own environment, and egress now exists.
+///
+/// So the direction of failure is inverted. An unrecognised variable is DROPPED, which
+/// costs at worst a setting, instead of FORWARDED, which costs a credential. This is the
+/// same move as the sbatch option registry (F13/F14/F24/F26/F27): construct what is allowed
+/// rather than subtract what is feared.
+///
+/// The list is generous on purpose — it has to keep a real ICON run working, and the thing
+/// husk must not do is quietly break the science. `--export=ALL` is load-bearing for the
+/// live uenv view's PATH, so PATH and the toolchain/fabric families stay. If something is
+/// missing, it is missing LOUDLY: every dropped name is reported to the broker's own log
+/// (names, never values), and `HUSK_SUBMIT_ENV_ALLOW` extends the list without a rebuild.
+/// That variable is read from the broker's environment, which is the human's login shell —
+/// the same trust level as `HUSK_SLURM_PARTITION`, and not something the caged agent can
+/// reach.
+const SUBMIT_ENV_ALLOW_EXACT: &[&str] = &[
+    // Identity and locale. HOME is needed for the guard's own log; USER/LOGNAME for
+    // accounting; TZ/LANG so timestamps and number formats match the login node.
+    "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TZ", "LANG", "HOSTNAME", "TMPDIR", "PWD",
+    // Toolchain search paths. PATH carries the active uenv view, which is the whole reason
+    // --export=ALL exists.
+    "PATH", "LD_LIBRARY_PATH", "LIBRARY_PATH", "CPATH", "MANPATH", "PKG_CONFIG_PATH",
+    "PYTHONPATH", "PERL5LIB", "JULIA_DEPOT_PATH", "R_LIBS", "R_LIBS_USER",
+    // Environment-module state. `module` is exported as a shell FUNCTION, and without these
+    // a job script's `module load` fails with nothing that explains why.
+    "MODULEPATH", "MODULESHOME", "LOADEDMODULES", "_LMFILES_", "MODULEPATH_ROOT",
+    // Threading. Dropping these silently changes how a run PERFORMS, which is the hardest
+    // kind of difference to trace back to a sandbox.
+    "OMP_NUM_THREADS", "OMP_PLACES", "OMP_PROC_BIND", "OMP_STACKSIZE", "MKL_NUM_THREADS",
+];
+
+/// Families that may cross, matched by prefix. Every one of these is a SETTING namespace —
+/// scheduler, fabric, MPI, GPU runtime, module system, I/O library, or husk's own.
+///
+/// `BASH_FUNC_` is here because `module` is a shell function and HPC job scripts call it.
+/// It would be a serious hole if the confined side could set it; it cannot — this is the
+/// broker's environment, inherited from the human's login shell before the agent exists.
+const SUBMIT_ENV_ALLOW_PREFIX: &[&str] = &[
+    "LC_",                                   // locale
+    "SLURM_", "SBATCH_", "SRUN_", "SALLOC_", // scheduler (husk's CLI outranks all of it)
+    "UENV_", "USER_ENV_",                    // uenv view
+    "HUSK_",                                 // husk's own; the rank path reserves it
+    "LMOD_", "BASH_FUNC_",                   // module system (and its shell function)
+    "CRAY_", "PE_", "PMI_", "PMIX_", "FI_", "UCX_", // fabric / process management
+    "MPICH_", "OMPI_", "MV2_", "NCCL_",      // MPI + collectives
+    "CUDA_", "NVIDIA_", "ROCR_", "HIP_", "HSA_", // GPU runtimes
+    "HDF5_", "NETCDF", "ECCODES_", "GRIB_",  // I/O libraries a weather model needs
+    "OMP_", "GOMP_", "KMP_",                 // threading
+    "SPACK_", "EBROOT", "EBVERSION",         // package managers
+];
+
+/// Split `HUSK_SUBMIT_ENV_ALLOW` (colon-separated, `NAME` or `PREFIX*`) into extra rules.
+fn extra_submit_env_rules() -> (Vec<String>, Vec<String>) {
+    let (mut exact, mut prefix) = (Vec::new(), Vec::new());
+    if let Ok(v) = std::env::var("HUSK_SUBMIT_ENV_ALLOW") {
+        for item in v.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+            match item.strip_suffix('*') {
+                Some(p) if !p.is_empty() => prefix.push(p.to_string()),
+                _ => exact.push(item.to_string()),
+            }
+        }
+    }
+    (exact, prefix)
+}
+
+/// May `name` cross into a job? The credential denylist wins over every allow rule,
+/// including an operator's — those four names are the ones husk knows buy inference.
+fn submit_env_allows(name: &str, extra_exact: &[String], extra_prefix: &[String]) -> bool {
+    if STRIPPED_SUBMIT_ENV.contains(&name) {
+        return false;
+    }
+    SUBMIT_ENV_ALLOW_EXACT.contains(&name)
+        || SUBMIT_ENV_ALLOW_PREFIX.iter().any(|p| name.starts_with(p))
+        || extra_exact.iter().any(|e| e == name)
+        || extra_prefix.iter().any(|p| name.starts_with(p.as_str()))
+}
+
+/// Partition an environment into (forwarded, dropped-names). Pure, so the policy can be
+/// tested without mutating the test process's own environment.
+fn filter_submit_env(
+    vars: impl Iterator<Item = (String, String)>,
+    extra_exact: &[String],
+    extra_prefix: &[String],
+) -> (Vec<(String, String)>, Vec<String>) {
+    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    for (k, v) in vars {
+        if submit_env_allows(&k, extra_exact, extra_prefix) {
+            kept.push((k, v));
+        } else {
+            dropped.push(k);
+        }
+    }
+    (kept, dropped)
+}
+
+/// Build the environment a brokered SLURM command runs with, and SAY what was dropped.
+///
+/// The report is names-only and goes to the broker's stderr — outside the cage, in husk's
+/// own log. A dropped variable that breaks a run must be diagnosable in one look; that is
+/// the difference between an allowlist someone can live with and one they turn off. It also
+/// carries the remedy, because "husk removed something" without "here is how to keep it" is
+/// the unattributed denial this project keeps having to fix.
+fn submit_env(reason: &str) -> Vec<(String, String)> {
+    let (extra_exact, extra_prefix) = extra_submit_env_rules();
+    let (kept, mut dropped) = filter_submit_env(std::env::vars(), &extra_exact, &extra_prefix);
+    if !dropped.is_empty() {
+        dropped.sort();
+        eprintln!(
+            "husk-broker: {reason}: {} login variable(s) not forwarded to SLURM: {}",
+            dropped.len(),
+            dropped.join(" ")
+        );
+        eprintln!(
+            "husk-broker:   husk forwards an ALLOWLIST, because --export=ALL would otherwise \
+             hand every secret in your login shell to a job the agent controls. If a job \
+             needs one of these, export HUSK_SUBMIT_ENV_ALLOW='NAME:PREFIX*' before \
+             launching husk."
+        );
+    }
+    kept
+}
 
 fn run_sbatch(argv: &[String], script: &str) -> Result<u64, String> {
     run_sbatch_with(argv, script, std::time::Duration::from_secs(SUBMIT_TIMEOUT_SECS))
@@ -439,9 +578,11 @@ fn run_sbatch_with(
     use std::sync::Arc;
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..]);
-    for k in STRIPPED_SUBMIT_ENV {
-        cmd.env_remove(k);
-    }
+    // Default-deny the environment, not default-forward. `env_clear` first, so a variable
+    // reaches the job because it is on the allowlist and for no other reason — the same
+    // reason the option registry rejects what it does not recognise.
+    cmd.env_clear();
+    cmd.envs(submit_env("submitting a job"));
     // The script arrives on stdin, so no file exists for anyone to substitute. See `submit`.
     //
     // And it runs under a watchdog, in its own process group, exactly like `run_query_cmd`.
@@ -807,6 +948,105 @@ mod tests {
         let id = run_sbatch_with(&argv, "#!/bin/bash\necho hi\n", std::time::Duration::from_secs(5))
             .expect("a fast submission must succeed");
         assert_eq!(id, 4242);
+    }
+
+    /// The env MEDIUM. `STRIPPED_SUBMIT_ENV` was a four-name denylist, and `--export=ALL`
+    /// hands slurmd the broker's whole environment — which is the human's login shell. So
+    /// every secret nobody had thought of rode into a job the AGENT controls and can read.
+    /// The reviewer's case was `GH_TOKEN`; the point is that there is no end to that list.
+    #[test]
+    fn the_submission_environment_is_an_allowlist_so_an_unlisted_secret_cannot_ride_along() {
+        let env: Vec<(String, String)> = [
+            // Secrets that were NOT among the four, i.e. exactly what the denylist missed.
+            ("GH_TOKEN", "ghp_secret"),
+            ("GITHUB_TOKEN", "ghp_secret"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("OPENAI_API_KEY", "sk-x"),
+            ("DATABASE_URL", "postgres://u:pw@h/db"),
+            ("MY_COMPANY_VPN_PASSWORD", "hunter2"),
+            // …and the four that were.
+            ("ANTHROPIC_API_KEY", "sk-ant"),
+            ("CSCS_INFERENCE_API_KEY", "cscs"),
+            // What a real run genuinely needs, which is why this cannot just be "drop all".
+            ("PATH", "/user-environment/env/icon/bin:/usr/bin"),
+            ("LD_LIBRARY_PATH", "/user-environment/env/icon/lib"),
+            ("UENV_VIEW", "/user-environment:icon:default"),
+            ("SLURM_CONF", "/etc/slurm/slurm.conf"),
+            ("MODULEPATH", "/opt/cray/modulefiles"),
+            ("BASH_FUNC_module%%", "() { eval `modulecmd bash $*`; }"),
+            ("MPICH_GPU_SUPPORT_ENABLED", "1"),
+            ("OMP_NUM_THREADS", "12"),
+            ("HOME", "/users/me"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        let (kept, dropped) = filter_submit_env(env.into_iter(), &[], &[]);
+        let kept_names: Vec<&str> = kept.iter().map(|(k, _)| k.as_str()).collect();
+
+        for secret in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "OPENAI_API_KEY",
+            "DATABASE_URL",
+            "MY_COMPANY_VPN_PASSWORD",
+            "ANTHROPIC_API_KEY",
+            "CSCS_INFERENCE_API_KEY",
+        ] {
+            assert!(
+                !kept_names.contains(&secret),
+                "{secret} reached the job — with a denylist it would have, which was the bug"
+            );
+            assert!(dropped.iter().any(|d| d == secret), "{secret} must be reported as dropped");
+        }
+        // A denial that breaks the science is a denial nobody keeps. The families a real
+        // ICON run needs must survive, or husk has traded a leak for an outage.
+        for needed in [
+            "PATH",
+            "LD_LIBRARY_PATH",
+            "UENV_VIEW",
+            "SLURM_CONF",
+            "MODULEPATH",
+            "BASH_FUNC_module%%",
+            "MPICH_GPU_SUPPORT_ENABLED",
+            "OMP_NUM_THREADS",
+            "HOME",
+        ] {
+            assert!(kept_names.contains(&needed), "{needed} must still reach the job");
+        }
+    }
+
+    #[test]
+    fn the_credential_denylist_outranks_every_allow_rule_including_the_operators() {
+        // The operator escape hatch exists so a missing setting is fixable without a
+        // rebuild. It must not be a way — accidental or otherwise — to put the inference
+        // credentials back on the wire: those are the ones husk KNOWS buy paid compute.
+        let extra_exact = vec!["ANTHROPIC_API_KEY".to_string()];
+        let extra_prefix = vec!["ANTHROPIC".to_string(), "CSCS_".to_string()];
+        let env: Vec<(String, String)> = [("ANTHROPIC_API_KEY", "sk"), ("CSCS_INFERENCE_API_KEY", "k")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let (kept, _) = filter_submit_env(env.into_iter(), &extra_exact, &extra_prefix);
+        assert!(kept.is_empty(), "the credential denylist must win: {kept:?}");
+    }
+
+    #[test]
+    fn a_brokered_command_actually_runs_with_the_filtered_environment() {
+        // The rules above are policy; this is the wiring. `cargo test` sets CARGO_PKG_NAME
+        // in this process and it is on no allowlist, so if the child can see it then
+        // `env_clear` is not in the path that matters and the policy is decoration.
+        assert!(std::env::var("CARGO_PKG_NAME").is_ok(), "precondition: cargo sets this");
+        let argv = vec!["sh".into(), "-c".into(), "env".into()];
+        let (out, _) = run_query_cmd(&argv, std::time::Duration::from_secs(5)).unwrap();
+        let seen = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !seen.lines().any(|l| l.starts_with("CARGO_PKG_NAME=")),
+            "an unlisted variable reached the child: {seen}"
+        );
+        assert!(seen.lines().any(|l| l.starts_with("PATH=")), "PATH must survive: {seen}");
     }
 
     #[test]
