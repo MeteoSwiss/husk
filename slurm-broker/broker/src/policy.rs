@@ -383,10 +383,38 @@ pub fn decide(
     // and unknown/next-year options fail closed by construction, not open. This retires
     // the whole F13/F14/F24/F26/F27 class rather than the instances. See THREAT-MODEL.md
     // "Design principle (the gate)".
-    match sbatch::interpret_cli(&cli) {
-        Ok(resource_opts) => options.extend(resource_opts),
+    // …from BOTH channels, because a real run script puts them in the BODY.
+    //
+    // This used to interpret the CLI only. Body `#SBATCH` lines were parsed (that is how
+    // an unknown or Forced directive gets rejected by name) and then their resource
+    // options were DROPPED — validated as acceptable and never re-emitted. The comment on
+    // `wrap_script` claimed the opposite: "husk already parses them, validates them, and
+    // re-emits what it allows onto the command line". It re-emitted only what came from
+    // the CLI.
+    //
+    // The cost was a production outage and it was silent, which is the worst shape: the
+    // job RAN, with SLURM's defaults. A script saying `#SBATCH --ntasks=64` got one task —
+    // 2 CPUs of a 256-CPU node — while `SLURM_NTASKS` came back empty and nothing anywhere
+    // said husk had dropped anything. The agent that hit it reasonably concluded husk was
+    // capping CPUs. Every real HPC run script uses directives, so this was the normal path,
+    // not an edge case (P7, P12).
+    //
+    // Precedence is sbatch's own: CLI > env > `#SBATCH`. So interpret the directives first
+    // and let CLI entries override them by option name — which also keeps husk's forced
+    // options winning, since those are emitted separately above and `interpret_cli` drops
+    // Forced/Ignored from both channels.
+    let body_opts = match sbatch::interpret_cli(&directives) {
+        Ok(o) => o,
+        Err(reason) => return Decision::Reject(format!("#SBATCH: {reason}")),
+    };
+    let cli_opts = match sbatch::interpret_cli(&cli) {
+        Ok(o) => o,
         Err(reason) => return Decision::Reject(reason),
-    }
+    };
+    let name_of = |o: &String| o.split_once('=').map(|(n, _)| n.to_string()).unwrap_or_else(|| o.clone());
+    let overridden: Vec<String> = cli_opts.iter().map(name_of).collect();
+    options.extend(body_opts.into_iter().filter(|o| !overridden.contains(&name_of(o))));
+    options.extend(cli_opts);
 
     // Compute-side cage: derive the bwrap profile from the (trusted) resolved
     // sandbox.filesystem policy, hiding homes and re-exposing the human's carve-outs.
@@ -3527,6 +3555,73 @@ mod tests {
             }
             _ => panic!("a glued -o pointing outside the workdir must be rejected"),
         }
+    }
+
+    #[test]
+    fn resource_directives_in_the_body_reach_slurm() {
+        // **THE PRODUCTION OUTAGE, 2026-08-05.** husk interpreted the CLI only. Body
+        // `#SBATCH` lines were parsed — that is how an unknown or Forced directive gets
+        // rejected by name — and then their resource options were DROPPED: validated as
+        // acceptable, never re-emitted. `wrap_script`'s comment claimed the opposite.
+        //
+        // It was silent, which is what made it expensive. The job RAN, on SLURM's
+        // defaults: a script asking for `--ntasks=64` got one task and 2 CPUs of a
+        // 256-CPU node, `SLURM_NTASKS` came back empty, and nothing said husk had dropped
+        // anything — so the agent that hit it concluded husk was capping CPUs, which was a
+        // reasonable reading of the only evidence available to it.
+        //
+        // EVERY REAL RUN SCRIPT USES DIRECTIVES. The CLI path had tests; this one did not,
+        // so a green suite coexisted with the normal path being broken (P9).
+        let root = icon_workdir("bodyres");
+        let body = "#!/bin/bash -l\n\
+                    #SBATCH --ntasks=64\n\
+                    #SBATCH --cpus-per-task=2\n\
+                    #SBATCH --mem=64G\n\
+                    srun ./a.out\n";
+        let opts = opts_in(&root, req_in(&root, &["--partition=preemptible"], body), &no_uenv());
+        for want in ["--ntasks=64", "--cpus-per-task=2", "--mem=64G"] {
+            assert!(has(&opts, want), "a body resource directive must reach sbatch: {opts:?}");
+        }
+
+        // Precedence is sbatch's own — CLI > env > #SBATCH — so a CLI value overrides the
+        // directive rather than appearing beside it. Two `--ntasks` on one command line
+        // would let the last one win by accident instead of by rule.
+        let both = opts_in(
+            &root,
+            req_in(&root, &["--partition=preemptible", "--ntasks=8"], body),
+            &no_uenv(),
+        );
+        assert!(has(&both, "--ntasks=8"), "the CLI must win: {both:?}");
+        assert!(!has(&both, "--ntasks=64"), "the directive must not survive beside it: {both:?}");
+        // …and an option the CLI did NOT mention still comes through from the body.
+        assert!(has(&both, "--cpus-per-task=2"), "unrelated directives are kept: {both:?}");
+
+        // husk's own forced options still outrank both channels.
+        assert!(has(&both, "--nodes=1"), "the cage profile still forces its topology");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_invalid_body_directive_value_is_rejected_rather_than_ignored() {
+        // The other half: now that directives are interpreted, a bad VALUE must reject
+        // rather than silently vanish. Previously the whole class was dropped, so a typo
+        // and a valid request were indistinguishable — both produced SLURM's defaults.
+        let root = icon_workdir("bodybad");
+        let d = decide(
+            &req_in(&root, &["--partition=preemptible"], "#!/bin/bash\n#SBATCH --ntasks=lots\n"),
+            &no_uenv(),
+            &FsPolicy::default(),
+            &root,
+        );
+        match d {
+            Decision::Reject(m) => assert!(
+                m.contains("#SBATCH"),
+                "the refusal must say which channel the bad value came from: {m}"
+            ),
+            _ => panic!("an invalid body directive value must be rejected, not ignored"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
