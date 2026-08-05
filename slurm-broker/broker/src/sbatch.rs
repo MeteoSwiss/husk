@@ -584,6 +584,15 @@ fn split_directive_line(rest: &str) -> Result<Vec<String>, String> {
                 quote = Some(c);
                 building = true; // `--x=""` is an empty value, not an absent one
             }
+            // An unquoted `#` that STARTS a token begins a trailing comment, as it does in
+            // the shell and in sbatch's own directive handling. Without this,
+            // `#SBATCH --job-name=x # a note` tokenised to `["--job-name=x", "#", "a",
+            // "note"]` and `interpret_cli` refused the submission on the stray `#` — another
+            // false reject on an ordinary line, from the same missing-lexer root as the
+            // quotes. Only at a token boundary: a `#` mid-token is left alone and judged by
+            // the value grammar, which accepts it for no option, so guessing there buys
+            // nothing.
+            None if c == '#' && !building => break,
             None if c.is_whitespace() => {
                 if building {
                     out.push(std::mem::take(&mut cur));
@@ -1013,6 +1022,30 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_comment_on_a_directive_line_is_not_read_as_options() {
+        // Before: `#SBATCH --job-name=x # a note` tokenised to
+        // `["--job-name=x", "#", "a", "note"]`, and `interpret_cli` refused the whole
+        // submission on the stray `#`. An ordinary, documented way to write a run script.
+        //
+        // Note the two readers disagreed about those tokens: `body_reject_reason` skips
+        // anything not starting with `-` (that is how it steps over a separated value) and
+        // saw nothing wrong, while `interpret_cli` rejected. Two functions, one token
+        // stream, two verdicts — the F13/F14 shape, inside husk rather than against slurmd.
+        // The stricter one runs, so it failed closed; it still meant the refusal came from
+        // the place least able to explain it.
+        let toks = sbatch_directives("#!/bin/bash\n#SBATCH --job-name=x # a note\n").unwrap();
+        assert_eq!(toks, v(&["--job-name=x"]), "the comment is not options");
+        assert_eq!(interpret_cli(&toks), Ok(v(&["--job-name=x"])));
+        assert!(body_reject_reason("#!/bin/bash\n#SBATCH --job-name=x # a note\n").is_none());
+
+        // A `#` inside quotes is literal — and then judged by the grammar, which takes it
+        // for no option, so this still refuses. Failing on the VALUE is the honest failure.
+        let q = sbatch_directives("#!/bin/bash\n#SBATCH --comment=\"a # b\"\n").unwrap();
+        assert_eq!(q, v(&["--comment=a # b"]), "quoted # is data, not a comment");
+        assert!(interpret_cli(&q).is_err(), "and the grammar refuses it");
+    }
+
+    #[test]
     fn an_unterminated_quote_in_a_directive_is_refused_rather_than_guessed() {
         // The author's intent is genuinely unknown here. Guessing is how a directive comes to
         // mean one thing to husk and another to the person who wrote it.
@@ -1075,4 +1108,5 @@ mod tests {
         assert!(unread_directive_note("#!/bin/bash\n#SBATCH -p x\nsrun hostname\n").is_none());
     }
 }
+
 
