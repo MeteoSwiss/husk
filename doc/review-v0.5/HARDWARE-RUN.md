@@ -1,6 +1,21 @@
 # husk v0.5 — hardware run plan (Balfrin / Santis)
 
-> **BALFRIN ROUND 1 DONE 2026-08-05 at `2f1a0b0`: selftest --full 91 PASS / 0 FAIL / 0 SKIP /
+> **★ BALFRIN CLOSED 2026-08-05 at `396ae7b`: selftest --full green AND A REAL ICON RUN WORKS.**
+> That took two more fixes after the "green" fix phase, both of them regressions the fix phase
+> introduced. The second one matters most: **a stat on the project directory is a TOCTOU, and
+> the login cage is what fills the window** — `sbatch` runs inside a login-cage Bash command,
+> the vendor runtime ghost-creates `/dev/null` mount points in the project dir for the duration
+> of that command, husk stat'd one during the moment it existed and emitted a hard bind for it.
+> Fixed by dropping the stat and using `--ro-bind-try` below the workdir (`396ae7b`).
+>
+> **The selftest cannot see that class at all** — it never calls the broker from inside a husk
+> session, so no login cage exists and no ghosts appear. 91/0/0 on both clusters said nothing
+> about a bug that broke every ICON job. **Treat the real-workload run as the verdict.**
+>
+> **SANTIS still needs a re-run at HEAD** — it was green at `2f1a0b0`, before both the Lmod fix
+> (`1426e46`; Santis is where Lmod was found) and the TOCTOU fix.
+>
+> **Earlier: BALFRIN ROUND 1 at `2f1a0b0`: selftest --full 91 PASS / 0 FAIL / 0 SKIP /
 > 1 INFO**, uenv `/user-environment:icon:default`, balfrin-ln002, SLURM 23.02.7.
 > Round 1 needed two fixes first (`2f1a0b0`): a cage-killer the fix round introduced (a
 > denyWrite bind with a missing source — bwrap exits before the job runs) and an env
