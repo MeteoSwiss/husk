@@ -121,6 +121,37 @@ export HUSK_STEP_SPOOL="$_husk_spool"
 "$_husk_broker" --step-broker --spool "$_husk_spool" --workdir '/work/project' \
 >>"$_husk_log" 2>&1 &
 _husk_step_pid=$!
+# CONFIRM IT CAME UP. The step broker fails CLOSED on settings it cannot parse and
+# exits(2) - which is correct. But it was started in the background and nothing ever
+# checked, so that exit was invisible: the stub still got bound over srun, every srun
+# wrote a request no one would ever answer, and the job hung to its walltime with no
+# output on any channel anyone was reading. The reason sat in husk's own job log, two
+# clear sentences, where neither the agent nor the operator was looking.
+#
+# That is not fail-closed. It is fail-silent, and it is the worst shape available: the
+# safe decision was taken and then hidden. It cost an afternoon of ghost-hunting across
+# four nodes and four rank counts (2026-08-06), and the trigger was a human saving an
+# empty .claude/settings.json in vim - about as ordinary as a mistake gets.
+#
+# Settings resolution happens before the watch loop, so a broker that is gone by now
+# refused to start. `kill -0` is NOT enough: bash has not reaped it, so a dead child is
+# a zombie and `kill -0` succeeds. Read the actual state instead.
+sleep 1
+_husk_step_state=$(sed -n 's/^State:[[:space:]]*\([A-Z]\).*/\1/p' \
+"/proc/$_husk_step_pid/status" 2>/dev/null)
+case "${_husk_step_state:-gone}" in
+Z|gone)
+echo "husk: the step broker refused to start, so srun cannot work in this job." >&2
+echo "husk: failing the job now, rather than letting every srun hang silently" >&2
+echo "husk: until the walltime expires. The reason it refused:" >&2
+if [ -f "$_husk_log" ]; then
+sed -n 's/^husk: /husk:     /p' "$_husk_log" 2>/dev/null | tail -n 4 >&2
+else
+echo "husk:     (see the step broker's output above)" >&2
+fi
+exit 1
+;;
+esac
 _husk_extra+=(--ro-bind "$_husk_stub" "$_husk_real_srun")
 fi
 else

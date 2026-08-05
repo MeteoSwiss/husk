@@ -522,6 +522,15 @@ pub fn decide(
 /// same submit-side/run-side split that made the GPU binds `--dev-bind-try`.
 fn husk_paths() -> (String, String, String) {
     let exe = std::env::current_exe().unwrap_or_default();
+    // TEST-ONLY seam, and deliberately the narrowest one that works: only the BROKER path,
+    // never the prefix the stub and socat are derived from. The guard now refuses to run a
+    // job whose step broker died at startup, so any harness that RUNS the guard needs a
+    // broker that stays alive — and under `cargo test` this path is the test binary, which
+    // exits immediately. Overriding the derivation instead would let a test silently prove
+    // a layout that install-husk.sh never creates.
+    #[cfg(test)]
+    let broker = tests::broker_path_override().unwrap_or_else(|| exe.to_string_lossy().to_string());
+    #[cfg(not(test))]
     let broker = exe.to_string_lossy().to_string();
     let prefix = exe.parent().and_then(|bin| bin.parent());
     let stub = prefix
@@ -1376,6 +1385,37 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
       \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir {workdir_q} \\\n\
         >>\"$_husk_log\" 2>&1 &\n\
       _husk_step_pid=$!\n\
+      # CONFIRM IT CAME UP. The step broker fails CLOSED on settings it cannot parse and\n\
+      # exits(2) - which is correct. But it was started in the background and nothing ever\n\
+      # checked, so that exit was invisible: the stub still got bound over srun, every srun\n\
+      # wrote a request no one would ever answer, and the job hung to its walltime with no\n\
+      # output on any channel anyone was reading. The reason sat in husk's own job log, two\n\
+      # clear sentences, where neither the agent nor the operator was looking.\n\
+      #\n\
+      # That is not fail-closed. It is fail-silent, and it is the worst shape available: the\n\
+      # safe decision was taken and then hidden. It cost an afternoon of ghost-hunting across\n\
+      # four nodes and four rank counts (2026-08-06), and the trigger was a human saving an\n\
+      # empty .claude/settings.json in vim - about as ordinary as a mistake gets.\n\
+      #\n\
+      # Settings resolution happens before the watch loop, so a broker that is gone by now\n\
+      # refused to start. `kill -0` is NOT enough: bash has not reaped it, so a dead child is\n\
+      # a zombie and `kill -0` succeeds. Read the actual state instead.\n\
+      sleep 1\n\
+      _husk_step_state=$(sed -n 's/^State:[[:space:]]*\\([A-Z]\\).*/\\1/p' \\\n\
+        \"/proc/$_husk_step_pid/status\" 2>/dev/null)\n\
+      case \"${{_husk_step_state:-gone}}\" in\n\
+        Z|gone)\n\
+          echo \"husk: the step broker refused to start, so srun cannot work in this job.\" >&2\n\
+          echo \"husk: failing the job now, rather than letting every srun hang silently\" >&2\n\
+          echo \"husk: until the walltime expires. The reason it refused:\" >&2\n\
+          if [ -f \"$_husk_log\" ]; then\n\
+            sed -n 's/^husk: /husk:     /p' \"$_husk_log\" 2>/dev/null | tail -n 4 >&2\n\
+          else\n\
+            echo \"husk:     (see the step broker's output above)\" >&2\n\
+          fi\n\
+          exit 1\n\
+          ;;\n\
+      esac\n\
       _husk_extra+=(--ro-bind \"$_husk_stub\" \"$_husk_real_srun\")\n\
     fi\n\
   else\n\
@@ -2038,7 +2078,24 @@ mod tests {
     /// failure and then, after a first fix, as the opposite one. Owning the state here
     /// removes the race instead of narrowing it. A flaky test is worse than no test: it
     /// teaches people to re-run rather than to look.
-    fn run_guard_with_stub_ex(tag: &str, stub_body: &str, want_stub: bool) -> (i32, String, String) {
+    /// See `husk_paths`. Set only while a harness that RUNS the guard is in flight, and
+    /// always under `STUB_PATH_LOCK`, because it is process-global and cargo runs tests as
+    /// threads of one process.
+    static BROKER_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// A step broker that comes up and stays up — what the guard expects.
+    const LIVE_BROKER: &str = "#!/bin/sh\nexec sleep 10\n";
+
+    pub(super) fn broker_path_override() -> Option<String> {
+        BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn run_guard_with_stub_ex(
+        tag: &str,
+        stub_body: &str,
+        want_stub: bool,
+        broker_body: &str,
+    ) -> (i32, String, String) {
         use std::os::unix::fs::PermissionsExt;
         let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let derived = derived_stub_path();
@@ -2064,6 +2121,15 @@ mod tests {
         let fake_srun = dir.join("srun");
         std::fs::write(&fake_srun, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&fake_srun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A step broker that STAYS UP. The guard now refuses the job if the one it started
+        // is already gone, so without this every harness run dies at that check — which is
+        // the check working, but it would stop these tests reaching bwrap at all. The real
+        // broker path here is the cargo test binary, which exits immediately.
+        let fake_broker = dir.join("husk-broker-stub");
+        std::fs::write(&fake_broker, broker_body).unwrap();
+        std::fs::set_permissions(&fake_broker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(fake_broker.to_string_lossy().to_string());
 
         // The workdir must EXIST: the guard creates the step spool under it, and a
         // workdir it cannot create in means no step pair (which the guard now announces).
@@ -2089,6 +2155,8 @@ mod tests {
             .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
             .output()
             .unwrap();
+        // Cleared before the lock is released, so a later test never sees another's broker.
+        *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = std::fs::remove_dir_all(&dir);
         (
             out.status.code().unwrap_or(-1),
@@ -2097,9 +2165,46 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_step_broker_that_refuses_to_start_fails_the_job_instead_of_hanging_it() {
+        // **2026-08-06, Balfrin.** The step broker fails closed on settings it cannot parse
+        // — correctly. But it is backgrounded and nobody checked, so the job carried on,
+        // bound the stub over srun, and every `srun` blocked forever on a request no one
+        // would answer. Five or six submissions across four nodes and four rank counts, all
+        // hanging identically to the walltime, with NO output on any channel. The reason was
+        // in husk's own job log the whole time.
+        //
+        // The trigger was a human saving an empty `.claude/settings.json` in vim. The safe
+        // decision was taken and then hidden, which is worse than either failing or
+        // succeeding — the operator cannot act on a decision they cannot see.
+        let (code, _out, err) = run_guard_with_stub_ex(
+            "deadbroker",
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
+            true,
+            // What the real broker does with unparseable settings: say why, exit(2).
+            "#!/bin/sh\necho 'husk: refusing to start the step broker - bad JSON' >&2\nexit 2\n",
+        );
+
+        assert_ne!(code, 0, "the job must FAIL, not proceed: stderr={err}");
+        assert!(
+            err.contains("the step broker refused to start"),
+            "and it must say so on the job's own stderr, where the operator is looking: {err}"
+        );
+        assert!(
+            err.contains("hang"),
+            "the message must name the symptom it is replacing, or nobody connects the two: {err}"
+        );
+        // The decisive part: the cage must never be entered. If it were, srun would be
+        // bound to a stub whose broker is dead and we would be back to the silent hang.
+        assert!(
+            !err.contains("ARG:"),
+            "the guard must fail BEFORE building the cage, not after: {err}"
+        );
+    }
+
     /// The common case: no srun stub installed, so no step pair.
     fn run_guard_with_stub(tag: &str, stub_body: &str) -> (i32, String, String) {
-        run_guard_with_stub_ex(tag, stub_body, false)
+        run_guard_with_stub_ex(tag, stub_body, false, LIVE_BROKER)
     }
 
     #[test]
@@ -3116,6 +3221,7 @@ mod tests {
             "quoting",
             "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
             true,
+            LIVE_BROKER,
         );
         assert_eq!(code, 0, "guard must run: {out}");
         for line in out.lines().filter_map(|l| l.strip_prefix("ARG:")) {
@@ -3143,7 +3249,7 @@ mod tests {
         // is fatal, which is how the MUNGE mask took every job down.
         //
         let (code, out, _err) =
-            run_guard_with_stub_ex("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n", false);
+            run_guard_with_stub_ex("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n", false, LIVE_BROKER);
         assert_eq!(code, 0, "the job must still run: {out}");
         assert!(
             !out.contains("srun-stub.py"),
