@@ -112,8 +112,8 @@ pub fn decide(
     let directives = sbatch::sbatch_directives(&req.script.body);
 
     // ---- partition: must resolve to the site's forced partition, else reject + teach ----
-    // The required partition is site-specific (HUSK_SLURM_PARTITION, default preemptible);
-    // Balfrin has `preemptible`, Santis does not, so it is not hard-coded.
+    // The required partition is site-specific (HUSK_SLURM_PARTITION, default preemptible).
+    // Not every site has a preemptible partition, so it is not hard-coded.
     let allowed = session.allowed_partitions.as_slice();
     let partition = sbatch::option_value(&cli, &["-p", "--partition"])
         .or_else(|| sbatch::option_value(&directives, &["-p", "--partition"]));
@@ -125,9 +125,9 @@ pub fn decide(
 
     // Resolve the requested partition against the allowed SET, and re-emit OUR entry.
     //
-    // A list rather than one value because a real cluster is not homogeneous: Balfrin has
-    // GPU nodes (`short`) and CPU-only postprocessing nodes (`pp-short`), and which one a
-    // job needs is a hardware fact only the job knows. husk bounds the set; the job picks
+    // A list rather than one value because a real cluster is not homogeneous: GPU nodes
+    // and CPU-only postprocessing nodes are different partitions, and which one a job
+    // needs is a hardware fact only the job knows. husk bounds the set; the job picks
     // from it. Same construct-and-re-emit shape as --chdir: the agent influences the value,
     // and the bytes that reach sbatch are ours.
     //
@@ -2724,7 +2724,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    // A real cluster is not homogeneous: Balfrin has GPU nodes (`short`) and CPU-only
+    // A real cluster is not homogeneous: it has GPU nodes and CPU-only
     // postprocessing nodes (`pp-short`), and which one a job needs is a hardware fact only
     // the job knows. husk bounds the SET; the job picks from it. The bytes that reach
     // sbatch are still husk's — the allowlist entry, never the request's copy of it.

@@ -39,7 +39,7 @@ const GPU_DEVICES: &[&str] = &[
 
 /// Fabric NIC device nodes exposed into a RANK cage (never into a plain job cage).
 ///
-/// `/dev/cxi[0-9]*` on Alps — Balfrin has four. Measured (gate C4/C1): the device is
+/// `/dev/cxi[0-9]*` on Alps, one per NIC. Measured (gate C4/C1): the device is
 /// REQUIRED for the CXI provider to enumerate (0 endpoints without it, 8 with) and needs
 /// no capability beyond the node itself, and enumeration is unaffected by
 /// `--unshare-net` — so the rank cage keeps full IP isolation AND the fabric.

@@ -1447,7 +1447,7 @@ def find_step_broker():
 def yama_scope():
     # A ptrace_scope of 1 restricts attachment to DESCENDANTS. Two ranks are siblings
     # (both children of slurmstepd), so a non-zero scope denies rank-to-rank CMA no matter
-    # what husk does with namespaces. Balfrin has no Yama at all; report the value so a
+    # what husk does with namespaces. Not every site enables Yama; report the value so a
     # failure here is attributable instead of being blamed on the cage.
     try:
         return open("/proc/sys/kernel/yama/ptrace_scope").read().strip()

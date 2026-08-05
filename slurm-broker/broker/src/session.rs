@@ -10,14 +10,14 @@ use std::env;
 // mounts but leaves the view inactive. See policy.rs for the rationale + AV7 caveat.
 
 /// The partition the broker forces (and requires the agent to request) when
-/// HUSK_SLURM_PARTITION is unset. Site-specific: Balfrin has `preemptible`; other
-/// sites (e.g. Santis) do not, so an operator overrides it via the env var.
+/// HUSK_SLURM_PARTITION is unset. Only a default: not every site has a preemptible
+/// partition, so an operator overrides it via the env var.
 pub const DEFAULT_PARTITION: &str = "preemptible";
 
 /// Split the operator's `HUSK_SLURM_PARTITION` into the set a job may request.
 ///
-/// A comma-separated LIST, because one partition is not enough on a real cluster: Balfrin
-/// has GPU nodes (`short`) and CPU-only postprocessing nodes (`pp-short`), and a workflow
+/// A comma-separated LIST, because one partition is not enough on a real cluster: GPU
+/// nodes and CPU-only postprocessing nodes are different partitions, and a workflow
 /// legitimately needs both. Which one a job wants is a HARDWARE choice only the job can
 /// make, so husk cannot pick for it — but it can bound the set.
 ///
@@ -115,8 +115,8 @@ pub struct Session {
     pub allowed_partitions: Vec<String>,
     /// `--account` forced onto every job, from `HUSK_SLURM_ACCOUNT` in the broker's TRUSTED
     /// environment (operator-set at install, agent-inaccessible). `None` where the site does
-    /// not use accounts — Balfrin does not, Santis REQUIRES one and its cli_filter rejects
-    /// every submission without it.
+    /// not use accounts. Where a site does require one, its `cli_filter` typically rejects
+    /// every submission without it, so it is not optional there.
     pub account: Option<String>,
     /// What to pass to `--view`, normalized to `uenvname:viewname`. UENV_VIEW is
     /// mount-qualified on this uenv (e.g. `/user-environment:icon:default`), which is
@@ -226,8 +226,8 @@ mod tests {
    State=UP TotalCPUs=3712 TotalNodes=29
 ";
 
-    // The operator's list. Balfrin needs two: `short` for GPU nodes, `pp-short` for the
-    // CPU-only postprocessing nodes.
+    // The operator's list. A real cluster needs more than one: GPU nodes and CPU-only
+    // postprocessing nodes are different partitions.
     #[test]
     fn partition_lists_are_split_trimmed_and_sanitised() {
         use super::parse_partition_list as split;

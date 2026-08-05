@@ -49,11 +49,12 @@ SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Optional flag: --slurm-partition NAME[,NAME...] ─────────────────────────────
 # The partitions a brokered agent job may request. Recorded for husk to export as
-# HUSK_SLURM_PARTITION. Site-specific: Balfrin uses the built-in default `preemptible`;
-# Santis has no such partition (use `debug` or `shared`).
-# A COMMA-SEPARATED LIST is accepted, because a cluster is not homogeneous — on Balfrin
-# `short` is the GPU partition and `pp-short` the CPU-only postprocessing one, and a
-# workflow legitimately needs both:  --slurm-partition short,pp-short
+# HUSK_SLURM_PARTITION. Site-specific: not every site has a preemptible partition, so
+# the built-in default is only a default. Prefer a preemptible one where it exists —
+# that is what makes the resource envelope structural (THREAT-MODEL.md).
+# A COMMA-SEPARATED LIST is accepted, because a cluster is not homogeneous: a GPU
+# partition and a CPU-only postprocessing partition are different partitions, and one
+# workflow legitimately needs both:  --slurm-partition gpu-part,pp-part
 # The job picks one of them; husk refuses anything else and names the whole set.
 # Extracted first so the positional --help/--uninstall checks below still see $1.
 SLURM_PARTITION_ARG=""
