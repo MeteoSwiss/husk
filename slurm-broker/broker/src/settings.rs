@@ -1963,6 +1963,39 @@ mod tests {
     }
 
     #[test]
+    fn every_cage_gets_a_private_tmp_so_a_sibling_sessions_egress_socket_is_not_even_nameable() {
+        // **O1.** The reviewer counted 35 live proxy sockets in a shared `/tmp`, with
+        // predictable names, and made the right argument: connecting to an AF_UNIX socket
+        // needs only WRITE permission on the file, and file permissions do not separate two
+        // sessions of the SAME user. Two concurrent husk sessions on different projects have
+        // different egress allowlists and the same uid, so if one could reach the other's
+        // socket it would egress under the other's policy.
+        //
+        // For husk's own socket that fails at the first step: it lives at
+        // `/tmp/husk-<uid>-<jobid>/net.sock`, and every cage mounts a FRESH tmpfs over
+        // `/tmp` — so inside a job, `/tmp` contains nothing but what husk binds back in,
+        // which is this job's own socket file and not its directory. A sibling's socket
+        // cannot be opened because its path does not exist in that mount namespace. Naming
+        // is the boundary here, not permission, which is the only kind that works between
+        // processes of one user.
+        //
+        // That property is currently a side effect of a `--tmpfs /tmp` that is there for
+        // other reasons. Pinned here, in both cages, so a later "let jobs share /tmp for
+        // scratch" cannot silently reopen it. (The 0755 sockets the reviewer actually
+        // listed are the vendor runtime's `srt-mux`, not husk's 0600 `net.sock`; those are
+        // the login side and belong to the 6a work.)
+        let p = FsPolicy::default();
+        assert!(
+            joined(&p, "/work").contains("--tmpfs /tmp "),
+            "the job cage must get a private /tmp"
+        );
+        assert!(
+            p.rank_bwrap_args("/work").join(" ").contains("--tmpfs /tmp"),
+            "so must the rank cage — a rank binds the same socket into its own namespace"
+        );
+    }
+
+    #[test]
     fn credential_masks_are_not_static_bwrap_args() {
         // The MUNGE mask is applied by the re-exec guard on the COMPUTE NODE, never here:
         // `--tmpfs DEST` kills bwrap when DEST is absent under a read-only root, and again

@@ -1065,20 +1065,33 @@ fn wrap_script(
   # project measured ~57: it worked, with under 20 to spare, and a project a couple of
   # directories deeper would have lost its network to a bare "AF_UNIX path too long".
   #
-  # So: a short, node-local, per-job directory instead. `mkdir` without -p and mode 0700,
-  # because /tmp is world-writable and job ids are public in squeue - a directory someone
-  # else pre-created is one they could put their own socket in, which would route this
-  # job's egress through their proxy. If we cannot own it, the job gets no network; the
-  # proxy re-checks ownership and mode before binding, so the shell only proposes.
+  # So: a short, node-local, per-job directory instead - created by `mktemp -d`, with a
+  # RANDOM suffix, and that randomness is the point (O1).
+  #
+  # The name used to be exactly `/tmp/husk-<uid>-<jobid>`, and job ids are public in
+  # squeue, so the path was predictable before it existed. `mkdir` + an ownership test
+  # answers the CROSS-USER version of that (someone else's directory is not ours, so the
+  # job gets no network) but NOT the same-uid version: a second session of the same user,
+  # or an escaped agent, could pre-create the directory for a job id it expected, pass the
+  # `-O` test - it really is that uid's directory - and still hold a handle on the path the
+  # ranks later resolve. AF_UNIX connect needs only write permission on the socket, and
+  # permission does not distinguish two sessions of one user; only NAMING does.
+  #
+  # `mktemp -d` closes it by construction: it creates the directory atomically at a name
+  # nobody could have guessed, 0700, and fails rather than accepting one that exists. So
+  # the directory is ours because we made it, not because it looked like ours. The proxy
+  # still re-checks ownership and mode before binding - the shell only proposes - and the
+  # socket is BIND-mounted into each cage, so a later swap of the host path cannot redirect
+  # a job that has already resolved it. Cost: ~7 more bytes of the 108-byte sun_path
+  # budget, out of the ~34 this layout spends.
   #
   # It is bound into the cage READ-ONLY. connect(2) works fine through a read-only bind
   # under --unshare-net - measured on 6.8, then confirmed on the kernel that matters when
   # net.live fetched through this socket on Balfrin (5.14.21, Cray Shasta, 2026-08-01).
   # The job then cannot delete or replace its own socket, which it could when the socket
   # sat in the writable spool.
-  _husk_net_dir="/tmp/husk-$(id -u 2>/dev/null || echo u)-${{SLURM_JOB_ID:-nojob}}"
-  mkdir -m 700 "$_husk_net_dir" 2>/dev/null || true
-  if [ -d "$_husk_net_dir" ] && [ -O "$_husk_net_dir" ]; then
+  _husk_net_dir=$(mktemp -d "/tmp/husk-$(id -u 2>/dev/null || echo u)-${{SLURM_JOB_ID:-nojob}}-XXXXXX" 2>/dev/null || true)
+  if [ -n "$_husk_net_dir" ] && [ -d "$_husk_net_dir" ] && [ -O "$_husk_net_dir" ]; then
     chmod 700 "$_husk_net_dir" 2>/dev/null
     rm -f "$_husk_net_dir/net.sock" 2>/dev/null
     _husk_net_sock="$_husk_net_dir/net.sock"
@@ -1122,9 +1135,10 @@ fn wrap_script(
     # Report BEFORE clearing the variable - naming the path is the whole point of the
     # message, and an unattributed "no network" is exactly the failure mode husk keeps
     # having to fix.
-    echo "husk: could not create a private $_husk_net_dir, so this job gets no network." >&2
-    echo "husk:   that path exists and is not a directory this job owns. husk will not" >&2
-    echo "husk:   route a job's egress through a directory it does not control." >&2
+    echo "husk: could not create a private directory under /tmp for this job's egress" >&2
+    echo "husk:   socket, so this job gets no network. mktemp -d failed, or what it made" >&2
+    echo "husk:   is not a directory this job owns. husk will not route a job's egress" >&2
+    echo "husk:   through a directory it did not create itself." >&2
     _husk_net_dir=
   fi
 "#,
@@ -2878,6 +2892,34 @@ mod tests {
         );
         // 137 (SIGKILL) as well as 143: a job past GraceTime is killed outright.
         assert!(script.contains("\"$_husk_rc\" = 137"), "{script}");
+    }
+
+    #[test]
+    fn the_egress_socket_directory_is_unguessable_so_it_cannot_be_pre_created() {
+        // **O1.** Connecting to an AF_UNIX socket needs only WRITE permission on the file,
+        // and permission does not distinguish two sessions of the SAME user — so an
+        // ownership test cannot be the boundary between them. The old name was exactly
+        // `/tmp/husk-<uid>-<jobid>`, and job ids are public in squeue: predictable BEFORE
+        // it existed. A same-uid actor could pre-create it for an expected job id, pass the
+        // `-O` check honestly (it really is that uid's directory), and keep a handle on the
+        // path each rank later resolves.
+        //
+        // `mktemp -d` makes the directory ours because we CREATED it, not because it looked
+        // like ours: atomic, unguessable, 0700, and it fails rather than adopting a path
+        // that already exists.
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()]);
+        assert!(
+            on.contains("mktemp -d \"/tmp/husk-") && on.contains("-XXXXXX\""),
+            "the egress socket dir must be created unguessably: {on}"
+        );
+        assert!(
+            !on.contains("mkdir -m 700 \"$_husk_net_dir\""),
+            "a predictable mkdir is pre-creatable by any same-uid process: {on}"
+        );
+        // The belt stays on: husk still refuses a directory it does not own, and the proxy
+        // re-checks owner and mode before it binds (check_socket_path). mktemp removes the
+        // race; it does not replace the check.
+        assert!(on.contains("[ -O \"$_husk_net_dir\" ]"), "ownership check must remain: {on}");
     }
 
     #[test]
