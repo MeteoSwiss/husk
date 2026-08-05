@@ -234,8 +234,19 @@ elif ! have srun || [ -z "${SLURM_JOB_ID:-}" ]; then
 else
   fnd C5 mpi_build "OK ($CCX = $(command -v "$CCX"))"
 
-  # C5 — singleton init, NO launcher (Stage 0 viability):
-  if out="$("$SHARED/mpi_hello" 2>&1)"; then
+  # C5 — singleton init, NO launcher (Stage 0 viability).
+  #
+  # `env -u PMI_* …` is load-bearing, not hygiene. If this probe is running INSIDE a step
+  # — `srun --pty bash`, which is the natural way to get an interactive compute shell —
+  # then PMI_RANK, PMI_CONTROL_PORT and PMI_SHARED_SECRET are all set, and a "singleton"
+  # MPI_Init is not singleton: it tries to join the surrounding step's rendezvous and
+  # BLOCKS FOREVER. Measured on Balfrin 2026-08-05: the probe hung here with no output and
+  # no timeout, which reads as a broken node rather than a broken assumption.
+  # Stripping the step's identity is what makes the word "singleton" true.
+  if out="$(${TMO[@]+"${TMO[@]}"} env -u PMI_RANK -u PMI_SIZE -u PMI_LOCAL_RANK \
+              -u PMI_LOCAL_SIZE -u PMI_UNIVERSE_SIZE -u PMI_JOBID -u PMI_CONTROL_PORT \
+              -u PMI_SHARED_SECRET -u PMIX_RANK -u PMIX_NAMESPACE \
+              "$SHARED/mpi_hello" 2>&1)"; then
     fnd C5 singleton_init "OK ($out) — Stage 0: ICON-1-rank may run with NO srun in the current cage"
   else
     fnd C5 singleton_init "FAIL [$(why "$out")] — $(one_line "$out")"
