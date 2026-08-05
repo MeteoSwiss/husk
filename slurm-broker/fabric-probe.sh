@@ -435,6 +435,13 @@ head2 "C10 — netns x geometry matrix for the PMI control plane"
 # SLURM_STEP_LAUNCHER_PORT). So the open question is exactly where --unshare-net stops
 # being affordable. Vary ONE thing at a time: PMI type x geometry x netns.
 # NOTE: needs >=2 tasks per node in the allocation — submit with -N2 --ntasks-per-node=2.
+# WHAT THIS MATRIX DOES *NOT* TEST: the shared holder. Every arm here runs a plain
+# `bwrap --ro-bind / /`, which gives each rank its OWN user namespace. husk's real rank
+# cage instead JOINS a holder's namespace (`--userns <fd>`), because same-node ranks need
+# one shared userns for CMA (P1). That is a design gap rather than an unknown — a
+# namespace is a kernel object on one machine, so multi-node needs one holder PER NODE,
+# and the rank wrapper must find-or-create it. No experiment is needed to know that; what
+# needs measuring is only what is below.
 # Run 7 corrections, all of them probe bugs in this helper:
 #   * every pmix/pmi2 arm died on `bwrap: Can't find source path .../mpi_cray_shasta/<id>`
 #     — those PMIs never create the cray_shasta step dir, and `--bind` is fatal on a
@@ -487,6 +494,16 @@ if [ -n "${CCX:-}" ] && have srun && [ -n "${SLURM_JOB_ID:-}" ] && [ "${BASE_OK:
   c10 pmix_2node2rank_netns     pmix   "-N2 -n2 --ntasks-per-node=1"   yes    jobdir   2
   c10 pmix_2node2rank_nonet     pmix   "-N2 -n2 --ntasks-per-node=1"   no     jobdir   2
   c10 pmi2_2node2rank_nonet     pmi2   "-N2 -n2 --ntasks-per-node=1"   no     jobdir   2
+
+  # THE REALISTIC SHAPE, and the only arms where intra-node and inter-node have to work at
+  # the same time. Every 2-node arm above puts ONE rank on each node, so nothing on a node
+  # has a peer: shared memory is never used, CMA is never exercised, and the fabric is the
+  # only path. ICON is 2+ ranks per node across several nodes, where a rank talks to its
+  # node-mates over /dev/shm and to the far node over the NIC — and the cage must allow
+  # both at once. If the matrix disagrees anywhere, it will be here.
+  c10 cs_2node4rank_nonet       ""     "-N2 -n4 --ntasks-per-node=2"   no     jobdir   4
+  c10 cs_2node4rank_netns       ""     "-N2 -n4 --ntasks-per-node=2"   yes    jobdir   4
+  c10 pmix_2node4rank_netns     pmix   "-N2 -n4 --ntasks-per-node=2"   yes    jobdir   4
   # UNCAGED 2-rank pmix control: run 9 showed caged pmix produces singletons with AND
   # without the netns, so the cage is not implicated — but that was never shown directly.
   # Irrelevant on Alps (cray_shasta is the site default and works); it matters at a site
