@@ -508,6 +508,14 @@ const SUBMIT_ENV_ALLOW_PREFIX: &[&str] = &[
     "UENV_", "USER_ENV_",                    // uenv view
     "HUSK_",                                 // husk's own; the rank path reserves it
     "LMOD_", "BASH_FUNC_",                   // module system (and its shell function)
+    // Lmod's serialised module table, measured on SANTIS (Balfrin's module system does not
+    // set these, which is why Balfrin's clean run did not reveal them). Lmod encodes what is
+    // currently loaded into `_ModuleTable001_`, `_ModuleTable_Sz_` and `__LMOD_REF_COUNT_*`;
+    // a job that inherits `MODULEPATH` but not these has a module system that disagrees with
+    // itself about what is loaded. Neither matches the `LMOD_` prefix above — one starts with
+    // a double underscore, the other is capitalised differently — which is exactly the kind
+    // of near-miss an allowlist has to be measured against rather than guessed at.
+    "__LMOD_", "_ModuleTable",
     "CRAY_", "PE_", "PMI_", "PMIX_", "FI_", "UCX_", // fabric / process management
     "MPICH_", "OMPI_", "MV2_", "NCCL_",      // MPI + collectives
     "CUDA_", "NVIDIA_", "ROCR_", "HIP_", "HSA_", // GPU runtimes
@@ -1077,6 +1085,38 @@ mod tests {
             .collect();
         let (kept, _) = filter_submit_env(noise.into_iter(), &[], &[]);
         assert!(kept.is_empty(), "a batch job needs none of these: {kept:?}");
+    }
+
+    #[test]
+    fn a_second_cluster_found_module_state_the_first_one_never_set() {
+        // **Santis, 2026-08-05.** Balfrin came back clean at 32 drops; Santis dropped 42, and
+        // the difference was Lmod's serialised module table. Lmod encodes what is loaded into
+        // `_ModuleTable001_`, `_ModuleTable_Sz_` and `__LMOD_REF_COUNT_MODULEPATH`; a job that
+        // inherits `MODULEPATH` but not these has a module system that disagrees with itself.
+        // Neither name matches the `LMOD_` prefix that was already there — one has a double
+        // underscore, the other is capitalised differently.
+        //
+        // The lesson is about METHOD, not about Lmod: an allowlist is only as good as the
+        // environments it has been measured against, and one clean cluster is not evidence
+        // about the next. Re-read the "not forwarded" line on every NEW site.
+        let env: Vec<(String, String)> = [
+            "_ModuleTable001_", "_ModuleTable_Sz_", "__LMOD_REF_COUNT_MODULEPATH", "LMOD_CMD",
+        ]
+        .iter()
+        .map(|k| (k.to_string(), "v".to_string()))
+        .collect();
+        let (_, dropped) = filter_submit_env(env.into_iter(), &[], &[]);
+        assert!(dropped.is_empty(), "Lmod's own state must reach the job: {dropped:?}");
+
+        // Santis also surfaced a channel worth keeping SHUT, and it is not noise: bash sources
+        // `$BASH_ENV` on non-interactive startup, so it is a code-execution channel into every
+        // shell a job runs. The old four-name denylist forwarded it to every job.
+        let (kept, _) = filter_submit_env(
+            [("BASH_ENV".to_string(), "/tmp/payload.sh".to_string())].into_iter(),
+            &[],
+            &[],
+        );
+        assert!(kept.is_empty(), "BASH_ENV is arbitrary code on shell startup: {kept:?}");
     }
 
     #[test]

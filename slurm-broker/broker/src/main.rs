@@ -536,6 +536,25 @@ fn main() {
         std::process::id(),
         husk_slurm_broker::utc_stamp(now_secs()),
     );
+    // WHICH BUILD is serving this session, on its own line so `grep build` finds it.
+    //
+    // The broker is spawned ONCE per husk session and serves it to the end, so reinstalling
+    // husk does not touch a session already running. On Balfrin (2026-08-05) a cage-killing
+    // bug was fixed, installed, and verified green by a selftest that spawns its own fresh
+    // broker — while the live session kept failing every ICON job with the very error that
+    // had been fixed, because its broker predated the install. The crate version above could
+    // not distinguish them: `0.4.0` does not move between builds. This line does.
+    eprintln!(
+        "broker: build {} ({}) from {} — a session keeps the broker it started with, so \
+         compare this against your install before believing a fix is in effect",
+        env!("HUSK_BUILD_REV"),
+        husk_slurm_broker::utc_stamp(
+            env!("HUSK_BUILD_UNIX").parse::<u64>().unwrap_or(0)
+        ),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown path>".into()),
+    );
     eprintln!("broker: compute-cage policy resolved from project dir {project_dir:?}");
 
     catch_shutdown_signals();
