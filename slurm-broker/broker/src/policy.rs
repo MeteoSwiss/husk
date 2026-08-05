@@ -2307,7 +2307,7 @@ mod tests {
             profile::Profile::SingleNode,
             &root,
             false,
-            &[root.clone()],
+            std::slice::from_ref(&root),
         );
         let path = dir.join("job.sh");
         std::fs::write(&path, &script).unwrap();

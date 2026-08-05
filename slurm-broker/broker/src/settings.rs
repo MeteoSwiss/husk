@@ -177,6 +177,10 @@ const AUTO_EXEC_RO_OR_EMPTY: &[&str] = &[
 /// `git init`, which is the same trap husk hit masking a path inside `.git` and fabricating
 /// a repository. Shape-aware masking (compute) or the vendor's conditional (login) owns
 /// that one; a static entry must never.
+/// Not read by the broker at run time — the LOGIN cage is the vendor runtime's, driven by
+/// the shipped JSON, so this constant's whole job is to be the thing that JSON is asserted
+/// against. Deleting it because "nothing uses it" deletes the pairing.
+#[allow(dead_code)]
 pub const LOGIN_AUTO_EXEC_DENY: &[&str] = &[
     ".Rprofile",
     ".hg/hgrc",
