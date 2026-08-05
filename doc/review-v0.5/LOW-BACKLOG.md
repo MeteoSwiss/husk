@@ -1,6 +1,13 @@
 # husk v0.5 — consolidated LOW / INFO backlog (A + B + C)
 
 Everything at LOW, INFO, or by-design across all three review clusters, in one place.
+
+> **2026-08-05: two entries here were closed for free by the above-LOW fix round.**
+> **A7-1** shipped with the A1 CRITICAL as designed (one host-fact-free refusal). **B6-F6**
+> (`scancel`/queries run with the broker's env unfiltered) is closed by the submission-env
+> allowlist, which was applied to everything the broker execs, not just `sbatch`. Both are
+> struck through below. The rest of this list is untouched.
+
 Above-LOW findings are tracked elsewhere: B/C's shipped fixes (`SYNTHESIS.md` priorities 1–16)
 and A's CRITICAL/MEDIUM set (the triage table). This file is only the tail.
 
@@ -15,7 +22,7 @@ acting).
 
 | ID | Sev | One line | Fix / note |
 |---|---|---|---|
-| A7-1 | LOW (MED as A1 multiplier) | confine refusal message is a host-path existence oracle | **folds into the A1 CRITICAL fix** — co-design the sanitized message; only `--output/--error`, `--chdir` already safe via `confine_under_any` |
+| ~~A7-1~~ | ~~LOW (MED as A1 multiplier)~~ | ~~confine refusal message is a host-path existence oracle~~ | **DONE 2026-08-05 (`653bb2c`)** — shipped with the A1 fix as designed: one host-fact-free refusal, detail to broker stderr under `$HOME` |
 | A3 scan | LOW usability | `#SBATCH` scan is whole-file/indented/last-wins → false-rejects heredoc-generated inner scripts | scan only the leading comment block, col-0, stop at first non-comment line (`sbatch.rs:491`) |
 | `_HUSK_` filter | LOW landmine (inert) | reserved-prefix filter catches `HUSK_` but not `_HUSK_`; inert today (nothing on the rank path reads `_HUSK_RESANDBOXED`) | reserve `_HUSK_` (`rank.rs:35`) before some future code reads a `_HUSK_` value |
 | Port-less tunnel (A9 O2) | LOW-MED, by-design | a port-less allowlist entry = generic all-ports TCP tunnel to that host (scheduler ports still refused, so no AV8) | prefer `host:port` entries; shipped default already pinned to `:443`; document the semantics |
@@ -35,7 +42,7 @@ acting).
 | B1-F7 | LOW | `~/.husk/log/` has no owner and no size bound | **OPEN** (log hygiene / rotation) |
 | B1-F8 | LOW (PLAUSIBLE) | the netproxy's tunnel counter is not `Drop`-guarded | **OPEN** (RAII) |
 | B3-F8 | LOW | relative `denyWrite` is silently dropped on compute (F22, unfixed on this one field) | **OPEN** |
-| B6-F6 | LOW today | `scancel`/read-only queries run with the broker's env unfiltered; `SCANCEL_*` is an unlisted channel for the same decision (it's the human's login env, not the agent's) | **OPEN** (env filter, defense-in-depth) |
+| ~~B6-F6~~ | ~~LOW today~~ | ~~`scancel`/read-only queries run with the broker's env unfiltered~~ | **DONE 2026-08-05 (`3354764`)** — the submission-env allowlist was applied to everything the broker execs, not just `sbatch` |
 | B4-F7 | LOW (minor) | the rank script's fail-closed guarantee is shell-dependent (bwrap covers it) | **OPEN** (robustness) |
 | B4-F8 | LOW (hygiene) | namespace fds leak into the workload (no impact found) | **HYGIENE** |
 | C2-9 | LOW (PLAUSIBLE) | with header injection the in-cage relay becomes a position the agent occupies | **BY-DESIGN** — recorded for the 6b design |

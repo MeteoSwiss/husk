@@ -1,5 +1,12 @@
 # husk v0.5 — Workstream A triage synthesis (pass 2)
 
+> **STATUS 2026-08-05: the fix phase for everything above LOW is DONE and committed**
+> (`653bb2c`, `1a3f706`, `3354764`, `b3758f9`, `714d2da`, plus `7126be8` for the selftest).
+> 1 CRITICAL + 4 MEDIUM fixed, each with a test verified to fail against the unfixed code.
+> Broker suite 209 → 221 lib tests, clippy clean; selftest 46 PASS / 0 FAIL / 2 SKIP on the
+> laptop. **NOT yet hardware-verified — see "What still needs Balfrin/Santis" at the end.**
+> The LOW tail is untouched and still lives in `LOW-BACKLOG.md`.
+
 All 9 A briefs ran (assumed-breach, on Balfrin) and were triaged by 7 independent laptop agents
 that verified each claim against the source (and, for two, built/ran husk: a local proxy for the
 CONNECT parser, `cargo test` for the deep chain). This is the settled output. LOW/INFO tail is in
@@ -72,3 +79,36 @@ Steps 3–4 are the format Christoph found most useful in the B/C round — keep
 Then converge: re-mine the FIXED code until a depth pass comes back clean (two clean passes,
 hypotheses closed). The accumulated escape-tests are the trusted-layer regression battery. The
 cage-build immediate fix should land early so a reviewer can re-run A5's deep chain live.
+
+## What shipped (2026-08-05) and what it cost
+
+| Finding | Fix | Test that pins it |
+|---|---|---|
+| **A1** CRITICAL | three parts: leaf `symlink_metadata` at submission; `--open-mode=append` FORCED (registry class `Forced`, so the agent cannot emit a later one that wins); and the job guard refuses to run a body whose fd 1/2 do not resolve inside the writable set | `output_pattern_refuses_a_leaf_that_is_a_symlink`, `a_hijacked_stdout_stops_the_job_before_the_agents_body_runs`, `output_files_are_opened_append_…`, selftest `sbatch.output_symlink_leaf` |
+| **A7-1** | one host-fact-free refusal for every confinement failure; detail redirected to broker stderr, which the wrapper keeps under `$HOME` — and the wrapper now tells the broker (`HUSK_LOG_AGENT_READABLE`) when it fell back to a spool log the agent can read, so detail is withheld there | `a_confinement_refusal_tells_the_agent_nothing_about_the_host_filesystem`, selftest `sbatch.confine_msg_opaque` |
+| **A4-F3** MED | `.Rprofile` + `.hg/hgrc` added to the shipped login `denyWrite`; `LOGIN_AUTO_EXEC_DENY` pairs the two lists | `every_auto_exec_file_the_compute_cage_masks_is_write_denied_on_the_login_side_too` |
+| **env** MED | `env_clear` + allowlist (exact names + prefix families) for everything the broker execs, incl. the query/cancel path (closes B6-F6); loud names-only drop report; `HUSK_SUBMIT_ENV_ALLOW` escape hatch that cannot re-admit the four credentials | 3 tests incl. a wiring test that fails against `env_remove` |
+| **cage-build** MED-avail | `AUTO_EXEC_DIRS` masked by shape (file → `/dev/null`, dir/absent → tmpfs) | `an_auto_exec_dir_that_is_already_a_file_is_masked_as_a_file` — builds the collision on disk, which the F6b tests never did |
+| **O1** MED | socket dir now `mktemp -d …-XXXXXX` (unguessable, atomic, cannot be pre-created by a same-uid actor); private `/tmp` in both cages pinned | `the_egress_socket_directory_is_unguessable_…`, `every_cage_gets_a_private_tmp_…` |
+
+**Behaviour changes worth knowing:** output files are opened `append` rather than `truncate`
+(only visible to a job that names a fixed output file and runs twice — every husk default is
+`%j`-unique); a job whose stdout/stderr resolve outside the writable set is now REFUSED rather
+than run; and the login environment no longer passes wholesale into jobs.
+
+## What still needs Balfrin/Santis
+
+1. **Does a batch script get a real file descriptor for `--output`?** The fd check enforces only
+   when fd 1 is a regular file; on a site where slurmstepd holds the file and pipes to the
+   script it would report (`"stdout/stderr are not regular files on this node"`) and not
+   enforce. A1's own evidence says direct fds, but confirm it — the whole run-time half rests
+   on it. Look for that line in `~/.husk/log/job-<id>.log`.
+2. **Did the env allowlist drop anything ICON needs?** Watch the first real run for
+   `husk-broker: … login variable(s) not forwarded to SLURM: …`. The remedy is in the message.
+3. **Re-run `selftest.sh --full`** — and pass `--broker` explicitly or rebuild first, because the
+   search order prefers a prebuilt `husk-slurm-broker-<arch>` that may predate these fixes.
+4. **A1's residual (H1)** is narrowed, not gone: the submit-time check races, and the run-time
+   check is what closes it. If (1) comes back "not regular files", A1 is only narrowed.
+5. **The cage-build collision residual**: the shape is read at submit time on the login node
+   while bwrap runs later on a compute node. Concurrent jobs in one project dir are the case to
+   re-test (A5's deep chain was blocked by exactly this).
