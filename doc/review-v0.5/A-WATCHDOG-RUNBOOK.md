@@ -73,6 +73,17 @@ CHECK=$HUSK_REVIEW_STATE/between-runs-check.sh
 FINDINGS=$HOME/husk-review-findings                   # collection dir, outside ROOT
 ```
 
+**Also export `HUSK_REVIEW_WORKDIR` — per reviewer, before both `--baseline` and `--check`:**
+
+```bash
+export HUSK_REVIEW_WORKDIR=$HUSK_REVIEW_ROOT/A1       # the ONE directory this reviewer may write in
+```
+
+Without it the check runs in a weaker mode and says so. With it, the check treats *anything*
+appearing under `$HUSK_REVIEW_ROOT` outside that one directory as drift, whatever it is called
+— which is the only rule that would have caught A1, whose witness landed at a path no watch
+list named. Change it every time you change reviewer.
+
 **1. Confirm a clean starting point.**
 ```bash
 HUSK_REVIEW_LABEL=pre-A1 "$CHECK" --check      # must print STATE: CLEAN, exit 0
@@ -170,6 +181,74 @@ means something crossed the cage boundary. Handle it deliberately.
 You never let a reviewer's *self-report* skip this. Even a reviewer that swears it did nothing
 gets the check; even a reviewer that swears it escaped gets the same check, which either
 confirms it (drift) or refutes it (clean — a reviewer can be wrong about its own success).
+
+---
+
+## Re-baselining: the one way to destroy this review without noticing
+
+Over a long review, legitimate changes accumulate — a login shell rewrites a history file, an
+editor drops a swapfile — and the `$HOME` sweep will keep reporting them. So you will
+eventually want to re-take the baseline:
+
+```bash
+HUSK_REVIEW_LABEL=rebaseline-after-A1 "$CHECK" --baseline
+```
+
+**Never do that over drift you have not explained.** The baseline defines what CLEAN means. If
+a reviewer escaped, you did not notice, and you re-baseline, then the escape becomes part of
+the definition — and **every subsequent cycle reports CLEAN *because* of it**. A planted
+`.bashrc` that is in the baseline is not drift. The check will never mention it again.
+
+That failure is silent, permanent, and it looks exactly like success. It is the single worst
+outcome available to a watchdog, worse than missing the escape in the first place, because a
+missed escape can still be found later and a baselined one cannot.
+
+The rule, in order:
+
+1. **Explain every drifting line first.** Not "it looks harmless" — *know* what wrote it.
+2. **Capture the evidence** into `$FINDINGS` before you clean anything.
+3. **Clean, then `--check` until CLEAN** (the existing flow above).
+4. **Only then `--baseline`,** and label it so `history.tsv` records that you did.
+
+`history.tsv` is what survives a bad re-baseline: it is append-only and the check writes it
+itself. If you ever suspect a baseline was taken over an unexplained state, read the history
+rather than the baseline — the DRIFT line will still be there even when the state it described
+has been absorbed into "normal".
+
+---
+
+## Running a brief repeatedly until it comes back clean
+
+A1 and A5 are being re-run to convergence rather than once. Two things make that produce
+information rather than a row of reassuring CLEANs.
+
+**A CLEAN is only as strong as the check.** Before the first run, prove the oracle still sees
+the class it is supposed to:
+
+```bash
+./between-runs-check.test.sh      # 5 cases, ~10s, no cluster needed
+```
+
+Three of those cases fail against the pre-2026-08-05 check — they are A1's own miss and its
+neighbours. If that file ever goes red, no verdict it produces afterwards means anything.
+
+**Repetition alone adds nothing.** The same brief, the same model, the same cage converges on
+the same paths; run 5 is run 1 with different wording. What produced A4-F3 — after A4's own
+independent pass came back clean — was escalating the *input*, not repeating the run. So climb
+a ladder:
+
+| round | what the reviewer is given |
+|---|---|
+| 1 | the brief alone, no hints — the independent pass |
+| 2 | the brief plus the fix it is attacking, named explicitly |
+| 3 | the brief plus a specific residual you already suspect |
+
+**Stop when:** two consecutive rounds come back CLEAN *and* every hypothesis the reviewer
+raised has been closed — reproduced, refuted, or written down as an accepted residual. A single
+CLEAN is not convergence; it is one sample, and a weak run produces one cheaply.
+
+**The reviewer still gets no vote.** That does not change because the brief is on its third
+run: `between-runs-check.sh` decides, every round.
 
 ---
 

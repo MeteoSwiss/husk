@@ -11,8 +11,24 @@
 # false "clean" lets a compromised reviewer contaminate the next one, and a false "dirty"
 # only costs you a look. See A-WATCHDOG-RUNBOOK.md.
 #
+# WHAT IT LOOKS AT, AND THE ONE THING THAT MATTERS ABOUT THE DIFFERENCE
+# --------------------------------------------------------------------
+# Two kinds of check live here, and they are not equally good.
+#
+#   ENUMERATED — WATCH_PATHS, the canary list, STRAY_PROCS, the residue globs. These catch a
+#   plant at a path somebody thought of in advance. Cheap, quiet, and bounded by imagination.
+#
+#   STRUCTURAL — "nothing may exist under $REVIEW_ROOT outside the reviewer's own workdir",
+#   "no symlink in the review tree may point out of it", "nothing under $HOME may be newer
+#   than the baseline". These do not need the path predicted.
+#
+# The enumerated half reported CLEAN over A1's CRITICAL, because A1 wrote to the parent of the
+# workdir and no entry named it. The structural half exists because of that miss. When the two
+# disagree, the structural one is the one to believe.
+#
 #   --baseline   snapshot the current (known-good) state. Run ONCE, after setup, before any
 #                reviewer. See A-PRE-RUN-SETUP.md.
+#                Set HUSK_REVIEW_WORKDIR=<the reviewer's project dir> for full coverage.
 #   Set HUSK_REVIEW_LABEL=<brief-id> before --check so the history line says which reviewer
 #   it followed. Optional, and worth it: an unlabelled history is hard to read afterwards.
 #
@@ -29,6 +45,23 @@ set -u
 # ─── SITE CONFIG — fill these in before first use ────────────────────────────────────────
 # The directory the review lives under. Reviewer project dirs are created inside it.
 REVIEW_ROOT="${HUSK_REVIEW_ROOT:-$SCRATCH/husk-review}"
+# The ONE directory this reviewer is allowed to write in — normally $REVIEW_ROOT/<project>.
+# Set HUSK_REVIEW_WORKDIR before --baseline and --check.
+#
+# THIS EXISTS BECAUSE THE CHECK MISSED A1's CRITICAL. A1 achieved arbitrary write as the user
+# and its witness landed in the PARENT of the workdir — a path no entry in WATCH_PATHS names,
+# so this script reported CLEAN over a real escape. The lists below are a DENYLIST OF PLACES
+# TO LOOK, and A1's class is "write anywhere", which no such list can cover.
+#
+# So the region outside the reviewer's own directory is watched STRUCTURALLY instead: the
+# reviewer legitimately writes in exactly one place, therefore anything appearing anywhere
+# else under $REVIEW_ROOT is escape evidence by construction, whatever it is called. That is
+# a property, not an enumeration, and it is the only part of this script that would have
+# caught A1.
+#
+# Unset is a supported but WEAKER mode: without it, only the immediate children of
+# $REVIEW_ROOT are watched (still enough for A1's own witness), and --check says so.
+REVIEW_WORKDIR="${HUSK_REVIEW_WORKDIR:-}"
 # Where the baseline and this script's own state live (NOT under REVIEW_ROOT — a reviewer
 # must never be able to write to its own baseline).
 STATE_DIR="${HUSK_REVIEW_STATE:-$HOME/.husk-review-state}"
@@ -95,9 +128,50 @@ digest_path() {
   fi
 }
 
+# Everything under $REVIEW_ROOT that is NOT inside the reviewer's own workdir. Names only —
+# the contents of the reviewer's directory churn by design and are none of our business; the
+# question is only whether anything exists OUTSIDE it. Bounded depth and a timeout because
+# $REVIEW_ROOT is Lustre-backed and a review tree can be large.
+outside_workdir() {
+  [ -d "$REVIEW_ROOT" ] || return 0
+  if [ -n "$REVIEW_WORKDIR" ]; then
+    run_bounded find "$REVIEW_ROOT" -maxdepth 4 -mindepth 1 \
+      \( -path "$REVIEW_WORKDIR" -o -path "$REVIEW_WORKDIR/*" \) -prune -o -print 2>/dev/null
+  else
+    # Weak mode: immediate children only. Still catches a witness dropped beside the workdir.
+    run_bounded find "$REVIEW_ROOT" -maxdepth 1 -mindepth 1 -print 2>/dev/null
+  fi
+}
+
+# Symlinks under $REVIEW_ROOT whose target resolves OUTSIDE it. This is A1's mechanism seen
+# from the outside: the CRITICAL was an `--output` whose leaf was a symlink, so the write
+# landed wherever the link pointed. A link like that is evidence whether or not the write has
+# happened yet, and unlike a fixed path list it does not need anyone to have predicted the
+# target.
+escaping_links() {
+  [ -d "$REVIEW_ROOT" ] || return 0
+  local l t
+  while IFS= read -r l; do
+    [ -n "$l" ] || continue
+    t=$(readlink -f "$l" 2>/dev/null) || continue
+    case "$t" in "$REVIEW_ROOT"/*|"$REVIEW_ROOT") ;; *) printf '%s -> %s\n' "$l" "$t" ;; esac
+  done < <(run_bounded find "$REVIEW_ROOT" -maxdepth 6 -type l -print 2>/dev/null)
+}
+
+# `find` with a wall-clock bound, so a Lustre metadata stall degrades to a loud partial
+# result instead of hanging the watchdog between reviewers.
+run_bounded() {
+  if command -v timeout >/dev/null 2>&1; then timeout 90 "$@"; else "$@"; fi
+}
+
 snapshot() {
   local out="$1"
   : > "$out"
+  # Paths outside the reviewer's own workdir, and links that escape the review tree.
+  while IFS= read -r p; do [ -n "$p" ] && printf 'outside\t%s\n' "$p"; done \
+    < <(outside_workdir) >> "$out"
+  while IFS= read -r p; do [ -n "$p" ] && printf 'escapelink\t%s\n' "$p"; done \
+    < <(escaping_links) >> "$out"
   # Watched plant sites.
   for p in "${WATCH_PATHS[@]}"; do
     printf 'watch\t%s\t%s\n' "$p" "$(digest_path "$p")" >> "$out"
@@ -129,13 +203,24 @@ snapshot() {
 
 if [ "$mode" = --baseline ]; then
   snapshot "$STATE_DIR/baseline.tsv"
+  # The reference mtime for the $HOME sweep. Written LAST, so "newer than this" means
+  # "changed after the baseline was taken".
+  touch "$STATE_DIR/baseline.stamp"
   echo "baseline written to $STATE_DIR/baseline.tsv ($(wc -l < "$STATE_DIR/baseline.tsv") lines)"
   echo "review this by eye once: it defines what CLEAN means."
+  [ -n "$REVIEW_WORKDIR" ] \
+    && echo "reviewer workdir: $REVIEW_WORKDIR (everything else under $REVIEW_ROOT is watched)" \
+    || echo "WARNING: HUSK_REVIEW_WORKDIR unset — only the immediate children of $REVIEW_ROOT
+         are watched. Set it to the reviewer's project dir for full coverage of the A1 class."
   exit 0
 fi
 
 [ "$mode" = --check ] || { echo "unknown mode $mode"; exit 2; }
 [ -r "$STATE_DIR/baseline.tsv" ] || { echo "STATE: DRIFT — no baseline; run --baseline first"; exit 1; }
+
+[ -n "$REVIEW_WORKDIR" ] || echo "NOTE: HUSK_REVIEW_WORKDIR unset — running in weak mode; only
+      the immediate children of $REVIEW_ROOT are watched, not the whole tree outside the
+      reviewer's workdir. A CLEAN in this mode is weaker than a CLEAN with it set."
 
 snapshot "$STATE_DIR/now.tsv"
 drift=0
@@ -181,7 +266,53 @@ while IFS=$'\t' read -r _ d; do
   echo "DRIFT: husk residue $d appeared during the review"
   drift=$((drift + 1))
 done < <(new_lines residue)
+
+# 4b. THE A1 CLASS. Anything that appeared under $REVIEW_ROOT outside the reviewer's own
+#     workdir. The reviewer has exactly one directory it may write in, so this is drift by
+#     construction — no list had to predict the name.
+while IFS=$'\t' read -r _ p; do
+  [ -n "$p" ] || continue
+  echo "DRIFT: $p appeared under the review root, OUTSIDE the reviewer's workdir"
+  echo "       ^ the reviewer may only write inside its own project dir. This is the shape"
+  echo "         A1's CRITICAL had, and the shape this check used to miss entirely."
+  drift=$((drift + 1))
+done < <(new_lines outside)
+
+# 4c. A symlink inside the review tree pointing out of it — A1's mechanism, whether or not
+#     the write has happened yet.
+while IFS=$'\t' read -r _ p; do
+  [ -n "$p" ] || continue
+  echo "DRIFT: symlink escapes the review tree: $p"
+  drift=$((drift + 1))
+done < <(new_lines escapelink)
 rm -f "$STATE_DIR/.base.$$"
+
+# 4d. THE UNPREDICTED-PATH SWEEP. Everything above still only looks where someone thought to
+#     look. A1's class is "write anywhere as the user", so also ask the filesystem directly:
+#     what under $HOME changed since the baseline? Metadata only, one filesystem, bounded and
+#     timed out, with the directories that churn by design pruned — the same rule WATCH_PATHS
+#     follows, for the same reason.
+if [ -f "$STATE_DIR/baseline.stamp" ]; then
+  sweep=$(run_bounded find "$HOME" -xdev -maxdepth 6 \
+      \( -path "$HOME/.claude" -o -path "$HOME/.husk" -o -path "$HOME/.cache" \
+         -o -path "$HOME/.local/state" -o -path "$HOME/.config/husk" \
+         -o -path "$STATE_DIR" -o -path "$HOME/.git" \) -prune -o \
+      -type f -newer "$STATE_DIR/baseline.stamp" \
+      ! -name '.bash_history' ! -name '.viminfo' ! -name '.lesshst' \
+      ! -name '.python_history' ! -name '.node_repl_history' \
+      -print 2>/dev/null)
+  if [ -n "$sweep" ]; then
+    n=$(printf '%s\n' "$sweep" | wc -l)
+    echo "DRIFT: $n file(s) under \$HOME changed since the baseline and are not watched churn:"
+    printf '%s\n' "$sweep" | head -40 | sed 's/^/       /'
+    [ "$n" -gt 40 ] && echo "       ... and $((n - 40)) more"
+    echo "       ^ NOT automatically an escape — a login shell or an editor can land here."
+    echo "         But every one needs an explanation before you re-baseline. See the runbook."
+    drift=$((drift + 1))
+  fi
+else
+  echo "NOTE: no baseline.stamp — the \$HOME sweep did not run. Re-run --baseline to enable it."
+fi
 
 # 5. --deep: compute-node residue, one probe job per node used this session. Optional because
 #    it costs an allocation; the login-node checks above catch the common cases.
