@@ -407,8 +407,18 @@ pub fn interpret_cli_in(reg: Registry, tool: &str, cli: &[String]) -> Result<Vec
     Ok(out)
 }
 
-/// The script body is submitted verbatim (never rewritten), so `#SBATCH` directives
-/// reach slurmd directly. Detect-and-reject the dangerous ones: burst-buffer/DataWarp
+/// Reject dangerous `#SBATCH` directives in the body.
+///
+/// This used to say the body "is submitted verbatim (never rewritten), so `#SBATCH`
+/// directives reach slurmd directly". **That has not been true since Fix 1**: husk submits
+/// its own script on sbatch's stdin and the agent's body travels as a data file, so no
+/// directive in it is ever parsed by slurmd. The check is still right, but not for the
+/// reason it claimed — husk now READS these lines and re-emits what it allows onto the real
+/// command line, so a directive husk mis-handles is husk emitting the wrong thing under its
+/// own name, not a parser differential with the scheduler. Reasoning about a gate from a
+/// stale model of where the bytes go is how F13/F14/F26 happened.
+///
+/// Detect-and-reject the dangerous ones: burst-buffer/DataWarp
 /// lines (`#BB`/`#DW`), any `Forced` option other than `--partition`/`--uenv`/`--view`/
 /// `--repo` (those have dedicated validation + messages in policy.rs), and any
 /// UNRECOGNISED option (strict allowlist — a directive we don't model could be the next
@@ -428,7 +438,10 @@ pub fn body_reject_reason(body: &str) -> Option<String> {
             );
         }
     }
-    let directives = sbatch_directives(body);
+    let directives = match sbatch_directives(body) {
+        Ok(d) => d,
+        Err(reason) => return Some(reason),
+    };
     let mut i = 0;
     while i < directives.len() {
         let tok = &directives[i];
@@ -532,17 +545,83 @@ fn directive_body(line: &str) -> Option<&str> {
     line.strip_prefix("#SBATCH")
 }
 
-/// Collect option tokens from `#SBATCH` directive lines in a script HEADER.
-pub fn sbatch_directives(body: &str) -> Vec<String> {
+/// Split one `#SBATCH` line into option tokens, honouring quotes.
+///
+/// This used to be `split_whitespace()`, which is wrong in the ordinary case rather than the
+/// exotic one: `#SBATCH --job-name="my run"` became the two tokens `--job-name="my` and
+/// `run"`, and `#SBATCH --job-name="myrun"` kept its quotes inside the value. Both were
+/// refused — the value grammar forbids `"` for every option, so they failed on the grammar,
+/// not on the tokeniser. **The failure was closed, and it was still a bug**: quoting a
+/// directive value is normal in real run scripts, and husk rejected the script.
+///
+/// It also made one deliberate design decision unreachable. `v_comment` is widened to permit a
+/// space precisely so `--comment` can carry a sentence; a whitespace-splitting tokeniser meant
+/// no value with a space could ever arrive. The grammar and the tokeniser disagreed about what
+/// was expressible, and the tokeniser silently won (P7).
+///
+/// Rules, chosen to match what a job-script author expects rather than to re-implement a
+/// shell: whitespace separates tokens outside quotes; `'` and `"` group and are removed; a
+/// quote may open mid-token, so `--comment="a b"` is one token; the other quote character is
+/// literal inside a quoted run. **An unterminated quote is an error, not a best guess** — the
+/// author's intent is genuinely unknown at that point, and silently guessing is how a
+/// directive comes to mean one thing to husk and another to its author.
+///
+/// Stripping quotes cannot widen what reaches slurmd. The value grammar still runs afterwards
+/// and still forbids `" ' \ ; $ ` < >` for every `Allowed` option, and the result is re-emitted
+/// into an ARGV element that never meets a shell. The only new capability is a space in the
+/// one grammar that already permits spaces.
+fn split_directive_line(rest: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    for line in header_lines(body) {
-        if let Some(rest) = directive_body(line) {
-            for tok in rest.split_whitespace() {
-                out.push(tok.to_string());
+    let mut cur = String::new();
+    let mut building = false;
+    let mut quote: Option<char> = None;
+
+    for c in rest.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                building = true; // `--x=""` is an empty value, not an absent one
+            }
+            None if c.is_whitespace() => {
+                if building {
+                    out.push(std::mem::take(&mut cur));
+                    building = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                building = true;
             }
         }
     }
-    out
+    if let Some(q) = quote {
+        return Err(format!(
+            "unterminated {} quote in a #SBATCH directive. Close the quote, or remove it if \
+             the value has no spaces.",
+            if q == '\'' { "single" } else { "double" }
+        ));
+    }
+    if building {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+/// Collect option tokens from `#SBATCH` directive lines in a script HEADER.
+///
+/// Fallible because a line can be unquotable — see `split_directive_line`. Returning the
+/// tokens it *could* parse would hand the caller a directive list that silently means
+/// something other than what the script says.
+pub fn sbatch_directives(body: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for line in header_lines(body) {
+        if let Some(rest) = directive_body(line) {
+            out.extend(split_directive_line(rest)?);
+        }
+    }
+    Ok(out)
 }
 
 /// `#SBATCH`-looking lines husk did NOT read, as advice for a SUCCESSFUL submit.
@@ -845,16 +924,16 @@ mod tests {
         // `echo hi` — to be collected. Scanning the whole file is not what sbatch does and
         // is not what a script means; it is what made husk reject legal run scripts.
         let body = "#!/bin/bash\n#SBATCH --partition=preemptible --nodes=2\necho hi\n#SBATCH -t 10\n";
-        assert_eq!(sbatch_directives(body), v(&["--partition=preemptible", "--nodes=2"]));
+        assert_eq!(sbatch_directives(body), Ok(v(&["--partition=preemptible", "--nodes=2"])));
 
         // Blank and comment lines do NOT end the header — real run scripts space their
         // directives out and comment them, and stopping at the first blank line would
         // silently drop half of a legitimate header.
         let spaced = "#!/bin/bash\n#SBATCH -p x\n\n# why we need two nodes\n#SBATCH -N 2\n\nsrun hostname\n";
-        assert_eq!(sbatch_directives(spaced), v(&["-p", "x", "-N", "2"]));
+        assert_eq!(sbatch_directives(spaced), Ok(v(&["-p", "x", "-N", "2"])));
 
         // Column 0, like sbatch: an indented `#SBATCH` is not a directive there either.
-        assert!(sbatch_directives("#!/bin/bash\n  #SBATCH -p x\n").is_empty());
+        assert_eq!(sbatch_directives("#!/bin/bash\n  #SBATCH -p x\n"), Ok(vec![]));
     }
 
     #[test]
@@ -875,7 +954,7 @@ mod tests {
                     #BB stage_in source=/x destination=/y\n\
                     EOF\n\
                     sbatch inner.sh\n";
-        assert_eq!(sbatch_directives(body), v(&["--partition=preemptible"]));
+        assert_eq!(sbatch_directives(body), Ok(v(&["--partition=preemptible"])));
         assert!(
             body_reject_reason(body).is_none(),
             "generating an inner script must not be a rejection — that was A3"
@@ -887,6 +966,94 @@ mod tests {
         // The header is still enforced, so the escape-shaped cases still reject.
         assert!(body_reject_reason("#!/bin/bash\n#SBATCH --qos=elevated\n").is_some());
         assert!(body_reject_reason("#!/bin/bash\n#BB stage_in\n").is_some());
+    }
+
+    // ── N5: the directive tokeniser honours quotes ───────────────────────────────────────
+    // These pin the level the bug lived at — the TOKENISER, not the option parser. A test
+    // written against `interpret_cli` alone would pass with the whitespace splitter still in
+    // place, because the splitter's damage was already done by the time the parser saw it.
+
+    #[test]
+    fn a_quoted_directive_value_is_one_token_with_the_quotes_removed() {
+        // Before: `--job-name="my run"` split into `--job-name="my` and `run"`, and
+        // `--job-name="myrun"` kept its quotes. Both were REFUSED — by the value grammar,
+        // which forbids `"` — so husk rejected ordinary run scripts.
+        assert_eq!(
+            sbatch_directives("#!/bin/bash\n#SBATCH --job-name=\"myrun\"\n"),
+            Ok(v(&["--job-name=myrun"]))
+        );
+        assert_eq!(
+            sbatch_directives("#!/bin/bash\n#SBATCH --job-name='myrun'\n"),
+            Ok(v(&["--job-name=myrun"]))
+        );
+        // A quote that opens mid-token still yields ONE token.
+        assert_eq!(
+            sbatch_directives("#!/bin/bash\n#SBATCH --comment=\"a b\"\n"),
+            Ok(v(&["--comment=a b"]))
+        );
+        // And the whole thing now survives the option parser.
+        let toks = sbatch_directives("#!/bin/bash\n#SBATCH --job-name=\"myrun\"\n").unwrap();
+        assert_eq!(interpret_cli(&toks), Ok(v(&["--job-name=myrun"])));
+    }
+
+    #[test]
+    fn a_directive_value_may_contain_a_space_where_the_grammar_permits_one() {
+        // `v_comment` is deliberately widened to allow a space. With a whitespace-splitting
+        // tokeniser that decision was UNREACHABLE: no value with a space could ever arrive.
+        // The grammar and the tokeniser disagreed about what was expressible.
+        let toks = sbatch_directives("#!/bin/bash\n#SBATCH --comment=\"nightly ICON run\"\n").unwrap();
+        assert_eq!(interpret_cli(&toks), Ok(v(&["--comment=nightly ICON run"])));
+
+        // ...and a grammar that does NOT permit a space still refuses one. The tokeniser's
+        // job is to deliver the author's value; the grammar's job is to judge it. Fixing the
+        // first must not soften the second.
+        let jn = sbatch_directives("#!/bin/bash\n#SBATCH --job-name=\"my run\"\n").unwrap();
+        assert_eq!(jn, v(&["--job-name=my run"]), "tokenised as one value");
+        assert!(interpret_cli(&jn).is_err(), "but the grammar still rejects a space here");
+    }
+
+    #[test]
+    fn an_unterminated_quote_in_a_directive_is_refused_rather_than_guessed() {
+        // The author's intent is genuinely unknown here. Guessing is how a directive comes to
+        // mean one thing to husk and another to the person who wrote it.
+        let e = sbatch_directives("#!/bin/bash\n#SBATCH --job-name=\"oops\n")
+            .expect_err("an unterminated quote must be an error");
+        assert!(e.contains("unterminated"), "and must say so: {e}");
+        // It must reject the SUBMISSION, not be swallowed somewhere.
+        assert!(body_reject_reason("#!/bin/bash\n#SBATCH --job-name=\"oops\n").is_some());
+    }
+
+    #[test]
+    fn stripping_quotes_cannot_fuse_two_options_into_something_accepted() {
+        // The security question the fix has to answer: removing quote characters joins text
+        // that used to be separate. Could that build an option out of two harmless halves?
+        // No — fusing produces ONE token whose name is not in the registry, and an unknown
+        // option is a hard reject (default-deny), not a skip.
+        let fused = sbatch_directives("#!/bin/bash\n#SBATCH --job-name=a\" \"--qos=elevated\n").unwrap();
+        assert_eq!(fused, v(&["--job-name=a --qos=elevated"]), "one token, not two");
+        assert!(
+            interpret_cli(&fused).is_err(),
+            "a fused token must not resolve to an accepted option"
+        );
+    }
+
+    #[test]
+    fn the_value_grammar_still_runs_after_the_quotes_come_off() {
+        // Quotes are removed BEFORE validation, so validation is what stands between a
+        // directive and sbatch's command line. Confirm the grammar is still the gate — this
+        // is the property that makes quote-stripping safe rather than merely convenient.
+        for hostile in [
+            "#!/bin/bash\n#SBATCH --job-name=\"a;rm -rf ~\"\n",
+            "#!/bin/bash\n#SBATCH --job-name=\"a$(id)\"\n",
+            "#!/bin/bash\n#SBATCH --job-name=\"a`id`\"\n",
+            "#!/bin/bash\n#SBATCH --comment=\"a\\\\b\"\n",
+        ] {
+            let toks = sbatch_directives(hostile).expect("tokenises");
+            assert!(
+                interpret_cli(&toks).is_err(),
+                "grammar must still refuse {toks:?}"
+            );
+        }
     }
 
     #[test]
@@ -908,3 +1075,4 @@ mod tests {
         assert!(unread_directive_note("#!/bin/bash\n#SBATCH -p x\nsrun hostname\n").is_none());
     }
 }
+

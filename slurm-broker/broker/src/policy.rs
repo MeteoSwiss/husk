@@ -109,7 +109,10 @@ pub fn decide(
     // Normalize getopt-glued short options (`-o/path`, `-ppancake`) into separate tokens
     // BEFORE parsing, so a glued form can't slip past the gate (F14) or the strip (F13).
     let cli = sbatch::option_tokens(&sbatch::split_glued_short_opts(&req.argv));
-    let directives = sbatch::sbatch_directives(&req.script.body);
+    let directives = match sbatch::sbatch_directives(&req.script.body) {
+        Ok(d) => d,
+        Err(reason) => return Decision::Reject(format!("#SBATCH: {reason}")),
+    };
 
     // ---- partition: must resolve to the site's forced partition, else reject + teach ----
     // The required partition is site-specific (HUSK_SLURM_PARTITION, default preemptible).
@@ -152,11 +155,14 @@ pub fn decide(
     let time_note = time_limit_note(session, &chosen, sets_time);
 
     // ---- topology: pick the cage profile, and force it rather than infer it ----
-    // Checked across CLI *and* #SBATCH, like the partition: a body directive would reach
-    // slurmd, and `--nodes` is Forced in the registry so the agent's own token never
-    // survives to the real command line. The profile then EMITS `--nodes=1` below, which
-    // is what makes the single-node cage true by construction — reading the request is not
-    // enough, since `--ntasks N` alone lets the scheduler spread tasks over nodes.
+    // Checked across CLI *and* #SBATCH, like the partition. The reason is NOT that a body
+    // directive would reach slurmd — it would not, and has not since Fix 1; husk submits its
+    // own script on stdin. It is that husk itself reads both channels and re-emits from
+    // both, so a `--nodes` husk fails to notice in the body is one it fails to VALIDATE.
+    // `--nodes` is Forced in the registry, so the agent's own token never survives to the
+    // real command line either way. The profile then EMITS `--nodes=1` below, which is what
+    // makes the single-node cage true by construction — reading the request is not enough,
+    // since `--ntasks N` alone lets the scheduler spread tasks over nodes.
     let requested_nodes = sbatch::option_value(&cli, &["-N", "--nodes"])
         .or_else(|| sbatch::option_value(&directives, &["-N", "--nodes"]));
     let profile = match profile::Profile::select(requested_nodes.as_deref()) {
