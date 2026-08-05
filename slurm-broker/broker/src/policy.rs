@@ -2025,6 +2025,130 @@ mod tests {
         }
     }
 
+    /// A5 cross-hop question (a). An agent-controlled `job_args` element is single-quoted by
+    /// `sh_quote` into the guard's `set -- '...'` line; the cage re-exec then runs
+    /// `exec /bin/bash "$_husk_body" "$@"`. Does a hostile element survive to the body as a
+    /// LITERAL positional argument, or can it break the single-quoting and inject a command —
+    /// the sharp case being an EMBEDDED NEWLINE? This drives the EXACT bytes `wrap_script`
+    /// emits for the hand-off through a real shell (both bash and dash) and asserts both
+    /// halves of the property at once:
+    ///   * every argument reaches the body byte-for-byte as submitted (literal survival), and
+    ///   * no injected `touch PWNED_*` ever runs (no break-out from the quoting).
+    #[test]
+    fn job_args_reach_the_body_as_literals_and_cannot_inject_a_command() {
+        use std::os::unix::fs::PermissionsExt;
+        // The reviewer's repertoire, plus the crux (a real embedded LF), a bare `'\''`
+        // sequence (the escape's own output, fed back), a leading-dash arg (which the `--`
+        // in `set --` must keep positional), and a tab.
+        let hostile: Vec<String> = [
+            "plain",
+            "with space",
+            "semi ; colon",
+            "amp && touch PWNED_AND",
+            "pipe | touch PWNED_PIPE",
+            "sub $(touch PWNED_CMDSUB)",
+            "tick `touch PWNED_TICK`",
+            "dollar $HOME ${PATH}",
+            "single ' quote",
+            "a'b'c",
+            "'\\''",
+            "double \" quote",
+            "back \\ slash",
+            "glob * ? [abc]",
+            "newline\ntouch PWNED_NEWLINE",
+            "tab\tafter",
+            "-rf",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let dir = std::env::temp_dir().join(format!("husk-jobargs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The REAL hand-off, produced by wrap_script from the hostile job_args.
+        let script = wrap_script(
+            BODY_PATH,
+            &hostile,
+            &[],
+            profile::Profile::SingleNode,
+            &dir.to_string_lossy(),
+            false,
+            &[dir.to_string_lossy().to_string()],
+        );
+        const MARK: &str = "# --- hand off to the agent's script, inside the cage ---\n";
+        let handoff = script
+            .rsplit(MARK)
+            .next()
+            .filter(|h| *h != script)
+            .unwrap_or_else(|| panic!("no hand-off marker in the generated guard:\n{script}"));
+        assert!(
+            handoff.starts_with("set -- "),
+            "the argv line must lead the hand-off: {handoff:?}"
+        );
+        assert!(
+            handoff.trim_end().ends_with("exec /bin/bash \"$_husk_body\" \"$@\""),
+            "the body must be exec'd with the positional args: {handoff:?}"
+        );
+
+        // A body that records each positional argument NUL-delimited, so an embedded newline
+        // inside an argument can never be mistaken for the record separator.
+        let body = dir.join("body.sh");
+        let out = dir.join("argv.nul");
+        std::fs::write(
+            &body,
+            format!(
+                "#!/bin/bash\n: > \"{o}\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\" >> \"{o}\"; done\n",
+                o = out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&body, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for sh in ["/bin/bash", "/bin/sh"] {
+            let _ = std::fs::remove_file(&out);
+            // The guard's own binding of the body path (line `_husk_body={body_q}`), then the
+            // generated hand-off verbatim — nothing else.
+            let runner = format!(
+                "_husk_body={}\n{}",
+                settings::sh_quote(&body.to_string_lossy()),
+                handoff
+            );
+            let st = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(&runner)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "hand-off must run cleanly under {sh}");
+
+            let raw = std::fs::read(&out).unwrap();
+            let mut recs: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+            assert_eq!(
+                recs.pop(),
+                Some(&b""[..]),
+                "records are NUL-terminated, so the split's tail must be empty under {sh}"
+            );
+            let got: Vec<String> =
+                recs.iter().map(|r| String::from_utf8_lossy(r).into_owned()).collect();
+            assert_eq!(
+                got, hostile,
+                "every job_arg must reach the body as a byte-for-byte literal under {sh}"
+            );
+
+            for marker in
+                ["PWNED_AND", "PWNED_PIPE", "PWNED_CMDSUB", "PWNED_TICK", "PWNED_NEWLINE"]
+            {
+                assert!(
+                    !dir.join(marker).exists(),
+                    "INJECTION under {sh}: the guard's set-- quoting let a job_arg run `{marker}`"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn guard_bootstraps_the_step_pair() {
         let script = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()]);

@@ -749,4 +749,136 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+
+    /// A5 cross-hop question (b), part 1 — the decisive answer. The rank wrapper builds the
+    /// MUNGE-socket mask (`$_m`) by iterating CREDENTIAL_SOCKET_DIRS and expanding the result
+    /// UNQUOTED in the bwrap exec line. That list is a compile-time constant of two root-owned
+    /// system paths, and `wrap_command` takes NO mask-path argument — so a rank has no channel
+    /// through which to add, remove, or alter a masked path. Anything job-derived reaching the
+    /// loop could unmask the real MUNGE socket or mis-split the exec line.
+    #[test]
+    fn credential_mask_list_is_a_fixed_root_owned_constant_no_rank_can_influence() {
+        assert_eq!(
+            crate::settings::CREDENTIAL_SOCKET_DIRS,
+            ["/run/munge", "/var/run/munge"],
+            "the mask list must stay a fixed pair of root-owned dirs"
+        );
+        // The generated script iterates over exactly those literals — nothing job-derived is
+        // spliced into the `for _c in ...` list, and the rank's own command rides in argv
+        // AFTER the script rather than inside its body.
+        let argv = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            live_holder(),
+            None,
+            &v(&["ZZ_RANK_CMD_SENTINEL"]),
+        );
+        let script = &argv[2];
+        assert!(
+            script.contains("for _c in /run/munge /var/run/munge; do"),
+            "the mask loop must iterate the constant verbatim:\n{script}"
+        );
+        assert!(
+            !script.contains("ZZ_RANK_CMD_SENTINEL"),
+            "the rank command must never be interpolated into the script body:\n{script}"
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("ZZ_RANK_CMD_SENTINEL"),
+            "the rank command must ride in argv after the script"
+        );
+    }
+
+    /// A5 cross-hop question (b), part 2 — the whitespace guard the rank.rs comment relies on.
+    /// Because `$_m` is expanded UNQUOTED and word-split in the exec line, a mask path that
+    /// contained whitespace would be mis-split into stray bwrap tokens. The guard
+    /// `case "$_r" in *[[:space:]]*) continue` is what makes the unquoted expansion safe. This
+    /// extracts the REAL loop bytes from a generated rank script and drives them (under both
+    /// bash and dash) against a controlled tree whose entries resolve to whitespace-bearing
+    /// paths — so the guard, not the fixed constant, is what is exercised.
+    #[test]
+    fn mask_loop_whitespace_guard_refuses_space_or_tab_resolving_paths() {
+        use std::os::unix::fs::symlink;
+
+        let dir = std::env::temp_dir().join(format!("husk-mask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Real target directories; two of them have whitespace IN THEIR PATH. Absolute-target
+        // symlinks so `readlink -f` resolves each to its whitespace-bearing destination. A
+        // duplicate of `plain` exercises the loop's de-duplication as well.
+        let plain = dir.join("plain");
+        let spaced = dir.join("spaced dir");
+        let tabbed = dir.join("tab\tdir");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(&spaced).unwrap();
+        std::fs::create_dir_all(&tabbed).unwrap();
+        symlink(&spaced, dir.join("link_space")).unwrap();
+        symlink(&tabbed, dir.join("link_tab")).unwrap();
+        symlink(&plain, dir.join("link_dup")).unwrap();
+
+        // Pull the real mask loop out of a generated rank script.
+        let full = built(&["true"])[2].clone();
+        let lstart = full.find("_m=\n").expect("mask loop assignment not found");
+        let rel = full[lstart..].find("done").expect("mask loop `done` not found");
+        let loop_src = &full[lstart..lstart + rel + "done".len()];
+        // Swap the constant path list for our controlled, hostile-resolving set.
+        let hostile_list = [
+            plain.clone(),
+            dir.join("link_space"),
+            dir.join("link_tab"),
+            dir.join("link_dup"),
+        ]
+        .iter()
+        .map(|p| sh_quote(&p.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+        let loop_hostile = loop_src.replace(
+            "for _c in /run/munge /var/run/munge; do",
+            &format!("for _c in {hostile_list}; do"),
+        );
+        assert!(
+            loop_hostile.contains(&hostile_list),
+            "path-list substitution failed:\n{loop_src}"
+        );
+
+        // Consumer: expand `$_m` UNQUOTED exactly as the exec line does, one token per NUL.
+        let program =
+            format!("{loop_hostile}\nfor w in $_m; do printf '%s\\0' \"$w\"; done\n");
+        let real_plain =
+            std::fs::canonicalize(&plain).unwrap().to_string_lossy().into_owned();
+
+        for sh in ["/bin/bash", "/bin/sh"] {
+            let out = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(&program)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "mask loop failed under {sh}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let toks: Vec<String> = out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            // Only the whitespace-free path may be masked, and only once (de-dup).
+            assert_eq!(
+                toks,
+                vec!["--tmpfs".to_string(), real_plain.clone()],
+                "under {sh}: exactly the whitespace-free path, masked once: {toks:?}"
+            );
+            // Neither whitespace-bearing target may leak into the exec line.
+            for bad in ["spaced dir", "tab\tdir"] {
+                assert!(
+                    !toks.iter().any(|t| t.contains(bad)),
+                    "under {sh}: a whitespace-resolving mask path leaked into the exec line: {toks:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
