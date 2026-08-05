@@ -62,22 +62,39 @@ dropped option an ungated body channel.
    option name. The merge key is the option name, computed by splitting the canonicalised
    token at the first `=` (`policy.rs:414`).
 
-★ **Two gates, and the second one is doing more work than the first.** `sbatch_directives`
-tokenises with `split_whitespace()` and **no quote handling at all** (`sbatch.rs:540`). Every
-re-emitted value then has to pass a per-option charset grammar, and a registry-wide invariant
-test forbids `" ' \ ; $ ` < >` newline and tab for *every* `Allowed` option. Measured on
-2026-08-05:
+★★ **The tokeniser is BRAND NEW and nobody has attacked it — this is the freshest code on
+your surface.** Until 2026-08-05 `sbatch_directives` split on whitespace with no lexing at
+all. Two ordinary spellings were consequently refused:
 
 ```
-#SBATCH --job-name="my run"   →  tokens: ["--job-name=\"my", "run\""]  →  REJECTED
-#SBATCH --job-name="myrun"    →  tokens: ["--job-name=\"myrun\""]      →  REJECTED
+#SBATCH --job-name="my run"      → ["--job-name=\"my", "run\""]        → REJECTED
+#SBATCH --job-name="myrun"       → ["--job-name=\"myrun\""]            → REJECTED
+#SBATCH --job-name=x # a note    → ["--job-name=x","#","a","note"]     → REJECTED
 ```
 
-Both fail closed, on the *grammar*, not on the tokeniser. So the missing quote handling does
-not become an injection — but it does mean **husk refuses ordinary job scripts**, and there is
-a neat inconsistency to pull on: `v_comment` is deliberately widened to allow a space, and the
-whitespace-splitting tokeniser makes that space unreachable. The grammar and the tokeniser
-disagree about what is expressible.
+All three failed *closed*, on the value grammar rather than on the tokeniser, so none was an
+injection. They were fixed anyway, because refusing ordinary run scripts is the same class
+of bug as the outage above. **The fix added a real lexer to the most adversarial input path
+in the system, and you are the first reviewer to see it.** Rules:
+
+- `'` and `"` group and are stripped; a quote may open mid-token
+- an unquoted `#` at a token boundary starts a comment; a `#` mid-token is left alone
+- an unterminated quote rejects the submission rather than guessing
+- **no continuation-line handling** — a trailing `\` becomes a stray token and rejects
+
+Attack the lexer directly. It runs *before* every gate, so anything that makes it produce
+different tokens than the author wrote changes what husk validates and what husk emits.
+Specifically: can quote-stripping **fuse** two things into one accepted option, or **split**
+one into two? (There is a test claiming the fused case fails closed via default-deny —
+break it.) Does the `#` rule swallow something meaningful? What does a lone `"` do, or a
+quote inside a quote, or a value that is entirely quotes?
+
+**Two gates, and know which one is load-bearing.** After lexing, every re-emitted value must
+pass a per-option charset grammar, and a registry-wide invariant test forbids
+`" ' \ ; $ ` < >`, newline and tab for *every* `Allowed` option. That grammar — not the
+lexer — is what keeps shell syntax out. So the question to answer is not "can I get a quote
+through the lexer" but **"can I reach a grammar that accepts more than I thought"**;
+`v_comment` permits spaces, `v_expr` permits `& | ( ) ! *`, `v_dist` permits `=`.
 
 So the parse no longer feeds slurmd — it feeds **husk's own argv**. A misparse is no longer a
 parser differential with the scheduler; it is husk emitting the wrong thing under its own name.

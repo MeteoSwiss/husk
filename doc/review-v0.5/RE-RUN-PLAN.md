@@ -11,9 +11,13 @@ Christoph the sole uncaged watchdog, `between-runs-check.sh` decides — never t
 
 ## 0. Prerequisites (do these before any reviewer runs)
 
-1. **Fix the check's `$REVIEW_ROOT` blind spot.** A1's escape witness landed in the PARENT of
-   the workdir, which `between-runs-check.sh` does not watch — so it read CLEAN over a real
-   arbitrary write. Until that is fixed the check can miss exactly the class it exists for.
+1. ~~**Fix the check's `$REVIEW_ROOT` blind spot.**~~ **DONE 2026-08-05 (`db6e2d6`).** The
+   check now watches three things structurally rather than by name: everything under
+   `$REVIEW_ROOT` outside the reviewer's own workdir (set `HUSK_REVIEW_WORKDIR`), symlinks
+   resolving out of the review tree, and files under `$HOME` newer than the baseline.
+   `between-runs-check.test.sh` pins all three — its cases 3–5 report CLEAN against the old
+   check and DRIFT against this one. **Run that test before the first reviewer**; if it goes
+   red no verdict afterwards means anything.
 2. **Fresh baseline + canaries.** The binary changed; the old baseline means nothing.
 3. **Refresh the briefs against the fixed code**, dated, with ★ on new material — the same
    discipline as the `5756134` refresh. A brief that describes code that no longer exists
@@ -102,18 +106,30 @@ newest code on the submission surface, it was written under production pressure 
 and it is exactly the shape that produced three CRITICALs before: one parser, two channels,
 a precedence rule between them.** F13/F14/F24/F26/F27 all lived here.
 
-- Can a body directive reach slurmd in a form the CLI path would have refused? The two
-  channels now go through the same `interpret_cli`, but they are *tokenised* differently —
-  `sbatch_directives` splits on whitespace, argv arrives pre-split. Is there a spelling where
-  those disagree?
-- The merge is by option NAME, computed by splitting on the first `=`. Attack that: a flag
-  with no value, a value containing `=`, a short option, the same option spelled long in one
-  channel and short in the other (`--ntasks` vs `-n` — **do those collide in the override
-  check, or does the body copy survive beside the CLI one?**).
-- Can a body directive override a husk-FORCED option? `interpret_cli` should drop
-  Forced/Ignored from both channels — verify rather than assume.
-- Directives are now scanned only in the leading header block (A3). Combined with the merge:
-  is there a placement that husk reads and slurmd does not, or vice versa?
+**Partly answered on the laptop, 2026-08-05 — read this before running it:**
+
+- ~~"the two channels are tokenised differently — is there a spelling where they disagree?"~~
+  **Yes, three of them, and they are fixed (`25a43e8`, `e93f588`).** `sbatch_directives` had
+  no lexer at all: `--job-name="my run"`, `--job-name="myrun"` and a trailing `# comment`
+  were each refused. All failed *closed*, on the value grammar rather than the tokeniser, so
+  none was an injection — they were false rejects on ordinary run scripts. **The fix put a
+  new lexer on the most adversarial input path in the system, and that lexer is now the
+  thing to attack.** See A3, which carries its rules.
+- ~~"`--ntasks` vs `-n` — do those collide in the override check?"~~ **They collide
+  correctly.** `interpret_cli` re-emits every option canonically as `--long=value` before the
+  merge sees it, so both spellings reduce to the same name and the CLI copy wins. Verified by
+  `interpret_cli_drops_forced_and_ignored_reemits_allowed_canonically`. Do not spend the run
+  here.
+- **Still open:** the merge key splits the canonicalised token at the first `=`. A flag with
+  no value yields the whole token as its name; a value containing `=` (`--distribution=plane=4`
+  is real and ships) yields the part before the first one. Is there a pair where two different
+  options produce the same key, or one option produces two?
+- **Still open:** can a body directive override a husk-FORCED option? `interpret_cli` should
+  drop Forced/Ignored from both channels — verify rather than assume.
+- **Still open:** directives are scanned only in the leading header block (A3). Combined with
+  the merge: is there a placement husk reads and slurmd does not, or vice versa? This is what
+  `directive-parity-probe.sh` measures — **its rationale was inverted and its variant table
+  stale until `e93f588`; use the current copy.**
 
 ### N6. The `-try` conversions (`396ae7b`)
 
