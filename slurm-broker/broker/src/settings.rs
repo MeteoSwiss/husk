@@ -1007,9 +1007,44 @@ impl FsPolicy {
         }
         for root in &writable_roots {
             let root = root.trim_end_matches('/');
+            // Masked BY SHAPE, for the same reason `.git` is — and this one was found the
+            // hard way. `--tmpfs <path>` makes bwrap create `<path>` as a DIRECTORY, so it
+            // dies with "Can't mkdir …/.git/hooks: Not a directory" the moment something
+            // has already put a FILE there. Something has: the LOGIN cage protects a
+            // non-existent deny path by binding `/dev/null` over it, which leaves an empty
+            // FILE on the host for as long as that sandbox is live. Two cages, one shared
+            // project directory, disagreeing about what shape a placeholder is — 3 of 4
+            // concurrent brokered jobs died in bwrap setup (A3/A5/A8).
+            //
+            // Fail-closed, so not an escape; but a job that dies before it starts, with a
+            // bwrap error that never says "husk", is an availability bug on exactly the
+            // shared project dir husk is meant to make usable. Mask what is THERE:
+            // a directory (or nothing) gets the tmpfs, a file gets `/dev/null`, and either
+            // way the job cannot read or plant through that path.
+            //
+            // NOTE the residual: this reads the shape at SUBMIT time on the login node,
+            // while bwrap runs later on the compute node. A placeholder that changes shape
+            // in between still collides. Closing that means resolving the shape ON THE
+            // COMPUTE NODE, the way the credential-socket masks already are — or the
+            // durable fix, a per-job private mount.
             for rel in AUTO_EXEC_DIRS {
-                a.push("--tmpfs".into());
-                a.push(format!("{root}/{rel}"));
+                let path = format!("{root}/{rel}");
+                match std::fs::symlink_metadata(&path) {
+                    // A file — the login cage's ghost placeholder, or anything else. A
+                    // tmpfs cannot go over it; `/dev/null` can, and masks it just as dead.
+                    Ok(m) if m.is_file() => {
+                        a.push("--ro-bind".into());
+                        a.push("/dev/null".into());
+                        a.push(path);
+                    }
+                    // A real directory, or absent, or stranger: tmpfs. Absent is the normal
+                    // case and must stay cheap — bwrap makes the directory, the job writes
+                    // into RAM, and none of it survives the job.
+                    _ => {
+                        a.push("--tmpfs".into());
+                        a.push(path);
+                    }
+                }
             }
             // `.git` is masked according to what it actually IS, because bwrap creates the
             // mountpoints it is given and the old rule created a repository that was not
@@ -2299,6 +2334,45 @@ mod tests {
         assert!(cmd.contains("--ro-bind-try /proj/.mcp.json /proj/.mcp.json"));
         // and the same protections on the allowWrite root:
         assert!(cmd.contains("--tmpfs /scratch/run/.claude"));
+    }
+
+    #[test]
+    fn an_auto_exec_dir_that_is_already_a_file_is_masked_as_a_file() {
+        // **The cage-build collision (A3/A5/A8).** THE TEST GAP: every F6b test above uses
+        // paths that do not exist, so all of them take the tmpfs branch and none of them
+        // ever meets the shape that actually broke jobs on Balfrin. `--tmpfs <path>` makes
+        // bwrap MKDIR the path, so it dies with "Can't mkdir …/.git/hooks: Not a directory"
+        // when a FILE is already there — and one is: the login cage protects a non-existent
+        // deny path by binding /dev/null over it, leaving an empty file on the host in the
+        // shared project dir. 3 of 4 concurrent brokered jobs died in bwrap setup.
+        //
+        // So build the collision for real, on disk, and assert husk masks what is there.
+        let root = std::env::temp_dir().join(format!("husk-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let r = root.to_string_lossy().to_string();
+
+        // `.vscode` as the login cage's ghost placeholder: an empty FILE.
+        std::fs::write(root.join(".vscode"), b"").unwrap();
+        // `.idea` as a real directory, the ordinary case.
+        std::fs::create_dir_all(root.join(".idea")).unwrap();
+        // `.claude` absent entirely, the other ordinary case.
+
+        let cmd = joined(&FsPolicy::default(), &r);
+        assert!(
+            cmd.contains(&format!("--ro-bind /dev/null {r}/.vscode")),
+            "a file placeholder must be masked with /dev/null, not mkdir'd: {cmd}"
+        );
+        assert!(
+            !cmd.contains(&format!("--tmpfs {r}/.vscode")),
+            "a tmpfs over an existing FILE is the bwrap failure this fixes: {cmd}"
+        );
+        // …while the shapes that always worked keep working. Fixing the collision must not
+        // cost the masking: both of these still have to be masked, just differently.
+        assert!(cmd.contains(&format!("--tmpfs {r}/.idea")), "a real dir still gets tmpfs: {cmd}");
+        assert!(cmd.contains(&format!("--tmpfs {r}/.claude")), "an absent dir still does: {cmd}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
