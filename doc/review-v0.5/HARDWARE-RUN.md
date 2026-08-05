@@ -1,8 +1,15 @@
 # husk v0.5 — hardware run plan (Balfrin / Santis)
 
-Everything above LOW plus the eight LOW code fixes is committed and green off-cluster
-(230 lib tests, clippy clean, selftest 47 PASS / 0 FAIL / 2 SKIP). **None of it is
-hardware-verified.** This is the ordered list to run and what to look at.
+> **BALFRIN ROUND 1 DONE 2026-08-05 at `2f1a0b0`: selftest --full 91 PASS / 0 FAIL / 0 SKIP /
+> 1 INFO**, uenv `/user-environment:icon:default`, balfrin-ln002, SLURM 23.02.7.
+> Round 1 needed two fixes first (`2f1a0b0`): a cage-killer the fix round introduced (a
+> denyWrite bind with a missing source — bwrap exits before the job runs) and an env
+> allowlist that was too tight. Answers recorded per item below.
+> **Still open: B1 (one grep), B3, B4, and all of Santis.**
+
+Everything above LOW plus the eight LOW code fixes is committed and was green off-cluster
+(232 lib tests, clippy clean, selftest 47 PASS / 0 FAIL / 2 SKIP). This is the ordered list
+to run and what to look at.
 
 Two goals, and they are not the same: **(A) confirm the fixes landed**, and **(B) gather the
 five facts only hardware can settle**. (B) is the more valuable half — one of those facts
@@ -132,10 +139,24 @@ grep -n 'not regular files on this node' ~/.husk/log/job-*.log
 Belt-and-braces, from inside a job: `readlink /proc/$$/fd/1` — expect a path under the
 writable set, not `pipe:[…]`.
 
-### B2. Which env vars did the allowlist drop?
+### B2. Which env vars did the allowlist drop? — **ANSWERED**
+**82 dropped on the first run**, including `SCRATCH`/`PROJECT`/`STORE`/`APPS`,
+`SQFSMNT_FWD_LD_LIBRARY_PATH` (uenv's library path — a uenv job that loses it loses its
+stack), `MODULE_VERSION*`, the build toolchain, and the `OPR_`/`GT4PY_` families. All added
+in `2f1a0b0`; **now 32, and every one is desktop or shell noise** —
+`DISPLAY LESS* LS_COLORS MAIL PAGER MINICOM WINDOWMANAGER XKEYSYMDB XNLSPATH
+XAUTHLOCALHOSTNAME G_* GPG_TTY HISTSIZE PROFILEREAD LIBGL_DEBUG DBUS_SESSION_BUS_ADDRESS
+COLORTERM CSHEDIT MORE OLDPWD SHLVL _` plus the whole `SSH_*` set.
+`SQFSMNT_FWD_LD_LIBRARY_PATH` is forwarded and `uenv.mounted` PASSES with the uenv active,
+so the uenv path is confirmed end to end. **And the allowlist earned itself: `SSH_AUTH_SOCK`
+— a live agent-forwarding socket — was among the 82 the old four-name denylist handed to
+every job.** Re-check this line on any NEW site; the site list is per-cluster by nature.
+
+<details><summary>original question</summary>
 Capture the full "not forwarded" list from a **real ICON run**, not a toy job. That list is
 the only evidence for whether the allowlist is too tight. Anything ICON needs goes into
 `HUSK_SUBMIT_ENV_ALLOW='NAME:PREFIX*'` and then into the shipped defaults.
+</details>
 
 ### B3. Does `--open-mode=append` change anything visible?
 Every husk default is `%j`-unique so it should be invisible. The case to watch is a run
@@ -148,7 +169,14 @@ same moment? The residual is that the shape is read at SUBMIT time on the login 
 bwrap runs later on a compute node. If collisions persist, the answer is to resolve the shape
 on the compute node like the credential masks already are.
 
-### B5. Is the MPI path unchanged? ★ the other one that needs a real run
+### B5. Is the MPI path unchanged? — **ANSWERED: yes**
+`cma.peers` PASS (one rank read another — the shared user namespace holds, MPICH intra-node
+transfers work), `cma.write` PASS (still SIGSYS), `cma.outside` PASS, and every step arm:
+`steps.launch`, `steps.cage`, `steps.pidns`, `steps.pidns_peers`, `steps.multirank` (2 ranks,
+both caged). So B4-F8's inner shell on EVERY rank and B4-F7's `|| exit 1` cost nothing on
+real hardware. **B4-F8 is closed, not partial.** `net.live` also green (200, 21140 bytes).
+
+<details><summary>original question</summary>
 `cma.peers`, `steps.*`, and a real ICON/KENDA run. **B4-F8 now adds a one-line inner shell to
 EVERY rank**, not just networked ones: bwrap execs `/bin/sh -c 'exec 8<&- 9<&-; exec "$@"'`,
 which drops the job's shared namespace handles and then becomes the workload. Verified in bash
@@ -160,6 +188,7 @@ one commit. From inside a rank, the check is direct:
 ```bash
 ls -l /proc/$$/fd        # 8 and 9 must be ABSENT; before the fix they were pid:[…] / user:[…]
 ```
+</details>
 
 ---
 
