@@ -409,10 +409,14 @@ fn cap_output(bytes: &[u8]) -> String {
 /// kills, strace merely shows which call it died attempting.
 /// The second category is CREDENTIALS THE JOB HAS NO USE FOR. The broker inherits the
 /// launching session's environment and forces `--export=ALL`, so an agent's model
-/// credentials would otherwise ride into every compute job — where nothing needs them,
-/// since a brokered job has no network at all today. Stripping them here is stronger than
-/// masking them in the cage (F4): the value never leaves the login node, so it is absent
-/// from slurmd's copy of the environment and from anything that inspects a running job.
+/// credentials would otherwise ride into every compute job, where nothing needs them.
+///
+/// This argument used to end "…and a brokered job has no network anyway". That is no
+/// longer true — a job with a configured allowlist reaches the internet through the proxy
+/// — which makes the strip MORE load-bearing than when it was written, not less. Keeping
+/// credentials out is stronger than masking them in the cage (F4): the value never leaves
+/// the login node, so it is absent from slurmd's copy of the environment and from anything
+/// that inspects a running job.
 ///
 /// These are bearer tokens that buy paid inference (`CSCS_INFERENCE_API_KEY` is the CSCS
 /// one, `ANTHROPIC_AUTH_TOKEN` the form Claude Code uses against an
