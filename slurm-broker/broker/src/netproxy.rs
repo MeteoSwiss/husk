@@ -244,20 +244,15 @@ fn serve_one(client: UnixStream, allow: &Allowlist) -> Verdict {
     Verdict::Allowed
 }
 
-/// Serve until the listener dies. Never returns in normal operation.
-/// One slot in the concurrent-tunnel budget, released by `Drop`.
+/// One slot in the concurrent-tunnel budget, released by `Drop` (`P6`).
 ///
-/// **B1-F8.** The count used to be a `fetch_add` at the top of the thread and a `fetch_sub`
-/// as its LAST STATEMENT. A panic anywhere in `serve_one` unwinds straight past that line,
-/// so the slot is never returned — and the leak is permanent, because nothing ever resets
-/// the counter. Sixty-four panics and the proxy answers every later connection with "too
-/// many concurrent connections" for the rest of the job: a job that talks to the network
-/// loses it entirely, with a message that describes load rather than the bug. The input
-/// that panics comes from the cage, so the trigger is the agent's to choose.
+/// **B1-F8.** The release used to be the thread's LAST STATEMENT, which a panic in
+/// `serve_one` never reaches — and the leak is permanent, because nothing resets the
+/// counter. Sixty-four panics and every later connection is refused for the rest of the
+/// job, with a message about load rather than the bug. The input that panics comes from the
+/// cage, so the trigger is the agent's to choose.
 ///
-/// `Drop` runs during unwinding, so tying the release to a value's lifetime makes it
-/// unconditional — the same rule husk applies to every other OS resource it holds. The
-/// acquire is `fetch_update`, which also makes the cap EXACT: the old check-then-add let two
+/// `fetch_update` on acquire also makes the cap EXACT: the old check-then-add let two
 /// connections pass the test before either incremented.
 struct TunnelSlot(Arc<AtomicUsize>);
 
@@ -277,6 +272,7 @@ impl Drop for TunnelSlot {
     }
 }
 
+/// Serve until the listener dies. Never returns in normal operation.
 pub fn serve(listener: UnixListener, allow: Allowlist) {
     let allow = Arc::new(allow);
     let live = Arc::new(AtomicUsize::new(0));

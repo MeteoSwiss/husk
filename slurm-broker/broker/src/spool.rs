@@ -438,18 +438,13 @@ const STRIPPED_SUBMIT_ENV: &[&str] = &[
 
 /// What may cross from the broker's login environment into a job. **An allowlist.**
 ///
-/// The four names above were a denylist, and a denylist is a bug list: it protected exactly
-/// the four credentials someone had thought of. `--export=ALL` hands slurmd the broker's
-/// whole environment, and the broker inherits the human's login shell — so every OTHER
-/// secret in it rode into the job unremarked. The reviewer's case was `GH_TOKEN`, but the
-/// shape is general: `*_TOKEN`, a cloud key, a database URL with a password in it, anything
-/// a scientist exported once. And the job that receives it is the AGENT's job: it reads its
-/// own environment, and egress now exists.
+/// The four names above were a denylist, and a denylist is a bug list (`P5`): they were the
+/// four credentials someone had thought of. `--export=ALL` hands slurmd the broker's whole
+/// environment and the broker inherits the human's login shell, so every other secret in it
+/// rode into a job the AGENT controls — measured: `GH_TOKEN`, and a live `SSH_AUTH_SOCK`.
 ///
-/// So the direction of failure is inverted. An unrecognised variable is DROPPED, which
-/// costs at worst a setting, instead of FORWARDED, which costs a credential. This is the
-/// same move as the sbatch option registry (F13/F14/F24/F26/F27): construct what is allowed
-/// rather than subtract what is feared.
+/// Inverted here: an unrecognised variable is DROPPED, costing at worst a setting, instead
+/// of FORWARDED, costing a credential.
 ///
 /// The list is generous on purpose — it has to keep a real ICON run working, and the thing
 /// husk must not do is quietly break the science. `--export=ALL` is load-bearing for the

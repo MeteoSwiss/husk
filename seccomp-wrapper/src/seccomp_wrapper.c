@@ -234,7 +234,8 @@ static const char *const BLOCKED_SYSCALLS[] = {
  *
  * WHAT BOUNDS THE READ. The kernel gates both calls with the ptrace-attach check:
  * credentials, Yama ptrace_scope, the target's dumpable flag, and PID visibility.
- * Balfrin has no Yama, so the load-bearing part here is the dumpable flag: the broker
+ * Where Yama is not enabled — as on our targets — the load-bearing part of that check is
+ * the dumpable flag: the broker
  * calls prctl(PR_SET_DUMPABLE, 0) at startup and is therefore not a valid CMA target
  * whatever this filter allows. --unshare-pid cannot help — each rank gets its own
  * bwrap, so a shared PID namespace would break the very rank-to-rank CMA being
@@ -329,9 +330,10 @@ static int install_filter(bool debug_mode, enum wrapper_profile profile)
      * ARM binary), bypassing a filter that only covers SCMP_ARCH_AARCH64.
      * Adding SCMP_ARCH_ARM closes that gap.
      *
-     * On Santis (Neoverse V2) AArch32 is not supported in silicon, so this
-     * is belt-and-braces. On other aarch64 cores (Cortex-A series) it is
-     * the primary protection against the 32-bit ABI bypass.
+     * On Neoverse V2 AArch32 is not supported in silicon, so there it is
+     * belt-and-braces. On aarch64 cores that do implement it (Cortex-A series)
+     * it is the primary protection against the 32-bit ABI bypass — so this is
+     * added unconditionally rather than probed.
      *
      * The personality(PER_LINUX32) block below (in install_filter) already
      * prevents ABI switches via personality(2); this is a second layer in

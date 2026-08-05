@@ -990,36 +990,22 @@ impl FsPolicy {
             // helper F22 introduced for exactly this, and it also gets `~/x` right (there
             // is nothing to re-bind under a hidden home).
             let Some(p) = abs_for_cage(p, workdir) else { continue };
-            // **AND `-try`, BECAUSE A STAT HERE CANNOT BE TRUSTED.** A bind whose source is
-            // missing kills the cage outright — bwrap exits before the job runs, with a
-            // message that never says "husk":
+            // **`-try`, because a stat here cannot be trusted** (`P3`). A bind with a
+            // missing source kills the cage: bwrap exits before the job runs, with a message
+            // that never says "husk".
             //
-            //   bwrap: Can't find source path <workdir>/.claude/settings.json: No such file
+            // The stat is DROPPED rather than kept as decoration. It ran on the login node at
+            // submit time while bwrap binds on a compute node minutes later, and the window
+            // is not idle: `sbatch` runs inside a login-cage Bash command, and the vendor
+            // runtime ghost-creates `/dev/null` mount points in this very directory for the
+            // duration of that command. husk stat'd `.claude/settings.json` during the one
+            // moment it existed and every ICON job died. Whether the file is there is a
+            // question only the compute node can answer, so bwrap answers it.
             //
-            // The first fix was to skip the entry when the path does not exist. That fixed
-            // the selftest and did NOT fix real jobs, because the existence check is a
-            // TOCTOU across two machines: husk stats on the LOGIN node at submit time, bwrap
-            // binds on a COMPUTE node when the job starts.
-            //
-            // What fills that window is not chance, it is the neighbouring cage. `sbatch`
-            // runs inside a login-cage Bash command, and the vendor runtime protects a
-            // non-existent deny path by binding `/dev/null` over it — which makes bwrap
-            // create an empty file on the HOST as the mount point, inside the project
-            // directory, for exactly as long as that command runs. So husk stats
-            // `.claude/settings.json` during the one moment it exists, emits a hard bind for
-            // it, the command ends, the runtime deletes its ghost, and the job dies minutes
-            // later on a node that never saw the file. Deterministic, and invisible to any
-            // test that does not call the broker from inside a husk session — which is why
-            // 91/0/0 on both clusters said nothing about it.
-            //
-            // `--ro-bind-try` is the answer, and the stat is dropped rather than kept as
-            // decoration: whether the file is there is a question only the compute node can
-            // answer, so let bwrap answer it. For a DENY, tolerating a missing source means
-            // "protect it if it is there" — and the absent case is not a hole, because
-            // stopping a dangerous path from being CREATED is the auto-exec mask's job
-            // below, which is shape-aware and absent-safe and already covers `.claude`,
-            // `.git`, `.hg`, `.Rprofile` and `.mcp.json`. `.claude/settings.json` sits inside
-            // a `--tmpfs` there, which is strictly stronger than a read-only bind.
+            // For a DENY, tolerating a missing source means "protect it if it is there". Not
+            // a hole: stopping a dangerous path from being CREATED is the auto-exec mask's
+            // job below, which is shape-aware and absent-safe, and `.claude` sits inside a
+            // `--tmpfs` there — strictly stronger than a read-only bind.
             if p.starts_with('/') && !path_under_floor(&p) {
                 a.push("--ro-bind-try".into());
                 a.push(p.clone());

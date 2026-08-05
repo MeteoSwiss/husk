@@ -360,23 +360,18 @@ pub fn decide(
     options.push(format!("--chdir={chdir}"));
     options.push(format!("--output={out}"));
     options.push(format!("--error={err}"));
-    // APPEND, never truncate — the first half of A1's run-time defence.
+    // APPEND, never truncate — the first half of A1's run-time defence (`P3`).
     //
-    // husk validates these paths at SUBMISSION; slurmd opens them when the job STARTS,
-    // which may be hours later, in a directory the agent can still write. The submit-time
-    // leaf check (`confine_output_pattern`) refuses a path that is a symlink *now*; it
-    // cannot refuse one that becomes a symlink while the job sits PENDING, and husk has no
-    // way to make slurmd open with O_NOFOLLOW.
+    // The submit-time leaf check refuses a path that is a symlink NOW; it cannot refuse one
+    // that becomes a symlink while the job sits PENDING, and husk cannot make slurmd open
+    // with O_NOFOLLOW. Under the default `truncate` that race destroys the target's contents
+    // before a line of husk's runs. `append` leaves nothing to destroy, and the fd guard
+    // below then refuses the body, so the only bytes that can reach a swapped-in target are
+    // husk's own refusal text — content injection needs the body.
     //
-    // Under the default `truncate` that race costs the target file its contents before a
-    // single line of husk's runs — an unconditional destroy primitive aimed at any file the
-    // user can write. `append` removes the destruction: the swapped-in target is opened, not
-    // emptied, and the guard below then refuses to run the agent's body at all, so the only
-    // bytes that can reach it are husk's own refusal text. Content injection needs the body.
-    //
-    // Cost: two runs writing to the same literal output filename accumulate instead of
-    // overwriting. Every husk default is `%j`-unique, so this is visible only to a job that
-    // names a fixed file and runs twice.
+    // Cost: two runs writing the same literal output filename accumulate rather than
+    // overwrite. Every husk default is `%j`-unique, so only a job that names a fixed file
+    // and runs twice can see it.
     options.push("--open-mode=append".to_string());
 
     // ---- resource options: ALLOWLIST, not passthrough ----
