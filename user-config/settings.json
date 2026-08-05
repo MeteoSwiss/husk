@@ -15,7 +15,9 @@
         "~/.claude/settings.json",
         ".claude/settings.json",
         ".claude/settings.local.json",
-        "~/.local/lib/husk"
+        "~/.local/lib/husk",
+        ".Rprofile",
+        ".hg/hgrc"
       ]
     },
     "network": {

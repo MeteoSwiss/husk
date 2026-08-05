@@ -153,6 +153,35 @@ const AUTO_EXEC_RO_OR_EMPTY: &[&str] = &[
     ".Rprofile", // R sources it from cwd at startup unless --vanilla. No trust prompt.
 ];
 
+/// The same protection, owed by the LOGIN cage — and a list that exists because the two
+/// cages disagreed.
+///
+/// **A4-F3.** The compute cage masked `.Rprofile` and `.hg/hgrc`; the login cage did not.
+/// Both dotfiles live in the shared, agent-writable project dir, so a LOGIN-session agent
+/// could delete and recreate either one with content of its choosing — and R sources
+/// `.Rprofile` from the working directory at startup, Mercurial reads `.hg/hgrc` and trusts
+/// it because the invoking user owns it. Neither needs the agent to be running: the payload
+/// fires the next time a HUMAN runs `R` or `hg` in that directory, outside every cage. The
+/// compute cage's re-masking hid the gap, because it made brokered jobs look protected.
+///
+/// The login cage is Anthropic's runtime, driven by husk's shipped `denyWrite`. So the fix
+/// is a policy entry, not code — which is exactly why it needs the pairing test below. Two
+/// lists of "what auto-executes", in two languages, in two files, is the duplication this
+/// project has been bitten by three times; assert them against each other instead.
+///
+/// Both shapes are safe to state statically because the runtime resolves them per shape: an
+/// absent LEAF gets `--ro-bind /dev/null` (creation blocked), while an absent INTERMEDIATE
+/// (`.hg` where no repo exists) gets a read-only EMPTY DIRECTORY rather than a character
+/// device, and both mount points are removed after the command. That is why `.git/config`
+/// is deliberately NOT here: `.git` absent would mount an empty dir over it and break
+/// `git init`, which is the same trap husk hit masking a path inside `.git` and fabricating
+/// a repository. Shape-aware masking (compute) or the vendor's conditional (login) owns
+/// that one; a static entry must never.
+pub const LOGIN_AUTO_EXEC_DENY: &[&str] = &[
+    ".Rprofile",
+    ".hg/hgrc",
+];
+
 /// SLURM filename specifiers we allow in an `--output`/`--error` pattern.
 ///
 /// `%x` (job name) is deliberately ABSENT. slurmd expands these AFTER husk has validated
@@ -1268,6 +1297,59 @@ mod tests {
                  protect it - the agent could edit its own cage. denyWrite = {deny:?}"
             );
         }
+    }
+
+    #[test]
+    fn every_auto_exec_file_the_compute_cage_masks_is_write_denied_on_the_login_side_too() {
+        // **A4-F3.** THE SECOND PAIRING, and the one the review found missing. husk masked
+        // `.Rprofile` and `.hg/hgrc` on compute and not on login, so a login-session agent
+        // could plant either in the shared project dir and have it auto-exec as the user
+        // the next time a HUMAN ran `R` or `hg` there — outside every cage. The compute
+        // cage's re-masking made brokered jobs look protected and hid it.
+        //
+        // Two directions, because either alone rots:
+        //   * a file husk masks on compute because it AUTO-EXECUTES must be write-denied on
+        //     login (add one to the compute list and this fails until login follows), and
+        //   * every login entry must actually be in the shipped config (the file is what
+        //     the runtime reads; a constant nobody ships protects nothing).
+        for f in AUTO_EXEC_RO_OR_EMPTY {
+            assert!(
+                LOGIN_AUTO_EXEC_DENY.contains(f),
+                "{f:?} auto-executes (that is why the compute cage masks it), so the login \
+                 cage must write-deny it too — that gap WAS A4-F3"
+            );
+        }
+
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../user-config/settings.json");
+        let text = match std::fs::read_to_string(&shipped) {
+            Ok(t) => t,
+            Err(_) => return, // not every checkout layout has it; see the pairing above
+        };
+        let cfg: serde_json::Value =
+            serde_json::from_str(&text).expect("shipped settings must be valid JSON");
+        let deny: Vec<String> = cfg["sandbox"]["filesystem"]["denyWrite"]
+            .as_array()
+            .expect("shipped settings must carry sandbox.filesystem.denyWrite")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        for want in LOGIN_AUTO_EXEC_DENY {
+            assert!(
+                deny.iter().any(|d| d == want),
+                "the shipped login config does not write-deny {want:?}, so an agent can \
+                 plant it in the project dir and have it run as the user. denyWrite = {deny:?}"
+            );
+        }
+
+        // `.git/config` must NOT be added here, however tempting the symmetry: with no
+        // `.git`, a static deny mounts an empty read-only directory over it and `git init`
+        // stops working. Shape-aware masking owns that case. Pinned so a later "complete the
+        // list" commit has to read the reason first.
+        assert!(
+            !LOGIN_AUTO_EXEC_DENY.iter().any(|d| d.starts_with(".git/")),
+            "`.git/*` is shape-dependent — a static deny breaks `git init`; see the doc comment"
+        );
     }
 
     #[test]
