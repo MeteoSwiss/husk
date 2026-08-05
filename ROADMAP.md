@@ -1,163 +1,204 @@
-# husk roadmap (post-v0.4)
+# husk roadmap
 
-## Design axiom (the through-line for everything below)
+**Where husk is going.** Its sibling [`doc/context.md`](doc/context.md) holds where husk *is*
+— together they are the ⟂ time axis of the [documentation stack](doc/README.md), and both are
+expected to rot on purpose. Nothing here re-argues *why*: the design premise lives in
+[`doc/threat-model.md §1`](doc/threat-model.md), the reasoning that outlives any scheduler in
+[`doc/PRINCIPLES.md`](doc/PRINCIPLES.md), and the agent contract in
+[`doc/sandbox-interface.md`](doc/sandbox-interface.md). If a paragraph here explains a rule
+rather than scheduling work, it is in the wrong file.
 
-**The confiner must be EXTERNAL to, INDEPENDENT of, and NOT reliant on the
-cooperation of, the confined.**
+**Strategy, unchanged:** reimplement the vendor runtime's pieces in Rust incrementally, each
+independently useful, until the marginal cost of dropping it is ~zero — then own it and
+generalise. Never big-bang.
 
-- The untrusted set is the agent **and everything it ships with** — especially any
-  software advertised as *restricting* it. A vendor's self-sandbox is
-  self-restriction, architecturally weaker than external restriction no matter how
-  well written: the process you're worried about is the one meant to jail itself.
-- Therefore husk uses a **per-session, kernel-enforced (bwrap + seccomp), external
-  wrap** — never a per-command hook the agent has to invoke. A per-command hook
-  makes containment only as correct as the untrusted orchestrator's code that calls
-  it (as many escape paths as it has bugs). An external wrap holds regardless of how
-  buggy or hostile the agent is, because nothing it does is on the enforcement path.
-- **Trust base = the kernel + husk's own small, auditable core.** Nothing else.
-- Open-source vendor sandboxes (Anthropic) are for **adopting + auditing** ideas —
-  never for husk to *depend on*. Run one too if present (free defense-in-depth), but
-  the guarantee never routes through it.
-- **Consequence:** husk wraps *any* agent — Claude, a closed OpenAI/MS agent, or a
-  self-hosted open-weight model (DeepSeek etc.) — identically, because none of them
-  are on the enforcement path. Generalization falls out of the right trust model; it
-  isn't a separate feature. (See `slurm-broker/THREAT-MODEL.md`.)
+---
 
-## Strategy
+## Shipped
 
-Incrementally reimplement Anthropic's Linux sandbox pieces in Rust — each one
-independently useful — until the marginal cost of dropping their runtime is ~zero,
-then own it and generalize. This de-risks the rewrite by never doing it big-bang.
+**v0.4 (2026-07-27)** — single-node broker: `sbatch`, compute-side re-sandbox, the fs cage
+(F1–F6), GPU carve-outs, read-only SLURM queries. Submission surface default-deny by
+construction. Balfrin-verified.
 
-## Steps (dependencies noted)
+**Steps 1–3b (2026-07-31, branch `experimental`, unreleased)** — `srun` brokering end to end
+(recursive stub/step-broker pairs, step option allowlist, per-rank cages, single-node
+multi-rank MPI); network egress (allowlist, one proxy per node, per-rank relays, `CONNECT`
+only by design). **ICON ran to completion with CMA enabled**, and a **production KENDA
+assimilation experiment ran green** — the first real production workload through husk.
 
-**v0.4 (SHIPPED 2026-07-27):** single-node broker — `sbatch` + compute-side re-sandbox
-+ the fs cage (F1–F6) + GPU carve-outs + read-only SLURM queries (Tier 1). The
-submission surface is default-deny by construction (option allowlist: parse → validate →
-re-emit → reject unknown). Verified on Balfrin hardware, 32/32
-(`slurm-broker/selftest.sh --full`). Still layers on Anthropic's runtime.
+**v0.5 fix round (2026-08-05)** — the security review's whole above-LOW set plus the eight LOW
+code fixes, hardware-green on Balfrin *and* Santis, ICON running again. Details in
+[`doc/review-v0.5/`](doc/review-v0.5/).
 
-**Steps 1+2 SHIPPED (branch `experimental`, 2026-07-31) — not yet released.** `srun`
-brokering works end to end: the recursive stub/step-broker pair, the step option allowlist,
-per-rank cages, and single-node multi-rank MPI. **ICON ran to completion on Balfrin** —
-one node, 4 MPI ranks, GPU, brokered throughout, with Cross Memory Attach enabled and no
-`MPICH_SMP_SINGLE_COPY_MODE=NONE`, so nobody pays an intra-node message tax. Design and
-the hardware gates are in
-[`slurm-broker/SRUN-MPI-DESIGN.md`](slurm-broker/SRUN-MPI-DESIGN.md).
+---
 
-The structural lesson of that phase is now a design principle in
-[`THREAT-MODEL.md`](slurm-broker/THREAT-MODEL.md), **the unit of confinement**: the
-security border is the job on a node, not the process. All ranks of a job are one trust
-domain, so they share one user namespace; a cage per task added no boundary, only N
-redundant copies of the same wall, and one of those copies silently cost us CMA.
+## Track A — finish and release v0.5
 
-1. ~~**Architecture decision — recursive sandbox-broker pairs**~~ **DONE.** A sandbox
-   always has a paired broker outside it; crossing a boundary spawns a new pair. The
-   `PDEATHSIG` chain holds per level.
+Everything else assumes a released baseline.
 
-2. ~~**`srun` brokering → single-node multi-process MPI**~~ **DONE, ICON verified.**
+1. **Santis at HEAD.** It was green at `2f1a0b0`, before both the Lmod env fix and the
+   ghost-file TOCTOU fix. Re-run.
+2. **The A1 file-descriptor question.** One grep of `~/.husk/log/job-*.log` for
+   `not regular files on this node`. Empty ⇒ the run-time guard enforces and the CRITICAL is
+   closed; a hit ⇒ it is inert on that site and A1 is only narrowed, which changes the design.
+3. **Pen-test re-run** — [`doc/review-v0.5/RE-RUN-PLAN.md`](doc/review-v0.5/RE-RUN-PLAN.md).
+   A5 first: it never actually ran (the cage-build collision killed 3 of its 4 jobs), so its
+   hop 2–4 verdicts came from laptop triage rather than the cluster. Then A1, then the new
+   briefs aimed at the code the fix round added — two of which are a *gate* nobody has
+   attacked.
+4. **→ RELEASE v0.5.** An agent on a CSCS system, externally confined, running its own
+   single-node 4-GPU jobs. A daily-work tool, not a demo.
 
-3. ~~**Network: socat + allowlist on compute nodes.**~~ **BUILT 2026-07-31** — allowlist
-   (`netallow.rs`), egress proxy (`netproxy.rs`), guard wiring, and four selftest arms.
-   Off unless an operator configures `sandbox.network.allowedDomains`; `*` available for
-   deliberate open egress; SLURM daemon ports refused regardless.
-   **VERIFIED ON BALFRIN 2026-07-31 at `6ce952b` — 56/56, no failures.** A caged job on a
-   compute node fetched the allowlisted host through the proxy (`net.live`, 200, 21140
-   bytes), while an unlisted host and a SLURM daemon port were both refused with 403 and
-   a direct connection out of the cage still failed. Compute nodes DO have a route to the
-   internet, so this is not login-only.
-   A field report from a caged agent running that production experiment also produced two
-   fixes that belong here: the cage's writable root is now the **trusted project dir**
-   (it was `req.cwd`, which the agent supplies — the confined side was choosing its own
-   confinement), and the cage **announces its writable paths** in the job via a banner and
-   `HUSK_WRITABLE`. Original scope note kept for the record: Reimplement the network layer rather than depending on Anthropic's. **Scope it:**
-   an SNI/host allowlist likely suffices; full TLS-MITM only if content filtering is
-   actually needed. Reactivates **AV8** (broker bypass) and is safe *only because* srun is
-   now brokered and `slurmctld` stays off the allowlist.
-   Shape decided by measurement (see SRUN-MPI-DESIGN.md): the **filtering proxy is one per
-   node**, reached through a unix socket bind-mounted into every rank's cage — a unix
-   socket crosses a network namespace because it is a filesystem object. Only a dumb relay
-   is per rank. The host-side allowlist must accept **host-or-IP + port**, not just
-   domains, because a self-hosted model endpoint is an internal address with no SNI.
+---
 
-3b. ~~**Rank egress**~~ **BUILT 2026-07-31.** Every rank starts its own relay to the same
-   single proxy, so `wget` behaves the same inside `srun` as in the sbatch script. The
-   per-rank piece is an adapter, not a policy — each rank has its own network namespace and
-   `HTTP_PROXY` names a `host:port`, so something must listen on that address inside each
-   one. One proxy, one allowlist, one log. Motivated by asymmetric pipelines (one rank
-   fetches, another parses, a third computes), which is where this would otherwise have
-   bitten someone.
+## Track B — own the boundary (6a, then 6b)
 
-   **Known limitation, by design:** `CONNECT` only, so `https://` works and plain `http://`
-   does not. A proxied `http://` request is an absolute-URI `GET`, and serving it would mean
-   a second HTTP parser — the F13/F14 shape. The refusal names `https://` so it is
-   actionable.
+**6a is the keystone, and it is not only a security milestone.** Today the vendor runtime owns
+the login-side boundary and wraps each *command*; husk wraps the *harness* only on compute.
+Three consequences close together when husk owns the outer cage:
 
-**v0.5 FEATURE WORK COMPLETE (2026-08-01).** ICON runs with CMA enabled, and a **production
-KENDA assimilation experiment ran green end to end** on Balfrin — the first real production
-workload through husk. Selftest 56/56 with no failures. Everything below step 3b is done;
-the only thing between here and release is the review.
+- **The two-door problem disappears.** In-process file tools stop being a hole — not because
+  the tools changed, but because a path that is not mounted is unreachable by any of them
+  ([`sandbox-interface.md §4.1`](doc/sandbox-interface.md)).
+- **`--tools Bash` can be deleted**, which is the single largest usability win available:
+  native file tools come back at full speed instead of every touch being a sandboxed command
+  on Lustre.
+- **husk can own policy** (§6 of the contract), because it owns what is mounted.
 
-4. **Security review before release** — a multi-agent adversarial pass over the whole
-   surface, as was done for v0.4, where it found four criticals. The submission surface,
-   the step surface and the new network surface all get it. Nothing ships to users until
-   this has run.
+*Acceptance test for 6a:* land the outer cage, **delete `--tools Bash`, and verify `/users` is
+still unreachable from the agent's own file tools.** If it holds, the workaround was
+redundant; if not, husk does not own the boundary it claims.
 
-**→ RELEASE v0.5.** Worth stating plainly what it buys, because it is already a lot: an
-agent on a CSCS system, externally confined, that can run its own single-node 4-GPU jobs.
-That is a daily-work tool, not a demo.
+*Prerequisite, now measurable:* user namespaces must **nest** — husk's cage will sit around a
+runtime that creates its own. `husk-site-check.sh` tests it.
 
-5. **`salloc`: block / defer** (interactive allocation = highest complexity, lowest value
-   for an agent; revisit only on a concrete need).
+**6b** — the contract is written and passes its own acceptance test (the vendor's name appears
+once, in the integration table). What remains is husk's own policy schema plus a vendor
+adapter. **Deliberately unspecified: the field names** — the property is the commitment, the
+encoding is 6a's to choose. husk's own non-conformance is tracked in
+[`sandbox-interface.md §8.1`](doc/sandbox-interface.md), and those rows are deleted when
+closed, never reworded.
 
-6. **Own the sandbox + generalize — v0.6.** By here fs, network and seccomp are all ours,
-   so the marginal cost of dropping Anthropic's runtime is small. **Split in two:**
-   - **6a — provide the login sandbox ourselves, still Claude only.** The deliverable is
-     three agent-NEUTRAL pieces: husk's own policy source (theirs reads
-     `.claude/settings.json`), **credential masking** (our compute cage is ~40% of their
-     fs model — a known gap), and a session-level wrap instead of their per-Bash-command
-     one. What is actually Claude-specific is a three-column table: binary to exec, config
-     dir to allow, API hosts to allowlist. **Acceptance test: the string `claude` appears
-     nowhere except one row of that table** — otherwise 6b is a rewrite, not an extension.
-     Also fixes the Balfrin/Santis lag, whose real cause is an in-process deny-set walk on
-     Lustre metadata, *provided* our policy layer expresses itself as **mounts, not a
-     scanned deny-set**. The compute cage is already built that way.
-   - **6b — open it to other agents**, including self-hosted. Note that self-hosted at
-     CSCS is a *network* case, not a no-network one: the model is served on the H100
-     vcluster while the harness runs on Balfrin, so they talk across vclusters. Two things
-     to pin early: which side dials (our proxy model is egress-only; anything dialling
-     *in* is materially new work) and who starts the model job (if the agent can, it
-     controls an un-caged process — the sbatch/ssh/tmux class again).
-   **Do before their runtime goes away** (laptop task, no allocation): enumerate what it
-   enforces *while it is still there to diff against* — the `seccomp-wrapper` vs
-   `apply-seccomp` syscall delta and the fs-model delta. Afterwards that is archaeology;
-   today it turns 6a from "reimplement a sandbox" into "close a known list".
+---
 
-## Smaller items (not blocking a phase)
-- **Allow a LIST of partitions, not one forced value.** Today `HUSK_SLURM_PARTITION`
-  is a single partition the broker forces onto every job, which is the tightest
-  policy but also the bluntest: a site may legitimately want short test jobs on one
-  queue and longer runs on another (Santis has both `debug` and `shared`). Natural
-  shape: the operator records an allow-set, the agent may pick from it, and anything
-  else is rejected with the same teaching message — i.e. the option-registry pattern
-  applied to a value rather than a flag. Keeps "the operator decides the policy, the
-  agent cannot escape it" while dropping the one-size restriction.
-- Validate the configured partition at broker startup (`sinfo`) and fail fast with an
-  actionable message, instead of surfacing a raw `invalid partition` from sbatch at
-  first submission.
+## Track C — more machines
 
-## Open questions to resolve along the way
-- Recursive lifecycle robustness (PDEATHSIG chains across nested pairs).
+Parallel to everything; blocks nothing. The architecture already ports (no root, no site
+cooperation, per-arch binaries, degrades without uenv). The details are where the work is.
+
+**Run [`slurm-broker/husk-site-check.sh`](slurm-broker/husk-site-check.sh) first, on every
+candidate.** It answers the one fatal, binary question — are unprivileged user namespaces
+available — in five seconds, before anyone invests a week. It also emits the draft site
+profile.
+
+**Targets, chosen for what they teach rather than for coverage:**
+
+| target | new axis | note |
+|---|---|---|
+| **LUMI** | AMD GPUs (`/dev/kfd`) | Cray EX, so Slingshot and the OS are familiar — one new variable, well isolated. Highest information per unit effort. |
+| **Euler (ETH)** | InfiniBand fabric, non-Cray OS | second device family and a different module system |
+| **DKRZ Levante** | — | mostly confirms what LUMI and Euler already teach; do it later, cheaply |
+
+**Known work:** the GPU device list is hard-coded NVIDIA and must become a runtime glob **in
+the guard** (the broker cannot enumerate at submit time; login ≠ compute). Same for the fabric
+list. The env allowlist needs one measured bringup per site — that is `P5`'s documented tax,
+and it is now routine: read the "not forwarded" line.
+
+---
+
+## Track D — multi-node MPI
+
+**Scope it before committing.** One 2-node experiment decides between *days* and *weeks*:
+netns is exonerated, the Slingshot data path is a device rather than a socket, and VNI
+isolation is already Slurm's. Do the experiment early; the answer changes the shape of
+everything after it.
+
+---
+
+## Track E — usability
+
+Not a phase — a lens. The evidence so far says usability is mostly **precision work**, not
+"make husk weaker": in each case the control's blast radius exceeds its target, and tightening
+the aim costs no security.
+
+| symptom | control | actual target | shape of the fix |
+|---|---|---|---|
+| agent memory does not persist across sessions | `~/.claude` is read-only | `settings.json` only | bind a husk-owned writable state dir over the agent's state path — needs `AgentProfile` |
+| cannot read another user's data tree (e.g. operations data) | the `/users` floor | credentials in home *roots* | **NOT DECIDED — see below** |
+| every file touch is a slow sandboxed command | `--tools Bash` | the two-door problem | dissolves with 6a |
+| per-site setup needs undocumented knowledge | — | — | site profile + `husk-site-check` |
+
+**Introspection is one problem wearing three hats**, and it has cost real time: a stale
+prebuilt binary reported the A1 escape as still open; a stale in-session broker cost a whole
+diagnosis round on ICON (a session keeps the broker it started with, so reinstalling does
+nothing); `exit` backgrounds a session rather than ending it, producing a phantom DRIFT. The
+build stamp fixed one instance. **`husk status`** would generalise it: which build, which
+broker, which session, which policy, which partitions, is the boundary actually up.
+
+---
+
+## Cross-cutting — profiles as first-class
+
+Today site knowledge is scattered across install flags, Rust constants, env vars and a shipped
+JSON; agent knowledge is scattered similarly, and some of it (the agent's state directory) does
+not exist as a concept at all. The proposal is to make both **data with a schema**, so the cage
+becomes a function of `(site, agent, operator policy, workdir)` rather than of constants —
+which also makes it testable against a synthetic LUMI without a LUMI.
+
+**Three kinds of data, and naming the third is what stops profiles becoming a dumping ground:**
+
+- **SiteProfile** — devices, scheduler, module system, site path vars, socket path budget.
+  First draft already exists: the `[site]` block `husk-site-check.sh` emits.
+- **AgentProfile** — state directory, egress needs, config paths, mediated binaries. This is
+  [`sandbox-interface.md §5`](doc/sandbox-interface.md) made real.
+- **husk's own catalogues** — auto-exec surfaces, blocked syscalls, the sbatch option registry.
+  These vary with the *ecosystem*, not with site or agent, and must ship with husk: `.Rprofile`
+  executes everywhere, and re-discovering that per site would be strictly worse.
+
+*Note the tangle this exposes:* `AUTO_EXEC_DIRS` currently mixes axes — `.claude` is
+agent-specific, `.vscode`/`.idea` are ecosystem. Invisible today, obvious under the split.
+
+**The discipline, mirroring L1's entry bar:** *a field enters a profile when a **second** site
+or agent disagrees about it.* Until then it stays a constant. On today's evidence that admits
+four fields, not a rewrite — `GPU_DEVICES` (LUMI is AMD), `SUBMIT_ENV_ALLOW_SITE` (Santis ≠
+Balfrin), `DEFAULT_PARTITION` (Santis has no preemptible), `FABRIC_DEVICES` (on checking
+Euler) — plus one *new* `AgentProfile` field driven by a real bug rather than by symmetry: the
+state directory.
+
+**Warning: a profile is a policy input.** It inherits `P2` (must live where the agent cannot
+write it) and `P8` (must join the `SETTINGS_SOURCES ↔ denyWrite` pairing test). Get that wrong
+and this has built a fresh way for the confined side to supply its own boundary — which is
+F17, the bug that started the whole write-root saga.
+
+*Migration:* start from the site-check's schema → move the four earned constants → add
+`AgentProfile.state_dir` and fix memory with it → leave everything else alone until a second
+instance appears.
+
+---
+
+## Smaller items
+
+- **Validate the configured partitions at startup** (`sinfo`/`scontrol`) and fail fast with an
+  actionable message. This is also the open instance of `P7` behind H11: nothing verifies that
+  a partition is actually preemptible, and nothing fails loudly if it is not.
+- **Report carve-outs that silently did not apply.** Floor-overlapping ones are already
+  reported; a symlinked component (F20) and a non-existent path are both dropped in silence.
+  Same teaching-message machinery, three sentences.
+- ~~Allow a LIST of partitions~~ **DONE** — shipped; `HUSK_SLURM_PARTITION` takes a list.
+
+---
+
+## Open questions
+
+- **Sub-home carve-outs — NOT DECIDED, needs separate reasoning.** Whether an operator may
+  expose a path *below* another user's home (operational data) while the floor keeps home
+  roots hidden. It is a real workflow with no workaround today, and it is a genuine policy
+  change rather than a bug fix, so it gets its own discussion before any code.
+- `salloc`: block permanently, or revisit? (`srun`/`salloc` from the login node stays low
+  priority.)
 - Network scope: SNI/host allowlist vs full TLS-MITM.
-- `salloc`: block permanently, or revisit?
-- Step 6a "naked Claude" check: confirm Claude runs correctly wrapped per-session
-  (its per-command sandbox should be a security layer, not a functional dependency).
-- Whether the cage holder should clear `PR_SET_DUMPABLE`. It *can* — measured on kernel
-  6.8, a non-dumpable holder is still joinable via `bwrap --userns`. Left off because the
-  gain is a third layer on a process that is already unreadable and holds nothing, while
-  the risk is kernel-dependent (Balfrin runs 5.14; if joining broke there, every step
-  would die). Revisit if the holder ever comes to hold something worth reading, or once
-  the behaviour is measured on the target.
-
-See also: `slurm-broker/THREAT-MODEL.md` (the AV1–AV8 threat model, incl. the AV8
-broker-bypass landmine that step 3 must respect) and `slurm-broker/BROKER.md`.
+- Recursive lifecycle robustness (`PDEATHSIG` chains across nested pairs).
+- Whether the cage holder should clear `PR_SET_DUMPABLE` — measured on 6.8 a non-dumpable
+  holder is still joinable, so the reasoning and the measurement disagree; the flag stays set
+  because the failure mode is fail-closed on the MPI path. Revisit only with a measurement on
+  the target kernel.
