@@ -148,10 +148,18 @@ same moment? The residual is that the shape is read at SUBMIT time on the login 
 bwrap runs later on a compute node. If collisions persist, the answer is to resolve the shape
 on the compute node like the credential masks already are.
 
-### B5. Is the MPI path unchanged?
-`cma.peers`, `steps.*`, and a real ICON/KENDA run. B4-F7 touched the rank script (`|| exit 1`)
-and B4-F8 touched the **egress** rank path only — the plain path was deliberately left
-byte-for-byte identical. If MPI regresses, those two are the first suspects.
+### B5. Is the MPI path unchanged? ★ the other one that needs a real run
+`cma.peers`, `steps.*`, and a real ICON/KENDA run. **B4-F8 now adds a one-line inner shell to
+EVERY rank**, not just networked ones: bwrap execs `/bin/sh -c 'exec 8<&- 9<&-; exec "$@"'`,
+which drops the job's shared namespace handles and then becomes the workload. Verified in bash
+and dash off-cluster (fds gone, argv preserved through spaces and semicolons), but it is one
+extra exec on the MPI-critical path and has never run on a real fabric.
+
+If MPI regresses, this and B4-F7's `|| exit 1` are the first two suspects — and the revert is
+one commit. From inside a rank, the check is direct:
+```bash
+ls -l /proc/$$/fd        # 8 and 9 must be ABSENT; before the fix they were pid:[…] / user:[…]
+```
 
 ---
 

@@ -188,6 +188,12 @@ pub struct Egress<'a> {
 /// passing `"$_husk_inner"` keeps exactly one level of quoting. The socket path travels in
 /// an exported variable for the same reason — `sh_quote` produces single quotes, which
 /// cannot appear inside the single-quoted assignment.
+/// Drop the job's shared namespace handles before the workload starts (B4-F8).
+///
+/// One origin for both shapes, because two copies of a security-relevant line in two
+/// branches is how the cleanup set drifted from the files it was supposed to remove.
+const CLOSE_NS_FDS: &str = "exec 8<&- 9<&-";
+
 fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     let sec = profile.seccomp_profile();
     let cage = match net {
@@ -219,22 +225,27 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     // They cannot be closed before `exec bwrap` — bwrap needs them — and bwrap has no flag
     // to drop them: any fd it is handed is inherited by whatever it execs. So the close has
     // to happen on the far side of the cage, in the one instant between bwrap's exec and the
-    // workload's, which means a shell hop.
+    // workload's. That instant is only reachable from a process bwrap starts, so both shapes
+    // now go through a one-line inner shell whose entire job is to close the two fds and
+    // exec the workload.
     //
-    // Done HERE, in the inner script the egress path already has, and deliberately NOT on
-    // the plain path: `a_rank_without_egress_gets_exactly_the_old_script` requires the
-    // no-network case to stay byte-for-byte what it was before egress existed — no extra
-    // shell, no extra process — because that is the MPI-critical path and it cost real
-    // bring-up rounds. Trading a measured-harmless fd leak for a new process on every rank
-    // of every MPI job is not a trade this fix gets to make on its own; it is a change of
-    // that invariant, and it needs a human and a hardware run. **So the plain path still
-    // leaks fds 8 and 9. Recorded, not silently closed.**
+    // The networked shape already had that shell — the socat relay needs it — so the close
+    // was free there. The plain shape did not, and an earlier note here said the no-network
+    // case had to stay BYTE-FOR-BYTE what it was before egress existed. That was too strong:
+    // the property worth protecting is that a job which never asked for a network gets the
+    // same SEMANTICS as before — no relay, no proxy environment, no socat, and the workload
+    // still exec'd from its own argv — not that the script text is unchanged. One exec that
+    // immediately replaces itself is not a regression to a job that asked for nothing.
     match net {
-        None => format!("exec {cage} \"$@\"\n"),
+        None => format!(
+            "_husk_inner='{CLOSE_NS_FDS}\n\
+             exec \"$@\"'\n\
+             exec {cage} /bin/sh -c \"$_husk_inner\" husk-rank \"$@\"\n"
+        ),
         Some(e) => format!(
             "export _HUSK_NET_SOCK={sock}\n\
              export _HUSK_SOCAT={caged}\n\
-             _husk_inner='exec 8<&- 9<&-\n\
+             _husk_inner='{CLOSE_NS_FDS}\n\
              if [ -x \"$_HUSK_SOCAT\" ]; then\n\
              \"$_HUSK_SOCAT\" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 \
              UNIX-CONNECT:\"$_HUSK_NET_SOCK\" >/dev/null 2>&1 &\n\
@@ -717,15 +728,27 @@ mod tests {
     }
 
     #[test]
-    fn a_rank_without_egress_gets_exactly_the_old_script() {
-        // The no-network case must be byte-for-byte what it was before egress existed:
-        // no extra shell, no extra process, nothing to regress for a job that never asked
-        // for a network. That is why the broker chooses the shape instead of the script
-        // branching at run time.
+    fn a_rank_without_egress_gets_no_network_semantics_whatsoever() {
+        // A job that never asked for a network must be UNAFFECTED by the fact that egress
+        // exists: no relay, no proxy environment, no socat, nothing listening. That is the
+        // property, and it is why the broker chooses the shape up front instead of letting
+        // the script branch at run time.
+        //
+        // This assertion used to be "byte-for-byte what it was before egress existed — no
+        // extra shell, no extra process". That was a corollary written as a law: it was true
+        // of the implementation at the time, not a thing anyone needed. Held literally it
+        // also forbade the B4-F8 fix, since closing the shared namespace fds is only possible
+        // from a process bwrap starts. Semantics are what must not regress; script text is
+        // not semantics.
         let script = &built(&["./a.out"])[2];
         assert!(!script.contains("SOCAT"), "no relay without egress: {script}");
-        assert!(!script.contains("_husk_inner"), "no inner shell without a socket: {script}");
-        assert!(script.contains("-- \"$@\""), "the workload is exec'd directly: {script}");
+        assert!(!script.contains("TCP-LISTEN"), "nothing listening: {script}");
+        assert!(!script.contains("HTTP_PROXY"), "no proxy environment: {script}");
+        assert!(!script.contains("net.sock"), "no socket bound in: {script}");
+        // The workload is still exec'd from its own argv, never interpolated into script
+        // text — the one property the inner shell must not cost us.
+        assert!(script.contains("exec \"$@\"'"), "the inner shell execs argv: {script}");
+        assert!(script.ends_with("husk-rank \"$@\"\n"), "the command is passed as argv: {script}");
     }
 
     #[test]
@@ -757,22 +780,31 @@ mod tests {
     }
 
     #[test]
-    fn the_plain_rank_path_still_leaks_the_namespace_fds_and_that_is_a_decision() {
-        // The other half of B4-F8, recorded rather than quietly fixed. Closing the fds needs
-        // a shell hop, and `a_rank_without_egress_gets_exactly_the_old_script` forbids one
-        // here on purpose: the no-network case is the MPI-critical path and must stay
-        // byte-for-byte what it was before egress existed. Trading a measured-harmless leak
-        // for a new process on every rank of every MPI job is a change to that invariant,
-        // not a bug fix, and it needs a human and a hardware run.
-        //
-        // This test exists so the state is asserted rather than assumed: if someone adds the
-        // hop, this fails and they must come here and read why it was left out.
-        let script = &built(&["./a.out"])[2];
-        assert!(
-            !script.contains("exec 8<&- 9<&-"),
-            "the plain path grew an fd close — that means it grew a shell hop; see \
-             a_rank_without_egress_gets_exactly_the_old_script before keeping this"
-        );
+    fn every_rank_shape_closes_the_namespace_fds_not_just_the_networked_one() {
+        // The second half of B4-F8. The networked shape got this free (it already had an
+        // inner shell for the relay); the plain shape needed one of its own, which is the
+        // MPI-critical path — so assert BOTH, from one origin, because a security-relevant
+        // line duplicated across two branches is exactly how husk's cleanup set once drifted
+        // from the files it was meant to remove.
+        let plain = built(&["./a.out"])[2].clone();
+        let networked = wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::default().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            live_holder(),
+            Some(Egress { sock: "/work/sp/net.sock", socat: "/work/sp/socat" }),
+            &v(&["./a.out"]),
+        )[2]
+        .clone();
+        for (what, script) in [("plain", &plain), ("networked", &networked)] {
+            assert!(
+                script.contains(CLOSE_NS_FDS),
+                "{what} rank must drop the shared namespace handles: {script}"
+            );
+            let closed = script.find(CLOSE_NS_FDS).expect("close present");
+            let workload = script.rfind("exec \"$@\"").expect("workload exec present");
+            assert!(closed < workload, "{what}: the close must precede the exec: {script}");
+        }
     }
 
     #[test]

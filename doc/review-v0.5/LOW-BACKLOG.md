@@ -3,7 +3,7 @@
 Everything at LOW, INFO, or by-design across all three review clusters, in one place.
 
 > **2026-08-05 (second pass): the EIGHT real code fixes in this list are DONE** — A3 scan,
-> `_HUSK_` filter, B1-F6/F7/F8, B3-F8, B4-F7, B4-F8 (partial, see its row). Commit `79cd790`.
+> `_HUSK_` filter, B1-F6/F7/F8, B3-F8, B4-F7, B4-F8. Commit `79cd790`.
 > What remains here is the doc/comment pass (~12 items), the three verify-first MED-LOWs, and
 > the C structural set, which is v0.6 roadmap rather than a bug queue.
 >
@@ -49,7 +49,7 @@ acting).
 | ~~B3-F8~~ | ~~LOW~~ | relative `denyWrite` is silently dropped on compute (F22, unfixed on this one field) | **DONE `79cd790`** — now goes through `abs_for_cage` like every other field |
 | ~~B6-F6~~ | ~~LOW today~~ | ~~`scancel`/read-only queries run with the broker's env unfiltered~~ | **DONE 2026-08-05 (`3354764`)** — the submission-env allowlist was applied to everything the broker execs, not just `sbatch` |
 | ~~B4-F7~~ | ~~LOW (minor)~~ | the rank script's fail-closed guarantee is shell-dependent (bwrap covers it) | **DONE `79cd790`** — `|| exit 1` on both redirections |
-| ~~B4-F8~~ | ~~LOW (hygiene)~~ | namespace fds leak into the workload (no impact found) | **PARTIAL `79cd790`** — closed on the egress path; the plain path keeps the leak because the no-network case must stay byte-for-byte (MPI-critical). A test asserts that state |
+| ~~B4-F8~~ | ~~LOW (hygiene)~~ | namespace fds leak into the workload (no impact found) | **DONE `79cd790`+ (pending hardware)** — closed on BOTH shapes via a one-line inner shell. The old "byte-for-byte" invariant was relaxed to "same semantics" (Christoph: it was a corollary, not a design principle). Watch `cma.peers` + a real ICON run |
 | C2-9 | LOW (PLAUSIBLE) | with header injection the in-cage relay becomes a position the agent occupies | **BY-DESIGN** — recorded for the 6b design |
 
 ### Doc-vs-code drift & comment defects
