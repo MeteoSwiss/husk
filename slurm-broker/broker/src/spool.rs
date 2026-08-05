@@ -31,6 +31,10 @@ pub struct Broker {
     /// Compute-cage filesystem policy, resolved once at startup from the TRUSTED project
     /// dir (never from the agent-controlled req.cwd). See main.rs. (F17)
     pub fs_policy: FsPolicy,
+    /// Where the user-level settings live. Held so submit time can re-check that the
+    /// settings the COMPUTE side will re-read still parse — checked, never adopted; the
+    /// authoritative policy stays the one captured at startup. (F17)
+    pub home: PathBuf,
     /// Job ids this broker submitted, and the ONLY ones it will cancel.
     ///
     /// Trusted state: it is built from what `sbatch --parsable` returned, never from
@@ -128,6 +132,33 @@ impl Broker {
             req.script.source,
             req.script.name.as_deref().unwrap_or("-"),
         );
+        // The settings the COMPUTE side will re-read must still parse, or this job is
+        // already doomed and does not know it.
+        //
+        // The step broker resolves the policy again on the compute node, per job, and fails
+        // closed if it cannot. That is right. But this broker resolved it once at startup
+        // and cached it, so an edit made after the session began is invisible here and fatal
+        // there — submissions keep succeeding while every job's step broker dies re-reading
+        // the same file. On Balfrin 2026-08-06 that cost five or six jobs, each hanging to
+        // its walltime, from one empty `.claude/settings.json`.
+        //
+        // CHECKED, NOT ADOPTED. The cached policy stays authoritative: it was captured from
+        // the trusted project dir before the agent ran, and re-resolving here would hand the
+        // confined side a way to author its own cage — exactly F17, and exactly the rule
+        // that the confined side must not supply its own boundary. So this reads the files
+        // only to answer "would the compute side choke on these?" and throws the result away.
+        if let Err(e) = FsPolicy::resolve(&self.home, &self.project_dir) {
+            let msg = format!(
+                "husk cannot submit this job: {e}\n\
+                 That file decides what a job may read and write, and husk's compute-node \
+                 half re-reads it when the job starts — so the job would be refused there, \
+                 after queueing, with no output. Fix the JSON and resubmit.\n\
+                 Note this session is still running on the settings it read at startup; \
+                 restart husk once the file is valid if you meant the change to apply."
+            );
+            eprintln!("broker: refusing id={id} - settings no longer parse: {e}");
+            return Some((id.clone(), Response::rejected(&id, msg)));
+        }
         // Use the cage policy captured at startup from the TRUSTED project dir — NOT
         // re-resolved from the agent-controlled req.cwd (that let the agent author its
         // own cage by planting a nested .claude/settings.local.json). (F17)
@@ -829,6 +860,7 @@ mod tests {
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
             project_dir: PathBuf::from("/work"),
+            home: PathBuf::from("/nonexistent-home"),
         };
         broker.process_once().unwrap();
 
@@ -844,6 +876,58 @@ mod tests {
     // from the TRUSTED project dir), NOT from a settings file the agent plants under an
     // agent-chosen req.cwd. Here the broker's policy is empty; a settings.local.json under
     // the request's cwd tries to grant allowRead:/EVILMARKER — it must be ignored.
+    #[test]
+    fn settings_that_stopped_parsing_are_refused_at_submit_not_discovered_in_a_hung_job() {
+        // **Balfrin 2026-08-06.** A human closed vim on an empty buffer, leaving a zero-byte
+        // `.claude/settings.json`. This broker had already resolved its policy at startup, so
+        // it kept accepting submissions — while every job's step broker re-read that file on
+        // the compute node, failed closed, and left srun hanging to the walltime with no
+        // output. Five or six jobs, four nodes, four rank counts, one afternoon.
+        //
+        // The submitting side can see this coming, so it should say so while someone is still
+        // watching a terminal.
+        let dir = std::env::temp_dir().join(format!("husk-submitcheck-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+        fs::create_dir_all(dir.join("spool")).unwrap();
+        // Exactly what `:wq` on an empty buffer leaves behind.
+        fs::write(dir.join(".claude/settings.json"), b"").unwrap();
+
+        let broker = Broker {
+            spool: dir.join("spool"),
+            session: Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], account: None, limits: Default::default() },
+            dry_run: true,
+            // The cached policy is FINE — that is the whole point. It was captured before
+            // the file was broken, and it stays authoritative.
+            fs_policy: FsPolicy::default(),
+            submitted: Default::default(),
+            project_dir: dir.clone(),
+            home: PathBuf::from("/nonexistent-home"),
+        };
+        let req = r##"{"version":1,"id":"submitcheck","tool":"sbatch","submitted_at":"t","cwd":"/tmp","argv":["--partition=preemptible"],"script":{"source":"file","body":"#!/bin/bash\necho hi\n"},"job_args":[],"env":{}}"##;
+        fs::write(broker.spool.join("req-submitcheck.json"), req).unwrap();
+        broker.process_once().unwrap();
+
+        let resp: serde_json::Value = serde_json::from_slice(
+            &fs::read(broker.spool.join("resp-submitcheck.json")).expect("a response"),
+        )
+        .unwrap();
+        let text = resp.to_string();
+        assert_eq!(
+            resp["status"], "rejected",
+            "the submission must be REFUSED, not queued to die later: {text}"
+        );
+        assert!(
+            text.contains("settings.json"),
+            "and must name the file, or the agent cannot fix it: {text}"
+        );
+        assert!(
+            text.contains("compute"),
+            "and must explain WHERE it would have failed, since nothing is wrong here: {text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn cage_ignores_settings_under_agent_cwd() {
         let dir = scratch("f17-cwd");
@@ -868,6 +952,7 @@ mod tests {
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
             project_dir: dir.clone(), // the trusted root; `proj` is a subdirectory of it
+            home: PathBuf::from("/nonexistent-home"),
         };
         let req_json = format!(
             r##"{{"version":1,"id":"f17id","tool":"sbatch","submitted_at":"t","cwd":"{}","argv":["--partition=preemptible"],"script":{{"source":"file","body":"#!/bin/bash\necho hi\n"}},"job_args":[],"env":{{}}}}"##,
@@ -902,6 +987,7 @@ mod tests {
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
             project_dir: PathBuf::from("/work"),
+            home: PathBuf::from("/nonexistent-home"),
         };
         broker.submitted.borrow_mut().insert(4991406);
 
@@ -940,6 +1026,7 @@ mod tests {
             fs_policy: FsPolicy::default(),
             submitted: Default::default(),
             project_dir: PathBuf::from("/work"),
+            home: PathBuf::from("/nonexistent-home"),
         };
         // cutoff 0 => every orphan (any positive age) is stale and reclaimed.
         broker.gc(std::time::Duration::ZERO);

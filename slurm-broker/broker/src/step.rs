@@ -114,8 +114,45 @@ impl StepBroker {
 
     /// One pass: reap finished steps, then admit new requests. Never blocks on a step.
     pub fn tick(&mut self) -> std::io::Result<()> {
+        self.heartbeat();
         self.reap();
         self.scan()
+    }
+
+    /// The file name the stub watches to tell a dead broker from a running step.
+    pub const HEARTBEAT: &'static str = "broker.alive";
+
+    /// Say "still here", once per pass.
+    ///
+    /// The stub has exactly one wait, and it is unbounded — correctly, because a step
+    /// legitimately runs for hours and killing a simulation on a wall clock would be worse
+    /// than waiting. But that single wait conflates two questions: *has anyone picked this
+    /// up* (seconds) and *has the step finished* (hours). With no way to separate them, a
+    /// broker that is not running is indistinguishable from a job that is still working, and
+    /// srun hangs to the walltime saying nothing. That is what happened on Balfrin
+    /// 2026-08-06 when unparseable settings stopped the broker from starting at all.
+    ///
+    /// A heartbeat rather than a per-request ack, because an ack only answers the first
+    /// question. A broker that dies *mid-step* — reaped, killed, panicking — has already
+    /// acked, and the stub would wait forever again. One file answers both, and keeps no
+    /// per-request state to leak.
+    ///
+    /// Best-effort by design: a spool we cannot write is a real problem, but it is the
+    /// step launch's problem to report, not this function's to abort on.
+    fn heartbeat(&self) {
+        // Sub-second, because the staleness bound the stub applies must not be pinned to
+        // this file's resolution — with whole seconds, any limit near 1s is a coin flip.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let path = self.spool.join(Self::HEARTBEAT);
+        let tmp = self.spool.join(".broker.alive.tmp");
+        // Write-and-rename: the stub reads this concurrently, and a torn read would look
+        // like a stale broker — i.e. it would manufacture exactly the failure it detects.
+        if fs::write(&tmp, format!("{now:.3}\n")).is_ok() && fs::rename(&tmp, &path).is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
     }
 
     /// Start the job's cage holder if it is not running yet, and return its pid.
@@ -444,5 +481,47 @@ mod tests {
                 "{bad:?} must not be accepted as a step working directory"
             );
         }
+    }
+
+    #[test]
+    fn every_pass_leaves_a_fresh_heartbeat_the_stub_can_read() {
+        // The stub's only wait is unbounded, and correctly so — a step runs for hours. That
+        // makes "nobody is listening" and "still computing" the same observation, which is
+        // why srun hung to the walltime on Balfrin 2026-08-06 with the broker not running.
+        // This file is what tells them apart, so its FORMAT is load-bearing: the stub parses
+        // the contents as unix seconds, not the mtime.
+        let dir = std::env::temp_dir().join(format!("husk-hb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut sb = super::StepBroker::new(
+            dir.clone(),
+            settings::FsPolicy::default(),
+            crate::profile::Profile::SingleNode,
+            dir.to_string_lossy().to_string(),
+            true,
+        );
+        sb.tick().expect("a pass over an empty spool still beats");
+
+        let beat = std::fs::read_to_string(dir.join(super::StepBroker::HEARTBEAT))
+            .expect("every pass must leave a heartbeat, or a live broker reads as dead");
+        let secs: f64 = beat.trim().parse().expect("unix seconds, parseable by the stub");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        assert!(now - secs < 60.0, "the beat must be current: {secs} vs {now}");
+        assert!(
+            beat.contains('.'),
+            "sub-second precision is load-bearing for the stub's bound: {beat:?}"
+        );
+
+        // No temp file left beside it: the stub globs this directory looking for its own
+        // response, and litter in an agent-writable spool is its own small problem.
+        assert!(
+            !dir.join(".broker.alive.tmp").exists(),
+            "the write-and-rename temp must not survive"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

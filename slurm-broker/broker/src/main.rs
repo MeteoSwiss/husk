@@ -579,6 +579,7 @@ fn main() {
         fs_policy,
         submitted: Default::default(),
         project_dir: project_dir.clone(),
+        home: home.clone(),
     };
     eprintln!(
         "broker: watching {spool:?}{}",

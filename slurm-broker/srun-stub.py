@@ -32,6 +32,42 @@ from datetime import datetime, timezone
 PROTOCOL_VERSION = 1
 POLL_INTERVAL = 0.05  # seconds; also the output-streaming granularity
 
+# How stale the broker's heartbeat may get before we call it dead. The broker rewrites it
+# once per scan pass (default 100ms), so this is ~200x its period — long enough that a
+# loaded Lustre metadata server or a broker busy launching ranks is never mistaken for a
+# corpse, short enough that nobody sits through a walltime to learn the truth.
+#
+# Both are overridable, because a heavily loaded metadata server is a real reason to want
+# them looser and no operator should have to patch a stub to get that. Safe to expose to the
+# cage: the only thing an agent can do by moving them is make its OWN srun give up sooner or
+# hang longer. Neither reaches past the job, and a bad value falls back to the default.
+HEARTBEAT_NAME = "broker.alive"
+
+
+def _env_seconds(name, default):
+    try:
+        v = float(os.environ.get(name, ""))
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+HEARTBEAT_STALE_AFTER = _env_seconds("HUSK_HEARTBEAT_STALE_AFTER", 20.0)
+HEARTBEAT_FIRST_WAIT = _env_seconds("HUSK_HEARTBEAT_FIRST_WAIT", 30.0)
+
+
+def broker_last_seen(spool):
+    """Seconds since the step broker said it was alive, or None if it never has.
+
+    Reads the CONTENT rather than the mtime: both sides run on the same node, but the spool
+    is on a shared filesystem whose attribute caching is not something to bet a diagnosis on.
+    """
+    try:
+        with open(os.path.join(spool, HEARTBEAT_NAME)) as f:
+            return max(0.0, time.time() - float(f.read().strip()))
+    except (OSError, ValueError):
+        return None
+
 
 def die(msg, code=1, from_husk=False):
     """Fail, and be honest about WHO refused — see the same function in sbatch-stub.py.
@@ -130,15 +166,45 @@ def main():
     err_path = os.path.join(spool, f"err-{req_id}")
     write_atomic(req_path, json.dumps(request))
 
-    # No default timeout: a step legitimately runs for hours, and killing a
-    # simulation because a wall clock expired would be worse than waiting. The
-    # step ends when the broker says so (or when SLURM tears the job down).
+    # No timeout on the STEP: it legitimately runs for hours, and killing a simulation
+    # because a wall clock expired would be worse than waiting. The step ends when the
+    # broker says so (or when SLURM tears the job down).
+    #
+    # But "is the step still running" and "is anyone still listening" are different
+    # questions, and this loop used to ask only the first. With one unbounded wait, a broker
+    # that never started looks exactly like a six-hour simulation — so srun hung to the
+    # walltime, silently, five or six times in a row (Balfrin 2026-08-06; the broker had
+    # refused to start over an empty .claude/settings.json, and said so in a log nobody was
+    # reading). The heartbeat separates them: unbounded on the step, bounded on the broker.
     out_tail = Tail(out_path, sys.stdout)
     err_tail = Tail(err_path, sys.stderr)
+    waited = 0.0
     try:
         while not os.path.exists(resp_path):
             out_tail.pump()
             err_tail.pump()
+
+            age = broker_last_seen(spool)
+            if age is None:
+                # Never seen. Either the broker is still starting, or it is not coming.
+                waited += POLL_INTERVAL
+                if waited > HEARTBEAT_FIRST_WAIT:
+                    die("the step broker is not running, so this step cannot be launched.\n"
+                        "husk: husk is failing now rather than waiting for the job's "
+                        "walltime.\n"
+                        f"husk: no heartbeat appeared in {spool} within "
+                        f"{HEARTBEAT_FIRST_WAIT:.0f}s. The reason it did not start is in "
+                        "husk's job log ($HUSK_JOB_LOG, normally ~/.husk/log/job-<id>.log) "
+                        "-- the usual cause is a settings file that does not parse.",
+                        from_husk=True)
+            elif age > HEARTBEAT_STALE_AFTER:
+                die("the step broker stopped responding while this step was waiting.\n"
+                    f"husk: its last heartbeat was {age:.0f}s ago (limit "
+                    f"{HEARTBEAT_STALE_AFTER:.0f}s). Anything this step already wrote is "
+                    "above; the step itself may or may not have run.\n"
+                    "husk: see husk's job log ($HUSK_JOB_LOG) for what happened to it.",
+                    from_husk=True)
+
             time.sleep(POLL_INTERVAL)
         # The broker wrote the response after the step exited, but output written
         # just before that may still be unread — drain both before reporting.
