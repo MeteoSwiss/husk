@@ -1,0 +1,10 @@
+== srun /bin/true (rank=1 dyn exec; stub launch=env+python) ==
+true-exit=0
+ld.so errors (true):
+4
+== srun hostname ==
+host-exit=0
+ld.so errors (hostname):
+4
+== unique error lines (true) ==
+ERROR: ld.so: object '/nonexistent/husk-review-a2env-preload.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.

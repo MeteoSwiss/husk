@@ -1,0 +1,71 @@
+################ A4 PROBE #2 ################
+start_utc=20260804T153944Z host=nid001112 job=5007701
+WR=/scratch/mch/cmueller/husk-review/A4  SP=/scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701  OUTDIR(outside writable)=/scratch/mch/cmueller/husk-review
+
+===== [C1+C2] cwd bound WRITABLE into rank cage? + env/argv arrival =====
+  snap out-husk-review-A4-cwdbind-5007701 failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/out-husk-review-A4-cwdbind-5007701'
+  snap resp-husk-review-A4-cwdbind-5007701.json failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/resp-husk-review-A4-cwdbind-5007701.json'
+  snap err-husk-review-A4-cwdbind-5007701 failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/err-husk-review-A4-cwdbind-5007701'
+[C1] resp: {"version":1,"id":"husk-review-A4-cwdbind-5007701","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+[C1] STEP STDOUT:
+IN-STEP pwd=/scratch/mch/cmueller/husk-review
+IN-STEP whoami=27069
+husk-review-A4-argv0: ./husk-review-A4-cwdwrite-5007701: Read-only file system
+WRITE_FAIL rc=1 (cwd not writable)
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ls: cannot access './husk-review-A4-cwdwrite-5007701': No such file or directory
+MOUNTINFO for cwd:
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+1001 968 3274:979974 /cmueller/husk-review/A4 /scratch/mch/cmueller/husk-review/A4 rw,nosuid,nodev master:293
+1002 1001 0:98 / /scratch/mch/cmueller/husk-review/A4/.claude rw,nosuid,nodev,relatime
+1003 1001 0:99 / /scratch/mch/cmueller/husk-review/A4/.vscode rw,nosuid,nodev,relatime
+1004 1001 0:100 / /scratch/mch/cmueller/husk-review/A4/.idea rw,nosuid,nodev,relatime
+1005 1001 0:101 / /scratch/mch/cmueller/husk-review/A4/.git/hooks rw,nosuid,nodev,relatime
+1006 1001 3274:979974 /cmueller/husk-review/A4/.hg/hgrc /scratch/mch/cmueller/husk-review/A4/.hg/hgrc ro,nosuid,nodev master:293
+1007 1001 3274:979974 /cmueller/husk-review/A4/.Rprofile /scratch/mch/cmueller/husk-review/A4/.Rprofile ro,nosuid,nodev master:293
+ENV_ARRIVAL:
+LD_PRELOAD=/nonexistent-husk-review-A4.so
+OMP_NUM_THREADS=4
+ARGV_ARRIVAL: dollar0=husk-review-A4-argv0 rest=husk-review-A4-argvcanary
+
+[C1] STEP STDERR:
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+
+[C1] witness path /scratch/mch/cmueller/husk-review/husk-review-A4-cwdwrite-5007701 exists=False
+
+===== [C3] id traversal: does broker validate id, or fail on glued path? =====
+[C3:up1] dropped id='../husk-review-A4-up1b-5007701'
+[C3:slip] dropped id='x/../../husk-review-A4-slipb-5007701'
+[C3:abs] dropped id='/tmp/husk-review-A4-absb-5007701'
+  snap out-husk-review-A4-cwdbind-5007701 failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/out-husk-review-A4-cwdbind-5007701'
+  snap resp-husk-review-A4-cwdbind-5007701.json failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/resp-husk-review-A4-cwdbind-5007701.json'
+  snap err-husk-review-A4-cwdbind-5007701 failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/err-husk-review-A4-cwdbind-5007701'
+[C3] recursive spool listing (looking for resp-.. dirs / glued files):
+   /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/out-husk-review-A4-cwdbind-5007701
+   /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/resp-husk-review-A4-cwdbind-5007701.json
+   /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/err-husk-review-A4-cwdbind-5007701
+[C3] /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/resp-.. exists=False isdir=False
+[C3] /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/out-x exists=False isdir=False
+[C3] /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/resp-x exists=False isdir=False
+
+===== [C4] symlink following: broker read a req via a symlink to an out-of-spool file? =====
+[C4] created symlink /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007701/req-012c8f2e-67d9-4751-9324-6594e5b3d4c6.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-sympoison-5007701.json
+  snap out-husk-review-A4-cwdbind-5007701 failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/out-husk-review-A4-cwdbind-5007701'
+  snap resp-husk-review-A4-cwdbind-5007701.json failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/resp-husk-review-A4-cwdbind-5007701.json'
+  snap err-husk-review-A4-cwdbind-5007701 failed: [Errno 22] Invalid argument: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts2-5007701/err-husk-review-A4-cwdbind-5007701'
+[C4] SYMWIN resp present in spool = False
+[C4] broker did NOT process the symlinked request (refuses symlinks / O_NOFOLLOW, or ignored)
+[C4] any SYMWIN artifacts anywhere:
+
+===== final artifacts snapshot dir =====
+   ART/err-husk-review-A4-cwdbind-5007701 (1064 bytes)
+   ART/out-husk-review-A4-cwdbind-5007701 (1415 bytes)
+   ART/resp-husk-review-A4-cwdbind-5007701.json (118 bytes)
+END

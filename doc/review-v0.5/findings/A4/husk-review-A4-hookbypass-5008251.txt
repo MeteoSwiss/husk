@@ -1,0 +1,24 @@
+CAGE host=nid001001 jid=5008251
+=== mask state (compute cage) ===
+902 901 0:88 / /scratch/mch/cmueller/husk-review/A4/.claude rw,nosuid,nodev,relatime
+903 901 0:89 / /scratch/mch/cmueller/husk-review/A4/.vscode rw,nosuid,nodev,relatime
+904 901 0:90 / /scratch/mch/cmueller/husk-review/A4/.idea rw,nosuid,nodev,relatime
+905 901 0:91 / /scratch/mch/cmueller/husk-review/A4/.git/hooks rw,nosuid,nodev,relatime
+906 901 3274:979974 /cmueller/husk-review/A4/.git/config /scratch/mch/cmueller/husk-review/A4/.git/config ro,nosuid,nodev master:293
+=== positive control: write into masked .git/hooks (expect tmpfs throwaway, not host) ===
+  wrote into .git/hooks (tmpfs)
+  fstype at .git/hooks: tmpfs
+=== bypass A: direct rmdir .git/hooks ===
+rmdir: failed to remove '/scratch/mch/cmueller/husk-review/A4/.git/hooks': Device or resource busy
+  rmdir blocked (expected)
+=== bypass B: rename parent .git -> .gitX, does the child mask follow? ===
+  renamed .git -> .gitX
+  MASK FOLLOWED rename (.gitX/hooks still masked) -> bypass FAILED (defended)
+  renamed back .gitX -> .git
+=== cleanup any marker that reached a real host path ===
+=== final .git/hooks listing ===
+total 4
+drwxr-xr-x  2 cmueller s83   60 Aug  4 18:09 .
+drwxr-x---+ 3 cmueller s83 4096 Aug  4 17:58 ..
+-rw-r--r--  1 cmueller s83    0 Aug  4 18:09 husk-review-A4-maskcontrol-5008251
+DONE

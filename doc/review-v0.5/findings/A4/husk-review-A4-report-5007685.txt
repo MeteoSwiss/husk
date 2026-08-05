@@ -1,0 +1,486 @@
+################ A4 STEP-SPOOL PROBE ################
+start_utc=20260804T153152Z
+host=nid001112
+id=uid=27069(cmueller) gid=30382(s83) groups=30382(s83),65534(nobody)
+pwd=/scratch/mch/cmueller/husk-review/A4
+job=5007685
+
+===== [R1] husk env =====
+HUSK_JOB_LOG=/users/cmueller/.husk/log/job-5007685.log
+HUSK_NET_SOCK=/tmp/husk-27069-5007685/net.sock
+_HUSK_RESANDBOXED=1
+HUSK_REVIEW_ROOT=/scratch/mch/cmueller/husk-review
+HUSK_REVIEW_STATE=/users/cmueller/.husk-review-state
+HUSK_SESSION_LOG=/users/cmueller/.husk/log/husk-20260804-151335Z-78335.log
+HUSK_SLURM_PARTITION=short,pp-short
+HUSK_SLURM_SPOOL=/scratch/mch/cmueller/husk-review/A4/.husk-slurm-spool-78335
+HUSK_SOCAT=/users/cmueller/.local/bin/socat
+HUSK_STEP_SPOOL=/scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685
+HUSK_WRITABLE=/scratch/mch/cmueller/husk-review/A4
+SLURM_JOB_ACCOUNT=s83
+SLURM_JOB_CPUS_PER_NODE=128
+SLURM_JOB_END_TIME=1785859311
+SLURM_JOB_GID=30382
+SLURM_JOB_GPUS=0,1,2,3
+SLURM_JOB_ID=5007685
+SLURM_JOBID=5007685
+SLURM_JOB_NODELIST=nid001112
+SLURM_JOB_NUM_NODES=1
+SLURM_JOB_PARTITION=short
+SLURM_JOB_QOS=normal
+SLURM_JOB_START_TIME=1785857511
+SLURM_JOB_UID=27069
+SLURM_JOB_USER=cmueller
+SSH_AUTH_SOCK=/tmp/ssh-VYIbIGicE7/agent.145540
+
+===== [R2] srun resolves to (should be the in-cage stub) =====
+srun=/usr/bin/srun
+-rwxr-xr-x 1 cmueller s83 6706 Aug  4 10:59 /usr/bin/srun
+--- head of srun target ---
+#!/usr/bin/env python3
+# srun-stub.py — in-cage stub that shadows `srun` INSIDE a brokered job.
+#
+(saved srun target to artifacts)
+
+===== [R3] step spool state =====
+HUSK_STEP_SPOOL=/scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685
+total 8
+drwxr-x---+  2 cmueller s83 4096 Aug  4 17:31 .
+drwxr-x---+ 10 cmueller s83 4096 Aug  4 17:31 ..
+--- step spool owner file (if any) ---
+cat: /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/owner: No such file or directory
+
+===== [R4] writable-root control: cage must NOT be able to write outside HUSK_WRITABLE =====
+HUSK_WRITABLE=/scratch/mch/cmueller/husk-review/A4
+parent(outside writable)=/scratch/mch/cmueller/husk-review
+OK: cage cannot write parent (/scratch/mch/cmueller/husk-review/husk-review-A4-cage-control-5007685): touch: cannot touch '/scratch/mch/cmueller/husk-review/husk-review-A4-cage-control-5007685': Read-only file system
+=> any husk-review-A4-* file that appears under /scratch/mch/cmueller/husk-review was written by the UNCAGED broker.
+
+===== [R5] relevant mounts (step spool / socat / net.sock / writable) =====
+909 888 3051:894610 /users/cmueller/.local/bin/socat /tmp/husk-socat ro,nosuid,nodev master:268
+910 888 0:50 /tmp/husk-27069-5007685/net.sock /tmp/husk-27069-5007685/net.sock ro,nosuid,nodev,relatime master:3
+
+===== [R6] srun-stub wire format (grep the saved stub) =====
+29:import uuid
+55:    d = os.environ.get("HUSK_STEP_SPOOL")
+57:        die("no step spool configured (HUSK_STEP_SPOOL unset) — is this job brokered by husk?")
+98:    req_id = str(uuid.uuid4())
+102:        "id": req_id,
+105:        "cwd": os.getcwd(),
+106:        "argv": argv,
+124:        "env": dict(os.environ),
+127:    req_path = os.path.join(spool, f"req-{req_id}.json")
+128:    resp_path = os.path.join(spool, f"resp-{req_id}.json")
+129:    out_path = os.path.join(spool, f"out-{req_id}")
+130:    err_path = os.path.join(spool, f"err-{req_id}")
+131:    write_atomic(req_path, json.dumps(request))
+
+===== [A*] crafted-request attack battery =====
+--- [A1] request injection: drop a well-formed req the stub never sent ---
+dropped req-96d20395-6277-4f64-a5a1-e9a175ac37be.json (json id=husk-review-A4-inject-5007685)
+resp/marker files observed after inject: ['/scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/err-husk-review-A4-inject-5007685', '/scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/out-husk-review-A4-inject-5007685', '/scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/resp-husk-review-A4-inject-5007685.json', '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts-5007685', '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-probe.sh', '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-report-5007685.txt']
+   /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/err-husk-review-A4-inject-5007685 => 
+   /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/out-husk-review-A4-inject-5007685 => 
+   /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/resp-husk-review-A4-inject-5007685.json => {"version":1,"id":"husk-review-A4-inject-5007685","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+   /scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts-5007685 (unreadable: [Errno 21] Is a directory: '/scratch/mch/cmueller/husk-review/A4/husk-review-A4-artifacts-5007685')
+   /scratch/mch/cmueller/husk-review/A4/husk-review-A4-probe.sh => #!/bin/bash
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=00:05:00
+#SBATCH --job-name=husk-review-A4
+# A4 step-spool probe. Runs INSIDE the compute cage. Reads srun-stub.py to learn the
+# step wire format, then exercises the running step-broker by dropping crafted req files
+# into HUSK_STEP_SPOOL and observing where it writes resp/out/err. Stops at PoC.
+set +e
+WR="${HUSK_WRITABLE:-$PWD}"
+JID
+   /scratch/mch/cmueller/husk-review/A4/husk-review-A4-report-5007685.txt => ################ A4 STEP-SPOOL PROBE ################
+start_utc=20260804T153152Z
+host=nid001112
+id=uid=27069(cmueller) gid=30382(s83) groups=30382(s83),65534(nobody)
+pwd=/scratch/mch/cmueller/husk-review/A4
+job=5007685
+
+===== [R1] husk env =====
+HUSK_JOB_LOG=/users/cmueller/.husk/log/job-5007685.log
+HUSK_NET_SOCK=/tmp/husk-27069-5007685/net.sock
+_HUSK_RESANDBOXED=1
+HUSK_REVIEW_ROOT=/scratch/mch/cm
+
+--- [A2] F1 id-as-path traversal (json id differs from filename) ---
+[A2:up1] dropped req-3c8e7176-6b5b-4c9c-abae-f0e839f14b6d.json with json id='../husk-review-A4-up1-5007685'
+[A2:up2] dropped req-80400392-ba2d-4166-8462-5e21d9318f89.json with json id='../../husk-review-A4-up2-5007685'
+[A2:abs] dropped req-682830e3-fada-4585-b8be-a0b6451e1730.json with json id='/scratch/mch/cmueller/husk-review/husk-review-A4-abs-5007685'
+[A2:slip] dropped req-89dfefc7-ba48-4e30-9ca6-259dfdfdf74d.json with json id='x/../../husk-review-A4-slip-5007685'
+[A2:up1] artifacts found: NONE
+[A2:up2] artifacts found: NONE
+[A2:abs] artifacts found: NONE
+[A2:slip] artifacts found: NONE
+
+--- [A3] cwd validation (is_workdir_allowed) ---
+[A3:root] dropped cwd='/' id=husk-review-A4-cwd-root-5007685
+[A3:etc] dropped cwd='/etc' id=husk-review-A4-cwd-etc-5007685
+[A3:users] dropped cwd='/users/cmueller' id=husk-review-A4-cwd-users-5007685
+[A3:up] dropped cwd='/scratch/mch/cmueller/husk-review/A4/../..' id=husk-review-A4-cwd-up-5007685
+[A3:tmp] dropped cwd='/tmp' id=husk-review-A4-cwd-tmp-5007685
+[A3:masked_home] dropped cwd='/users/cmueller' id=husk-review-A4-cwd-masked_home-5007685
+[A3:good] dropped cwd='/scratch/mch/cmueller/husk-review/A4' id=husk-review-A4-cwd-good-5007685
+[A3] resp-husk-review-A4-cwd-etc-5007685.json => {"version":1,"id":"husk-review-A4-cwd-etc-5007685","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+[A3] resp-husk-review-A4-cwd-good-5007685.json => {"version":1,"id":"husk-review-A4-cwd-good-5007685","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+[A3] resp-husk-review-A4-cwd-masked_home-5007685.json => {"version":1,"id":"husk-review-A4-cwd-masked_home-5007685","status":"rejected","job_id":null,"message":"the step's working directory \"/users/cmueller\" is not allowed (it must be an absolute path, not '/', and not under a hidden home like /users)","exit_code":1,"stdout":""}
+[A3] resp-husk-review-A4-cwd-root-5007685.json => {"version":1,"id":"husk-review-A4-cwd-root-5007685","status":"rejected","job_id":null,"message":"the step's working directory \"/\" is not allowed (it must be an absolute path, not '/', and not under a hidden home like /users)","exit_code":1,"stdout":""}
+[A3] resp-husk-review-A4-cwd-tmp-5007685.json => {"version":1,"id":"husk-review-A4-cwd-tmp-5007685","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+[A3] resp-husk-review-A4-cwd-up-5007685.json => {"version":1,"id":"husk-review-A4-cwd-up-5007685","status":"rejected","job_id":null,"message":"the step's working directory \"/scratch/mch/cmueller/husk-review/A4/../..\" is not allowed (it must be an absolute path, not '/', and not under a hidden home like /users)","exit_code":1,"stdout":""}
+[A3] resp-husk-review-A4-cwd-users-5007685.json => {"version":1,"id":"husk-review-A4-cwd-users-5007685","status":"rejected","job_id":null,"message":"the step's working directory \"/users/cmueller\" is not allowed (it must be an absolute path, not '/', and not under a hidden home like /users)","exit_code":1,"stdout":""}
+
+--- [A4] argv/env passthrough marker ---
+[A4] dropped argv/env canary id=husk-review-A4-argenv-5007685 (confirmation needs broker log)
+
+--- [A6] cleanup persistence: leave a non-req file + subdir in the spool ---
+[A6] created /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/husk-review-A4-KEEP-5007685 and /scratch/mch/cmueller/husk-review/A4/.husk-step-spool-5007685/husk-review-A4-KEEPDIR-5007685 ; spool should FAIL rmdir at job end and persist
+
+--- [A7] egress socket dir / socat (observation; subversion is A9) ---
+[A7] net dir /tmp/husk-27069-5007685 :
+   mode=0o40700 uid=27069 (mine=27069)
+   listing: ['net.sock']
+   /tmp/husk-socat mode=0o100755 uid=27069
+   /tmp/husk-27069-5007685/net.sock mode=0o140600 uid=27069
+[A7] UNEXPECTED: cage could write into /tmp/husk-27069-5007685
+
+===== [A5] symlink TOCTOU race (bash, timed) =====
+[A5] 300 swap iterations in .915525124s
+[A5] RACEWIN marker present? (would prove broker followed a symlink out of spool):
+   none — race not won this run
+[A5] leftover race req files in spool:
+300
+
+===== [Z] final spool state =====
+total 1280
+drwxr-x---+  3 cmueller s83 20480 Aug  4 17:32 .
+drwxr-x---+ 10 cmueller s83  4096 Aug  4 17:32 ..
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 err-husk-review-A4-argenv-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 err-husk-review-A4-cwd-etc-5007685
+-rw-r-----+  1 cmueller s83   214 Aug  4 17:32 err-husk-review-A4-cwd-good-5007685
+-rw-r-----+  1 cmueller s83   130 Aug  4 17:32 err-husk-review-A4-cwd-tmp-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:31 err-husk-review-A4-inject-5007685
+-rw-r-----+  1 cmueller s83   298 Aug  4 17:32 err-husk-review-A4-racegood
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 husk-review-A4-KEEP-5007685
+drwxr-x---+  2 cmueller s83  4096 Aug  4 17:32 husk-review-A4-KEEPDIR-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 out-husk-review-A4-argenv-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 out-husk-review-A4-cwd-etc-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 out-husk-review-A4-cwd-good-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 out-husk-review-A4-cwd-tmp-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:31 out-husk-review-A4-inject-5007685
+-rw-r-----+  1 cmueller s83     0 Aug  4 17:32 out-husk-review-A4-racegood
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-100.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-101.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-102.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-103.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-104.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-105.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-106.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-107.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-108.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-109.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-10.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-110.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-111.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-112.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-113.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-114.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-115.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-116.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-117.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-118.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-119.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-11.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-120.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-121.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-122.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-123.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-124.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-125.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-126.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-127.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-128.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-129.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-12.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-130.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-131.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-132.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-133.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-134.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-135.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-136.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-137.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-138.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-139.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-13.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-140.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-141.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-142.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-143.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-144.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-145.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-146.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-147.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-148.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-149.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-14.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-150.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-151.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-152.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-153.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-154.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-155.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-156.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-157.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-158.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-159.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-15.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-160.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-161.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-162.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-163.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-164.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-165.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-166.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-167.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-168.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-169.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-16.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-170.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-171.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-172.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-173.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-174.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-175.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-176.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-177.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-178.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-179.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-17.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-180.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-181.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-182.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-183.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-184.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-185.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-186.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-187.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-188.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-189.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-18.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-190.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-191.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-192.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-193.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-194.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-195.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-196.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-197.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-198.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-199.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-19.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-1.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-200.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-201.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-202.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-203.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-204.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-205.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-206.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-207.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-208.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-209.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-20.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-210.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-211.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-212.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-213.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-214.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-215.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-216.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-217.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-218.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-219.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-21.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-220.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-221.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-222.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-223.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-224.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-225.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-226.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-227.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-228.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-229.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-22.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-230.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-231.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-232.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-233.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-234.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-235.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-236.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-237.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-238.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-239.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-23.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-240.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-241.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-242.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-243.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-244.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-245.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-246.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-247.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-248.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-249.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-24.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-250.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-251.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-252.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-253.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-254.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-255.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-256.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-257.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-258.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-259.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-25.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-260.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-261.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-262.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-263.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-264.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-265.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-266.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-267.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-268.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-269.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-26.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-270.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-271.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-272.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-273.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-274.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-275.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-276.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-277.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-278.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-279.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-27.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-280.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-281.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-282.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-283.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-284.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-285.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-286.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-287.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-288.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-289.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-28.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-290.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-291.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-292.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-293.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-294.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-295.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-296.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-297.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-298.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-299.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-29.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-2.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-300.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-30.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-31.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-32.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-33.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-34.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-35.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-36.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-37.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-38.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-39.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-3.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-40.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-41.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-42.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-43.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-44.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-45.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-46.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-47.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-48.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-49.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-4.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-50.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-51.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-52.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-53.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-54.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-55.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-56.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-57.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-58.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-59.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-5.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-60.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-61.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-62.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-63.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-64.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-65.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-66.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-67.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-68.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-69.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-6.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-70.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-71.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-72.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-73.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-74.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-75.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-76.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-77.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-78.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-79.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-7.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-80.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-81.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-82.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-83.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-84.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-85.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-86.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-87.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-88.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-89.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-8.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-90.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-91.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-92.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-93.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-94.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-95.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-96.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-97.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-98.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-99.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+lrwxrwxrwx   1 cmueller s83    71 Aug  4 17:32 req-race-9.json -> /scratch/mch/cmueller/husk-review/A4/husk-review-A4-poison-5007685.json
+-rw-r-----+  1 cmueller s83   117 Aug  4 17:32 resp-husk-review-A4-argenv-5007685.json
+-rw-r-----+  1 cmueller s83   118 Aug  4 17:32 resp-husk-review-A4-cwd-etc-5007685.json
+-rw-r-----+  1 cmueller s83   119 Aug  4 17:32 resp-husk-review-A4-cwd-good-5007685.json
+-rw-r-----+  1 cmueller s83   275 Aug  4 17:32 resp-husk-review-A4-cwd-masked_home-5007685.json
+-rw-r-----+  1 cmueller s83   254 Aug  4 17:32 resp-husk-review-A4-cwd-root-5007685.json
+-rw-r-----+  1 cmueller s83   118 Aug  4 17:32 resp-husk-review-A4-cwd-tmp-5007685.json
+-rw-r-----+  1 cmueller s83   293 Aug  4 17:32 resp-husk-review-A4-cwd-up-5007685.json
+-rw-r-----+  1 cmueller s83   269 Aug  4 17:32 resp-husk-review-A4-cwd-users-5007685.json
+-rw-r-----+  1 cmueller s83   117 Aug  4 17:31 resp-husk-review-A4-inject-5007685.json
+-rw-r-----+  1 cmueller s83   111 Aug  4 17:32 resp-husk-review-A4-racegood.json
+end_utc=20260804T153224Z
+################ A4 PROBE END ################

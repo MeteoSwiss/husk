@@ -1,0 +1,26 @@
+== BODY: attempt munge divert via job-made symlink ==
+/run writable? test:
+  /run not writable
+before: readlink-f /run/munge = [/run/munge]
+attempt replace /run/munge with symlink -> /tmp/husk-review-a2env-maskdir:
+rm: cannot remove '/run/munge': Read-only file system
+  rm /run/munge FAILED
+  symlink created
+after: readlink-f /run/munge = [/run/munge]
+after: readlink-f /var/run/munge = [/run/munge]
+== BODY: srun into rank to observe mask placement ==
+== RANK: munge/mask view ==
+rank uid=27069 host=nid001001
+ls /run/munge:
+total 0
+drwxr-xr-x  2 cmueller s83      40 Aug  4 14:45 .
+drwxr-xr-x 39 nobody   nobody 1120 Aug  4 14:30 ..
+readlink-f /run/munge: [/run/munge]
+mountinfo munge/mask lines:
+1008 943 0:102 / /run/munge rw,nosuid,nodev,relatime - tmpfs tmpfs rw,mode=755,uid=27069,gid=30382,inode64
+tmpfs mounts total:
+38
+== RANK END ==
+srun-exit=0
+== srun stderr (trusted rank-wrapper sh / bwrap) ==
+== BODY END ==

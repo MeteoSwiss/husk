@@ -1,0 +1,256 @@
+=== A2 HARNESS BEGIN ===
+host=nid001009
+id=uid=27069(cmueller) gid=30382(s83) groups=30382(s83),65534(nobody)
+argv0=[/scratch/mch/cmueller/husk-review/A2/.husk-body-179e42c9-b17d-4209-8df3-e33aee8a7f89.sh]
+numargs=0
+--- selected identity/exec-relevant vars (values shown; these are not secrets) ---
+PATH=[/users/cmueller/.cargo/bin:/users/cmueller/.local/bin:/scratch/mch/jenkins/fieldextra/balfrin/tools:/users/cmueller/.local/bin:/users/cmueller/bin:/usr/local/bin:/usr/bin:/bin:/usr/lpp/mmfs/bin:/usr/lib/mit/bin:/oprusers/osm/bin:/oprusers/osm/opr.aare/LMscripts:/oprusers/osm/opr.inn/bin]
+LD_PRELOAD=<unset>
+LD_LIBRARY_PATH=<unset>
+LD_AUDIT=<unset>
+PYTHONPATH=<unset>
+PERL5LIB=<unset>
+BASH_ENV=<unset>
+ENV=<unset>
+IFS=[ 	
+]
+SHELL=[/usr/local/bin/bash]
+TMPDIR=[/tmp]
+HOME=[/users/cmueller]
+USER=[cmueller]
+--- HUSKREV_* canaries (values shown) ---
+--- ALL env NAMES (values redacted) ---
+_
+}
+all_proxy
+ALL_PROXY
+APPS
+BASH_FUNC_module%%
+CARGO_HOME
+CLUSTER_NAME
+COLORTERM
+CPU
+CSHEDIT
+CUDA_VISIBLE_DEVICES
+DBUS_SESSION_BUS_ADDRESS
+DISPLAY
+ENVIRONMENT
+G_BROKEN_FILENAMES
+G_FILENAME_ENCODING
+GPG_TTY
+GPU_DEVICE_ORDINAL
+GT4PY_BUILD_JOBS
+GT4PY_UNSTRUCTURED_HORIZONTAL_HAS_UNIT_STRIDE
+HISTSIZE
+HOME
+HOST
+HOSTNAME
+HOSTTYPE
+http_proxy
+HTTP_PROXY
+https_proxy
+HTTPS_PROXY
+HUSK_JOB_LOG
+HUSK_NET_SOCK
+_HUSK_RESANDBOXED
+HUSK_REVIEW_ROOT
+HUSK_REVIEW_STATE
+HUSK_SESSION_LOG
+HUSK_SLURM_PARTITION
+HUSK_SLURM_SPOOL
+HUSK_SOCAT
+HUSK_STEP_SPOOL
+HUSK_WRITABLE
+INFRANAME
+JAVA_BINDIR
+JAVA_HOME
+JDK_HOME
+JRE_HOME
+LANG
+LC_ADDRESS
+LC_IDENTIFICATION
+LC_MEASUREMENT
+LC_MONETARY
+LC_NAME
+LC_NUMERIC
+LC_PAPER
+LC_TELEPHONE
+LC_TIME
+LESS
+LESS_ADVANCED_PREPROCESSOR
+LESSCLOSE
+LESSKEY
+LESSOPEN
+LIBGL_DEBUG
+LMOD_SYSTEM_NAME
+LM_SETUP_DIR
+LOADEDMODULES
+LOGNAME
+LS_COLORS
+LUSTRE_JOB_ID
+MACHTYPE
+MAIL
+MANPATH
+MINICOM
+MODULEPATH
+MODULESHOME
+MODULE_VERSION
+MODULE_VERSION_STACK
+MORE
+no_proxy
+NO_PROXY
+OLDPWD
+OPR_APPS_DIR
+OPR_BIN
+OPR_CONDA_DIR
+OPR_ENV_DIR
+OPR_HOME
+OPR_MODULEFILES
+OPR_OPR_DIR
+OPR_SETUP_DIR
+OPR_SRC_DIR
+OPR_USER
+OSTYPE
+PAGER
+PATH
+PROFILEREAD
+PROJECT
+PWD
+ROCR_VISIBLE_DEVICES
+RUSTUP_HOME
+SCRATCH
+SDK_HOME
+SHELL
+SHLVL
+SLURM_CLUSTER_NAME
+SLURM_CONF
+SLURM_CPUS_ON_NODE
+SLURMD_NODENAME
+SLURM_GPUS_ON_NODE
+SLURM_GTIDS
+SLURM_JOB_ACCOUNT
+SLURM_JOB_CPUS_PER_NODE
+SLURM_JOB_END_TIME
+SLURM_JOB_GID
+SLURM_JOB_GPUS
+SLURM_JOB_ID
+SLURM_JOBID
+SLURM_JOB_NODELIST
+SLURM_JOB_NUM_NODES
+SLURM_JOB_PARTITION
+SLURM_JOB_QOS
+SLURM_JOB_START_TIME
+SLURM_JOB_UID
+SLURM_JOB_USER
+SLURM_LOCALID
+SLURM_NNODES
+SLURM_NODE_ALIASES
+SLURM_NODEID
+SLURM_NODELIST
+SLURM_NPROCS
+SLURM_NTASKS
+SLURM_PRIO_PROCESS
+SLURM_PROCID
+SLURM_SCRIPT_CONTEXT
+SLURM_SUBMIT_DIR
+SLURM_SUBMIT_HOST
+SLURM_TASK_PID
+SLURM_TASKS_PER_NODE
+SLURM_TOPOLOGY_ADDR
+SLURM_TOPOLOGY_ADDR_PATTERN
+SLURM_WORKING_CLUSTER
+SSH_AUTH_SOCK
+SSH_CLIENT
+SSH_CONNECTION
+SSH_SENDS_LOCALE
+SSH_TTY
+STORE
+TERM
+TMPDIR
+USER
+USER_ENV_IMAGE
+USER_ENV_ROOT
+WINDOWMANAGER
+XAUTHLOCALHOSTNAME
+XDG_CONFIG_DIRS
+XDG_DATA_DIRS
+XDG_SESSION_CLASS
+XDG_SESSION_TYPE
+XKEYSYMDB
+XNLSPATH
+ZE_AFFINITY_MASK
+--- proxy-var NAMES present (values redacted) ---
+all_proxy
+ALL_PROXY
+http_proxy
+HTTP_PROXY
+https_proxy
+HTTPS_PROXY
+LESSKEY
+no_proxy
+NO_PROXY
+XKEYSYMDB
+--- mountinfo (first 60) ---
+824 602 0:47 / / ro,nosuid,nodev,relatime master:1 - overlay none rw,lowerdir=/new_root/lower,upperdir=/new_root/upper/data,workdir=/new_root/upper/work
+825 824 0:50 / /cray/tmp ro,nosuid,nodev,relatime master:2 - tmpfs tmpfs rw,size=448455592k,mode=755,inode64
+826 824 0:50 /tmp /tmp ro,nosuid,nodev,relatime master:3 - tmpfs tmpfs rw,size=448455592k,mode=755,inode64
+827 824 0:50 /var-tmp /var/tmp ro,nosuid,nodev,relatime master:4 - tmpfs tmpfs rw,size=448455592k,mode=755,inode64
+828 824 0:5 / /dev ro,nosuid,nodev,relatime master:5 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=1048576,mode=755,inode64
+829 828 0:50 /dev-shm /dev/shm ro,nosuid,nodev,relatime master:6 - tmpfs tmpfs rw,size=448455592k,mode=755,inode64
+830 828 0:51 / /dev/pts ro,nosuid,nodev,noexec,relatime master:7 - devpts devpts rw,gid=5,mode=620,ptmxmode=000
+831 828 0:53 / /dev/hugepages ro,nosuid,nodev,relatime master:24 - hugetlbfs hugetlbfs rw,pagesize=2M
+832 828 0:29 / /dev/mqueue ro,nosuid,nodev,noexec,relatime master:25 - mqueue mqueue rw
+833 824 0:46 / /.rootfs_upper_ro ro,nosuid,nodev,relatime master:8 - tmpfs upper-tmpfs rw,inode64
+834 824 7:0 / /.rootfs_lower_ro ro,nosuid,nodev,relatime master:9 - squashfs /dev/loop0 ro,errors=continue
+835 824 0:31 / /sys ro,nosuid,nodev,noexec,relatime master:10 - sysfs sysfs rw
+836 835 0:6 / /sys/kernel/security ro,nosuid,nodev,noexec,relatime master:11 - securityfs securityfs rw
+837 835 0:35 / /sys/fs/cgroup ro,nosuid,nodev,noexec,relatime master:12 - cgroup2 cgroup2 rw
+838 835 0:36 / /sys/fs/pstore ro,nosuid,nodev,noexec,relatime master:13 - pstore pstore rw
+839 835 0:37 / /sys/firmware/efi/efivars ro,nosuid,nodev,noexec,relatime master:14 - efivarfs efivarfs rw
+840 835 0:38 / /sys/fs/bpf ro,nosuid,nodev,noexec,relatime master:15 - bpf bpf rw,mode=700
+841 835 0:7 / /sys/kernel/debug ro,nosuid,nodev,relatime master:16 - debugfs debugfs rw
+842 841 0:12 / /sys/kernel/debug/tracing rw,relatime master:111 - tracefs tracefs rw
+843 835 0:12 / /sys/kernel/tracing ro,nosuid,nodev,noexec,relatime master:26 - tracefs tracefs rw
+844 835 0:56 / /sys/fs/fuse/connections ro,nosuid,nodev,noexec,relatime master:29 - fusectl fusectl rw
+845 835 0:65 / /sys/kernel/config ro,nosuid,nodev,noexec,relatime master:38 - configfs configfs rw
+846 824 0:34 / /run ro,nosuid,nodev master:17 - tmpfs tmpfs rw,size=105518964k,nr_inodes=819200,mode=755,inode64
+847 846 0:41 / /run/cxi/cxi0 ro,nosuid,nodev,relatime master:18 - fuse /dev/fuse rw,user_id=0,group_id=0,allow_other
+848 846 0:40 / /run/cxi/cxi2 ro,nosuid,nodev,relatime master:19 - fuse /dev/fuse rw,user_id=0,group_id=0,allow_other
+849 846 0:42 / /run/cxi/cxi3 ro,nosuid,nodev,relatime master:20 - fuse /dev/fuse rw,user_id=0,group_id=0,allow_other
+850 846 0:43 / /run/cxi/cxi1 ro,nosuid,nodev,relatime master:21 - fuse /dev/fuse rw,user_id=0,group_id=0,allow_other
+851 846 0:58 / /run/credentials/systemd-sysusers.service ro,nosuid,nodev,noexec,relatime master:31 - ramfs none rw,mode=700
+852 846 0:72 / /run/user/0 ro,nosuid,nodev,relatime master:237 - tmpfs tmpfs rw,size=52759480k,nr_inodes=13189870,mode=700,inode64
+853 824 0:30 / /proc ro,nosuid,nodev,noexec,relatime master:22 - proc proc rw
+854 853 0:52 / /proc/sys/fs/binfmt_misc ro,nosuid,nodev,relatime master:23 - autofs systemd-1 rw,fd=30,pgrp=0,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=76824
+855 824 0:54 / /var/lib/hugetlbfs/global/pagesize-1073741824 ro,nosuid,nodev,relatime master:27 - hugetlbfs none rw,pagesize=1024M
+856 824 0:55 / /var/lib/hugetlbfs/global/pagesize-134217728 ro,nosuid,nodev,relatime master:28 - hugetlbfs none rw,pagesize=128M
+857 824 0:57 / /var/lib/hugetlbfs/global/pagesize-16777216 ro,nosuid,nodev,relatime master:30 - hugetlbfs none rw,pagesize=16M
+858 824 0:59 / /var/lib/hugetlbfs/global/pagesize-2097152 ro,nosuid,nodev,relatime master:32 - hugetlbfs none rw,pagesize=2M
+859 824 0:60 / /var/lib/hugetlbfs/global/pagesize-2147483648 ro,nosuid,nodev,relatime master:33 - hugetlbfs none rw,pagesize=2048M
+860 824 0:61 / /var/lib/hugetlbfs/global/pagesize-268435456 ro,nosuid,nodev,relatime master:34 - hugetlbfs none rw,pagesize=256M
+861 824 0:62 / /var/lib/hugetlbfs/global/pagesize-33554432 ro,nosuid,nodev,relatime master:35 - hugetlbfs none rw,pagesize=32M
+862 824 0:63 / /var/lib/hugetlbfs/global/pagesize-4194304 ro,nosuid,nodev,relatime master:36 - hugetlbfs none rw,pagesize=4M
+863 824 0:64 / /var/lib/hugetlbfs/global/pagesize-536870912 ro,nosuid,nodev,relatime master:37 - hugetlbfs none rw,pagesize=512M
+864 824 0:66 / /var/lib/hugetlbfs/global/pagesize-67108864 ro,nosuid,nodev,relatime master:39 - hugetlbfs none rw,pagesize=64M
+865 824 0:67 / /var/lib/hugetlbfs/global/pagesize-8388608 ro,nosuid,nodev,relatime master:40 - hugetlbfs none rw,pagesize=8M
+866 824 3051:894610 / /scratch/d1000 ro,nosuid,nodev master:268 - lustre 148.187.99.238@tcp1:148.187.99.239@tcp1:/mchstor1 rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+867 824 3274:979974 / /store_new/mch ro,nosuid,nodev master:273 - lustre 172.28.1.2@tcp,172.28.1.3@tcp:172.28.1.4@tcp,172.28.1.5@tcp:/capstor/store/mch rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+868 824 3274:979974 / /store/mch ro,nosuid,nodev master:278 - lustre 172.28.1.2@tcp,172.28.1.3@tcp:172.28.1.4@tcp,172.28.1.5@tcp:/capstor/store/mch/mch rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+869 824 3274:979974 / /archive/mch ro,nosuid,nodev master:283 - lustre 172.28.1.2@tcp,172.28.1.3@tcp:172.28.1.4@tcp,172.28.1.5@tcp:/capstor/archive/mch rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+870 824 3274:979974 / /capstor/store/cscs/c2sm ro,nosuid,nodev master:288 - lustre 172.28.1.2@tcp,172.28.1.3@tcp:172.28.1.4@tcp,172.28.1.5@tcp:/capstor/store/cscs/c2sm rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+871 824 3274:979974 / /scratch/mch ro,nosuid,nodev master:293 - lustre 172.28.1.2@tcp,172.28.1.3@tcp:172.28.1.4@tcp,172.28.1.5@tcp:/capstor/scratch/mch rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+872 824 3051:894610 /users /users ro,nosuid,nodev master:268 - lustre 148.187.99.238@tcp1:148.187.99.239@tcp1:/mchstor1 rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+873 824 3051:894610 /opr /opr ro,nosuid,nodev master:268 - lustre 148.187.99.238@tcp1:148.187.99.239@tcp1:/mchstor1 rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+874 824 3051:894610 /apps /apps ro,nosuid,nodev master:268 - lustre 148.187.99.238@tcp1:148.187.99.239@tcp1:/mchstor1 rw,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+875 824 7:1 / /mch-environment/v6 ro,nosuid,nodev,relatime master:310 - squashfs /dev/loop1 ro,errors=continue
+876 824 7:2 / /mch-environment/v7 ro,nosuid,nodev,relatime master:315 - squashfs /dev/loop2 ro,errors=continue
+877 824 7:3 / /mch-environment/v8 ro,nosuid,nodev,relatime master:320 - squashfs /dev/loop3 ro,errors=continue
+878 824 3274:979974 / /capstor/store/cscs/director2/d_weather ro,nosuid,nodev master:356 - lustre 172.28.1.2@tcp,172.28.1.3@tcp:172.28.1.4@tcp,172.28.1.5@tcp:/capstor/store/cscs/director2/d_weather ro,checksum,flock,nouser_xattr,lruresize,lazystatfs,nouser_fid2path,verbose,encrypt
+879 828 0:82 / /dev rw,nosuid,nodev,relatime - tmpfs tmpfs rw,mode=755,uid=27069,gid=30382,inode64
+880 879 0:5 /null /dev/null rw,nosuid,relatime master:5 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=1048576,mode=755,inode64
+881 879 0:5 /zero /dev/zero rw,nosuid,relatime master:5 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=1048576,mode=755,inode64
+882 879 0:5 /full /dev/full rw,nosuid,relatime master:5 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=1048576,mode=755,inode64
+883 879 0:5 /random /dev/random rw,nosuid,relatime master:5 - devtmpfs devtmpfs rw,size=4096k,nr_inodes=1048576,mode=755,inode64
+--- am I caged? cwd + write test ---
+cwd=/scratch/mch/cmueller/husk-review/A2
+=== A2 HARNESS END ===

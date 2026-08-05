@@ -1,0 +1,11 @@
+guard AAA count=520; guard HUSK_WRITABLE set? [YES]
+@@MASK2_BEGIN
+AAA count in rank=512
+HUSK_WRITABLE=<unset> (mask held)
+CUDA_VISIBLE_DEVICES=<unset> (mask held)
+GPU_DEVICE_ORDINAL=<unset> (mask held)
+ROCR_VISIBLE_DEVICES=<unset> (mask held)
+ZE_AFFINITY_MASK=<unset> (mask held)
+SLURM_NODE_ALIASES=<unset> (mask held)
+@@MASK2_END
+srun-exit=0

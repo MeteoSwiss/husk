@@ -2,6 +2,11 @@
 
 Everything at LOW, INFO, or by-design across all three review clusters, in one place.
 
+> **2026-08-05 (second pass): the EIGHT real code fixes in this list are DONE** — A3 scan,
+> `_HUSK_` filter, B1-F6/F7/F8, B3-F8, B4-F7, B4-F8 (partial, see its row). Commit `79cd790`.
+> What remains here is the doc/comment pass (~12 items), the three verify-first MED-LOWs, and
+> the C structural set, which is v0.6 roadmap rather than a bug queue.
+>
 > **2026-08-05: two entries here were closed for free by the above-LOW fix round.**
 > **A7-1** shipped with the A1 CRITICAL as designed (one host-fact-free refusal). **B6-F6**
 > (`scancel`/queries run with the broker's env unfiltered) is closed by the submission-env
@@ -23,8 +28,8 @@ acting).
 | ID | Sev | One line | Fix / note |
 |---|---|---|---|
 | ~~A7-1~~ | ~~LOW (MED as A1 multiplier)~~ | ~~confine refusal message is a host-path existence oracle~~ | **DONE 2026-08-05 (`653bb2c`)** — shipped with the A1 fix as designed: one host-fact-free refusal, detail to broker stderr under `$HOME` |
-| A3 scan | LOW usability | `#SBATCH` scan is whole-file/indented/last-wins → false-rejects heredoc-generated inner scripts | scan only the leading comment block, col-0, stop at first non-comment line (`sbatch.rs:491`) |
-| `_HUSK_` filter | LOW landmine (inert) | reserved-prefix filter catches `HUSK_` but not `_HUSK_`; inert today (nothing on the rank path reads `_HUSK_RESANDBOXED`) | reserve `_HUSK_` (`rank.rs:35`) before some future code reads a `_HUSK_` value |
+| ~~A3 scan~~ | ~~LOW usability~~ | `#SBATCH` scan is whole-file/indented/last-wins → false-rejects heredoc-generated inner scripts | **DONE `79cd790`** — header-only scan + a note for directives husk did not read |
+| ~~`_HUSK_` filter~~ | ~~LOW landmine (inert)~~ | reserved-prefix filter catches `HUSK_` but not `_HUSK_`; inert today (nothing on the rank path reads `_HUSK_RESANDBOXED`) | **DONE `79cd790`** |
 | Port-less tunnel (A9 O2) | LOW-MED, by-design | a port-less allowlist entry = generic all-ports TCP tunnel to that host (scheduler ports still refused, so no AV8) | prefer `host:port` entries; shipped default already pinned to `:443`; document the semantics |
 | Env truncation | INFO | `MAX_FORWARDED_ENV=512` truncates — but warns to the trusted log, and masks are structurally uncapped | optional: fail-closed at the bound instead of warn+truncate (`rank.rs:118`) |
 | A8 attribution | LOW, trade-off | the `husk:`/`sbatch failed:` prefix is a non-executing gate-probe of the option registry | **not a bug** — same bit the honest agent needs; optionally trim the query-refusal enumeration to closest-match |
@@ -38,13 +43,13 @@ acting).
 | ID | Sev | One line | Status |
 |---|---|---|---|
 | B4-F2 | LOW | three docs call clearing the holder's `PR_SET_DUMPABLE` a "cheap win"; for husk's no-exec holder it makes ranks fail **closed** (`cage.rs:89-97` is the one correct copy) | **DOC** landmine — correct the three wrong copies |
-| B1-F6 | LOW | `--once` creates and claims a spool it never removes | **OPEN** (RAII/cleanup) |
-| B1-F7 | LOW | `~/.husk/log/` has no owner and no size bound | **OPEN** (log hygiene / rotation) |
-| B1-F8 | LOW (PLAUSIBLE) | the netproxy's tunnel counter is not `Drop`-guarded | **OPEN** (RAII) |
-| B3-F8 | LOW | relative `denyWrite` is silently dropped on compute (F22, unfixed on this one field) | **OPEN** |
+| ~~B1-F6~~ | ~~LOW~~ | `--once` creates and claims a spool it never removes | **DONE `79cd790`** — releases what it acquired, keeps what it borrowed |
+| ~~B1-F7~~ | ~~LOW~~ | `~/.husk/log/` has no owner and no size bound | **DONE `79cd790`** — pruned at session start by age/count/bytes |
+| ~~B1-F8~~ | ~~LOW (PLAUSIBLE)~~ | the netproxy's tunnel counter is not `Drop`-guarded | **DONE `79cd790`** — RAII slot, Drop-released, exact cap |
+| ~~B3-F8~~ | ~~LOW~~ | relative `denyWrite` is silently dropped on compute (F22, unfixed on this one field) | **DONE `79cd790`** — now goes through `abs_for_cage` like every other field |
 | ~~B6-F6~~ | ~~LOW today~~ | ~~`scancel`/read-only queries run with the broker's env unfiltered~~ | **DONE 2026-08-05 (`3354764`)** — the submission-env allowlist was applied to everything the broker execs, not just `sbatch` |
-| B4-F7 | LOW (minor) | the rank script's fail-closed guarantee is shell-dependent (bwrap covers it) | **OPEN** (robustness) |
-| B4-F8 | LOW (hygiene) | namespace fds leak into the workload (no impact found) | **HYGIENE** |
+| ~~B4-F7~~ | ~~LOW (minor)~~ | the rank script's fail-closed guarantee is shell-dependent (bwrap covers it) | **DONE `79cd790`** — `|| exit 1` on both redirections |
+| ~~B4-F8~~ | ~~LOW (hygiene)~~ | namespace fds leak into the workload (no impact found) | **PARTIAL `79cd790`** — closed on the egress path; the plain path keeps the leak because the no-network case must stay byte-for-byte (MPI-critical). A test asserts that state |
 | C2-9 | LOW (PLAUSIBLE) | with header injection the in-cage relay becomes a position the agent occupies | **BY-DESIGN** — recorded for the 6b design |
 
 ### Doc-vs-code drift & comment defects

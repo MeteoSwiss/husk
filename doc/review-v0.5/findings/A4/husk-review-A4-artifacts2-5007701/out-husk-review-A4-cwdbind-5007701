@@ -1,0 +1,19 @@
+IN-STEP pwd=/scratch/mch/cmueller/husk-review
+IN-STEP whoami=27069
+husk-review-A4-argv0: ./husk-review-A4-cwdwrite-5007701: Read-only file system
+WRITE_FAIL rc=1 (cwd not writable)
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+ls: cannot access './husk-review-A4-cwdwrite-5007701': No such file or directory
+MOUNTINFO for cwd:
+ERROR: ld.so: object '/nonexistent-husk-review-A4.so' from LD_PRELOAD cannot be preloaded (cannot open shared object file): ignored.
+1001 968 3274:979974 /cmueller/husk-review/A4 /scratch/mch/cmueller/husk-review/A4 rw,nosuid,nodev master:293
+1002 1001 0:98 / /scratch/mch/cmueller/husk-review/A4/.claude rw,nosuid,nodev,relatime
+1003 1001 0:99 / /scratch/mch/cmueller/husk-review/A4/.vscode rw,nosuid,nodev,relatime
+1004 1001 0:100 / /scratch/mch/cmueller/husk-review/A4/.idea rw,nosuid,nodev,relatime
+1005 1001 0:101 / /scratch/mch/cmueller/husk-review/A4/.git/hooks rw,nosuid,nodev,relatime
+1006 1001 3274:979974 /cmueller/husk-review/A4/.hg/hgrc /scratch/mch/cmueller/husk-review/A4/.hg/hgrc ro,nosuid,nodev master:293
+1007 1001 3274:979974 /cmueller/husk-review/A4/.Rprofile /scratch/mch/cmueller/husk-review/A4/.Rprofile ro,nosuid,nodev master:293
+ENV_ARRIVAL:
+LD_PRELOAD=/nonexistent-husk-review-A4.so
+OMP_NUM_THREADS=4
+ARGV_ARRIVAL: dollar0=husk-review-A4-argv0 rest=husk-review-A4-argvcanary

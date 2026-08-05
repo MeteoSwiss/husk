@@ -1,0 +1,16 @@
+@@SEC_BEGIN
+AAA_count=512
+HUSK_NET_SOCK=present
+HUSK_SOCAT=present
+_HUSK_NET_SOCK=present
+_HUSK_SOCAT=present
+PATH=present
+HOME=present
+USER=present
+http_proxy=present
+HTTPS_PROXY=present
+HUSK_JOB_LOG=present
+HUSK_STEP_SPOOL=present
+HUSK_SESSION_LOG=present
+@@SEC_END
+srun-exit=0

@@ -1,0 +1,10 @@
+@@ORD_BEGIN
+HUSK_WRITABLE=<unset:MASK_WINS>
+CUDA_VISIBLE_DEVICES=[husk-review-a2env-RESTORE-cuda]
+ROCR_VISIBLE_DEVICES=[husk-review-a2env-RESTORE-rocr]
+ZE_AFFINITY_MASK=[husk-review-a2env-RESTORE-ze]
+SLURM_GPUS_ON_NODE=<unset:MASK_WINS>
+SLURM_NODE_ALIASES=<unset:MASK_WINS>
+GPU_DEVICE_ORDINAL=[husk-review-a2env-RESTORE-ord]
+@@ORD_END
+srun-exit=0

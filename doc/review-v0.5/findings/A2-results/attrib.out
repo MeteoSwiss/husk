@@ -1,0 +1,11 @@
+stub-launch(env+python)=2
+compute-cage /bin/true=1
+srun-n1 /bin/true=4
+srun-n2 /bin/true=6
+== rank proc tree ==
+self=8 exe=/usr/bin/bash
+PPid=0 ppexe= ppcmd=
+GPPid= gpexe= gpcmd=kernel initrd=initrd console=ttyS0,115200 bad_page=panic crashkernel=512M hugepagelist=2m-2g intel_pstate=disable iommu.passthrough=y numa_balancing=disable numa_interleave_omit=headless oops=panic pageblock_order=14 pcie_ports=native rd.retry=10 rd.shell split_lock_detect=off systemd.unified_cgroup_hierarchy=1 ip=dhcp quiet ksocklnd.skip_mr_route_setup=1 module_blacklist=algif_aead,esp4,esp6,rxrpc cxi_core.disable_default_svc=0 cxi_core.enable_fgfc=1 cxi_core.sct_pid_mask=0xf spire_join_token=d605b652-9257-4e24-8816-03831e94c79a root=craycps-s3:s3://boot-images/a0554b3c-20c9-4beb-a2a2-f2a0bea3f0f7/rootfs:bc527cbedbd8cc97c5309a9cd6d977a8-1837:dvs:api-gw-service-nmn.local:300:nmn0:0 nmd_data=url=s3://boot-images/a0554b3c-20c9-4beb-a2a2-f2a0bea3f0f7/rootfs,etag=bc527cbedbd8cc97c5309a9cd6d977a8-1837 bos_update_frequency=4h xname=x1500c0s3b0n0 nid=1012 bss_referral_token=7a48b3d2-55f6-4883-8568-f84c5ebf2bbe ds=nocloud-net;s=http://10.92.100.81:8888/
+visible-pids:
+1 24 25 26 8 9 
+-- tree stderr ld.so count=9

@@ -1,0 +1,25 @@
+################ A4 PROBE #3 (field sanitization / audit-log injection) ################
+start_utc=20260804T154406Z host=nid001112 job=5007710
+step-broker audit log (HUMAN verifies here): /users/cmueller/.husk/log/job-5007710.log
+=== [V1] cwd newline reflection (readable proof of non-sanitization) ===
+resp raw: '{"version":1,"id":"husk-review-A4-sanit-cwd-5007710","status":"rejected","job_id":null,"message":"the step\'s working directory \\"/users/cmueller\\\\nhusk-review-A4-LOGFORGE-cwd-5007710: this line was authored by the caged rank\\\\nhusk: \\" is not allowed (it must be an absolute path, not \'/\', and not under a hidden home like /users)","exit_code":1,"stdout":""}'
+newline present in resp.message: False
+forged marker present in resp.message: True
+resp.message rendered:
+the step's working directory "/users/cmueller\nhusk-review-A4-LOGFORGE-cwd-5007710: this line was authored by the caged rank\nhusk: " is not allowed (it must be an absolute path, not '/', and not under a hidden home like /users)
+
+=== [V2] submitted_at newline (HUMAN verifies in job log) ===
+resp: {"version":1,"id":"husk-review-A4-sanit-sub-5007710","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+
+=== [V3] argv newline (HUMAN verifies in job log) ===
+resp: {"version":1,"id":"husk-review-A4-sanit-argv-5007710","status":"ok","job_id":null,"message":"","exit_code":0,"stdout":""}
+
+=== [V4] id newline (HUMAN verifies in job log; resp likely absent - glued path) ===
+spool entries mentioning sanit-id: []
+
+=== HUMAN VERIFICATION ===
+Inspect the step-broker's per-job audit log OUTSIDE husk:
+  /users/cmueller/.husk/log/job-5007710.log
+Grep for lines authored by the caged rank:  grep -n 'husk-review-A4-LOGFORGE' <that log>
+Any husk-review-A4-LOGFORGE-* line present there = the audited party (a rank) forged audit-trail content.
+END

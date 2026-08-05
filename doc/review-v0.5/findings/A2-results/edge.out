@@ -1,0 +1,10 @@
+@@EDGE_BEGIN
+-- canary-valued names that reached the rank (name=value) --
+HUSKREV_OK=husk-review-a2env-control
+Slurm_Mixed=husk-review-a2env-mixedcase
+SLURMNOUND=husk-review-a2env-nounderscore
+-- newline value NLVAL (od to reveal bytes) --
+0000000   a   a   a  \n   b   b   b
+0000007
+@@EDGE_END
+srun-exit=0

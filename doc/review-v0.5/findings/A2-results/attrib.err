@@ -1,0 +1,12 @@
+husk: compute cage active - the filesystem is READ-ONLY except:
+husk:   /scratch/mch/cmueller/husk-review/A2  (project dir: where husk was launched)
+husk: a write outside the list above fails with 'Read-only file
+husk: system' - that is husk, not the filesystem.
+husk: reads are mostly unrestricted, with three deliberate gaps:
+husk:   home directories are hidden (they look EMPTY, not missing),
+husk:   configured denyRead paths are hidden the same way, and
+husk:   credential files read as empty or refuse with EACCES.
+husk: If a file you expect is empty or absent, that may be husk
+husk: hiding it rather than the file being gone. Copy what the job
+husk: needs to the writable set above.
+husk: husk's own log for this job: /users/cmueller/.husk/log/job-5007243.log
