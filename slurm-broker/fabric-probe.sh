@@ -643,6 +643,58 @@ else
 fi
 
 # ============================================================================
+# C13 — WHICH PMI TRANSPORT IS ACTUALLY IN USE?
+#
+# This is the question multi-node containment turns on, and we have been answering a
+# DIFFERENT one. We recorded "cray_shasta PMI is TCP" from seeing PMI_CONTROL_PORT and
+# SLURM_STEP_RESV_PORTS in the environment. But Slurm exports a pile of PMI variables that
+# any given plugin may ignore — their PRESENCE is not evidence that they are the transport.
+#
+# It matters because the three possible answers need three different amounts of work:
+#
+#   TCP port        the rank must reach an IP inside its netns. Needs a relay, an address
+#                   rewrite, and the hope that PMI treats the address as a connect target
+#                   rather than as identity. The expensive answer.
+#   inherited fd    PMI_FD exists precisely so a launcher can hand a bootstrapped
+#                   connection to the process it spawns. husk already passes fds through
+#                   bwrap (--userns 9 --pidns 8), so this is nearly free.
+#   unix socket     PMIX_SERVER_URI names a FILESYSTEM path, and a filesystem path crosses
+#                   a network namespace natively. husk already bind-mounts exactly this
+#                   shape for the egress socket. Nothing to solve — the netns was never
+#                   the obstacle.
+#
+# So: dump what a rank actually sees, and look at what the rank actually has OPEN. The
+# environment says what was offered; the fd table and the socket list say what was taken.
+head2 "C13 — PMI transport: what is offered vs what is actually used"
+if [ -n "${SLURM_JOB_ID:-}" ]; then
+  say "-- PMI/PMIX environment as a rank sees it --"
+  srun --overlap -n1 sh -c 'env | grep -E "^(PMI|PMIX|SLURM_STEP_RESV_PORTS|SLURM_MPI)" | sort' \
+    2>/dev/null | sed 's/^/   /'
+  say ""
+  say "-- what a rank has OPEN during MPI init (the deciding evidence) --"
+  # ls -l /proc/self/fd shows socket:[inode] for sockets; ss maps inode -> endpoint.
+  # A unix socket here means the netns is irrelevant; a tcp socket means it is not.
+  srun --overlap -n1 sh -c '
+      ls -l /proc/self/fd 2>/dev/null | sed -n "s/.*-> //p" | grep -E "socket|pipe" | sort | uniq -c
+      echo "--- unix sockets this rank holds ---"
+      ss -xp 2>/dev/null | head -20
+      echo "--- tcp sockets this rank holds ---"
+      ss -tnp 2>/dev/null | head -20' 2>/dev/null | sed 's/^/   /'
+  say ""
+  if srun --overlap -n1 sh -c 'env | grep -q "^PMIX_SERVER_URI"' 2>/dev/null; then
+    fnd C13 pmi_transport "PMIX_SERVER_URI is set — the rendezvous is a FILESYSTEM path, so a netns does not block it. Bind it like the egress socket."
+  elif srun --overlap -n1 sh -c 'env | grep -q "^PMI_FD"' 2>/dev/null; then
+    fnd C13 pmi_transport "PMI_FD is set — the transport is an INHERITED FD, which survives unshare-net for free."
+  elif srun --overlap -n1 sh -c 'env | grep -q "^PMI_CONTROL_PORT"' 2>/dev/null; then
+    fnd C13 pmi_transport "only PMI_CONTROL_PORT — LOOKS like TCP, but check the ss output above before believing it: a variable being SET is not proof it is used."
+  else
+    fnd C13 pmi_transport "no PMI_* rendezvous variable found — read the dumps above"
+  fi
+else
+  fnd C13 pmi_transport "SKIP — not in a SLURM allocation"
+fi
+
+# ============================================================================
 head2 "summary — how to read the caged MPI results, and the one thing this can't do"
 say "Re-run with -N2 (two nodes) to force the INTER-NODE fabric for C1-def; a single"
 say "node may satisfy 2 ranks over shared memory and hide the netns×CXI question."

@@ -129,6 +129,32 @@ way `single-node` and `multi-node` already differ; (2) **one netns per job-on-a-
 than per rank, with an address PMI can bind — consistent with `P1`, looks right on principle,
 needs its own measurement; (3) treat the fabric as the checked hole VNIs already make it.
 
+**(4) — added 2026-08-06, Christoph: let the endpoint pre-exist the boundary.** Rather than
+carrying PMI *through* the netns, arrange that the connection it needs already exists when the
+cage is built — the spirit of the egress relay, where the real socket lives outside and the
+caged side only holds a handle. Two mechanisms do this without any address rewriting:
+
+- **an inherited fd** — `PMI_FD` exists precisely so a launcher can hand a bootstrapped
+  connection to the process it spawns, and husk already passes fds through bwrap
+  (`--userns 9 --pidns 8`);
+- **a Unix socket path** — `PMIX_SERVER_URI` names a *filesystem* rendezvous, and a filesystem
+  path crosses a netns natively. husk already bind-mounts exactly this shape for egress.
+
+**What does NOT work, and it is worth writing down so nobody spends a day on it:** "let MPI
+bootstrap, then wrap it." bwrap execs, and exec destroys the in-process MPI state, not merely
+its sockets. The in-process variant — the workload calling `unshare(CLONE_NEWNET)` on itself
+after `MPI_Init` — is mechanically fine but requires the confined side to cooperate, which is
+the one thing husk's axiom forbids.
+
+**This option is cheaper than (1)–(3) if it applies, and free if the transport is already a
+socket path — but the existing evidence points the other way and should not be waved past.**
+`_pmi_set_af_in_use: Unable to obtain IP address` is a real failure mode naming a real IP
+lookup, not merely a variable being set; and "obtain **its own** address" is the harder
+sub-case, because an address used as *identity* cannot be rewritten the way an HTTP proxy
+target can. `fabric-probe.sh` **C13** settles which of the three transports is actually in use
+by dumping what a rank is offered *and* what it holds open — the environment says what was
+offered, the fd table and `ss` say what was taken. One 2-node run, no new experiment.
+
 **Security item surfaced by the same run:** `SLINGSHOT_VNIS` is in the step environment and
 steers which VNI a process uses, while `SLINGSHOT_` is not in `RESERVED_ENV_PREFIXES` — so a
 caged rank can set it. Whether the NIC validates it against Slurm's grant is the
