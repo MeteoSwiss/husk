@@ -118,6 +118,53 @@ this brief tests whether that treatment is complete.
    confusion between them turns "masked even when absent" into "silently not masked". (Shared
    with N6.)
 
+10. ★★ **Do husk's own credential denies deny anything on Linux? MEASURED 2026-08-06: at the
+    mount layer, no.** Run with `SRT_DEBUG=1`, the vendor runtime reports this for every
+    credential glob husk ships in `permissions.deny`:
+
+    ```
+    [Sandbox] Glob pattern too broad, skipping: /**/.ssh/**
+    [Sandbox] Expanded glob pattern "/**/.ssh/**" to 0 paths on Linux
+    ```
+
+    The same for `/**/.aws/**`, `/**/.gnupg/**`, `/**/.config/gcloud/**`, `/**/.kube/**`,
+    `/**/*.pem`, `/**/*.key`, `/**/credentials`, `/**/.netrc`, `/**/.git-credentials`,
+    `/**/.npmrc`, `/**/.pypirc`, `/**/.docker/config.json`. **Every one becomes zero bwrap
+    deny paths.**
+
+    This was investigated before and recorded as COSMETIC, on the grounds that the permission
+    layer still enforces the globs for the agent's tools even when the mount layer drops them
+    — and that is still observably true: an agent's `head` of a credential-matching file was
+    refused on the login node this week.
+
+    **Re-test it anyway, because the reasoning that made it cosmetic has expired.** That
+    verdict was reached when the file tools were the main path. husk now launches the agent
+    with `--tools Bash` (the two-door fix), so *every* file operation is a Bash command, and
+    the whole control rests on one question: does the permission layer gate Bash commands as
+    reliably as it gates `Read`? There is no mount-layer backstop underneath it — the globs
+    that were supposed to be that backstop are the ones expanding to nothing.
+
+    Inheriting a conclusion across an architecture change is precisely the "secure the
+    interface, not your model of it" failure, so this brief should settle it rather than cite
+    it. **The test is one command from inside a husk LOGIN session:**
+
+    ```
+    cat ~/.ssh/id_rsa            # or any planted canary matching a shipped deny glob
+    ```
+
+    Then vary it, because the permission layer parses commands and a parser is a surface:
+    indirection (`f=~/.ssh/id_rsa; cat "$f"`), a different reader (`head`, `dd`, `python -c`,
+    `awk`), a path that reaches the same file another way (a symlink, `/proc/self/root/...`,
+    a relative path from `$HOME`), and reading it as a side effect (`grep -r . ~/.ssh`,
+    `tar cf - ~/.ssh | wc -c`).
+
+    **A read that succeeds is a finding, and a serious one** — those globs are husk's stated
+    credential protection on the login side. A read that is refused is also a result: it means
+    the permission layer alone is carrying it, which is worth knowing explicitly rather than
+    assuming, and it makes the mount-layer gap a defence-in-depth item rather than a hole.
+
+    Note the canary rules still apply: plant a fake key, do not read a real one.
+
 ## What counts as a finding
 
 - Any step-request field that reaches a path, argv, mount, or environment in the trusted
