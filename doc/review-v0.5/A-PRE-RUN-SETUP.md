@@ -5,8 +5,10 @@ Do all of this once, on the Balfrin login node, before any reviewer runs. It exi
 told to break things without breaking anything that matters, and so that the provenance tests
 have something real to fail against.
 
-The husk being tested must be the one the hardware round installed (`c6698ce` or later) — the
-review is only meaningful against the fixed build.
+The husk being tested must be the build the hardware round verified: **`7505d67`**, green on
+Balfrin (91/0/0) and Santis (92/0/1) on 2026-08-06. The review is only meaningful against the
+fixed build — and a session keeps the broker it started with, so check the banner's build stamp
+rather than the install.
 
 ---
 
