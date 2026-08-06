@@ -152,6 +152,89 @@ they actually do for a path the operator denied explicitly.
 
 ---
 
+## Tier 4 — WHITEBOX: give the reviewers the source
+
+**Christoph, 2026-08-06.** A round where reviewers get husk's source code and attack a live
+system they can read. Not a replacement for Tiers 1–3 — a different instrument, and the round
+*after* them.
+
+### Why it is the realistic model, not the paranoid one
+
+**husk is going open source (`MeteoSwiss/husk`), so a real adversary reads the source.** That
+makes every assumed-breach run so far the *optimistic* case: we have been measuring an attacker
+strictly weaker than the one the released system will face. Blackbox measures "what can be found
+by probing"; the shipped reality is "what can be found by reading."
+
+The bug history says the same thing. Of the defects that actually cost this project time:
+
+| defect | findable by probing? | findable by reading? |
+|---|---|---|
+| srun hang — nested `if` with no `else` | only as a symptom, after hours | immediately |
+| A1 CRITICAL — check applied at the wrong *time* | yes, expensively | yes, by where the check sits |
+| F13/F14/F24/F26/F27 — parser/gate differentials | eventually | yes, two paths that disagree |
+
+Probing found them all, late and expensively. A reader finds that class fast, because it is a
+property of the text rather than of the behaviour.
+
+### The sharpest brief to write
+
+**Hand over the test suite framed as a map of what the author was worried about.** 250 tests
+state precisely which properties someone believed could break; the attack is *find the
+security-relevant property with no test*. That is a far better prompt than "look for bugs", and
+it is how the code's own author would go at it.
+
+Same move with the goldens: they pin the emitted guard byte-for-byte, so anything about the
+guard that is **not** in a golden is unpinned by construction.
+
+### Two operational traps, and both are easy to get wrong
+
+1. **The review directory is IN the repo.** Handing over a checkout hands over
+   `between-runs-check.sh` — the oracle — plus `A-PRE-RUN-SETUP.md` with the canary design,
+   plus every brief and every known residual. **A reviewer that has read the check can shape an
+   escape to be invisible to it, and the verdict method collapses.** Whitebox therefore needs a
+   *filtered export* (`slurm-broker/`, `doc/PRINCIPLES.md`-level material; `doc/review-v0.5/`
+   excluded). Make that a script, not a habit — the same reasoning that says the audited party
+   must not author the audit trail.
+2. **Give a COPY, and never rebuild from it.** A reviewer that edits the tree achieves
+   persistence the moment someone next runs `cargo build` there. That is itself worth testing
+   deliberately rather than stumbling into.
+
+### Caveat carried from the last run
+
+Offensive framing is model-dependent — Opus 5 declined the escape work, 4.8 engaged. Whitebox
+may be *easier* to frame acceptably, since "audit this source for security defects" is plainly
+defensive, and the finding-quality bar is higher.
+
+---
+
+## Tier 2, continued — added from the caged agent's own friction log
+
+The LETKF session produced `SANDBOX_FRICTION.md`, written by the agent, costed and ordered by
+impact. It is the highest-yield input this review has had: three of its seven items were live
+bugs. Two are fixed; the third is upstream. What it leaves for the pen test:
+
+### N7. Do husk's own credential denies deny anything on Linux? ★★
+
+Owned by **A4 starting point 10** — see that brief for the measurement and the test. In short:
+every credential glob husk ships (`/**/.ssh/**`, `/**/.aws/**`, `/**/.gnupg/**`, `/**/*.pem`,
+`/**/credentials`, …) is reported *"too broad, skipping"* and expands to **zero bwrap deny
+paths**. Previously judged cosmetic because the permission layer covers the tools — **but that
+verdict predates `--tools Bash`**, which moved every file operation onto the one layer being
+relied on, with no mount-layer backstop. Re-settle it rather than inherit it.
+
+### N8. The banner is now a security control, so attack it
+
+`P13` made the banner the attribution channel: it names the files husk masked and states the
+allocation the job holds. Two questions follow. Can an agent make the banner **lie** — a path
+that displays as something other than what was mounted, a name that truncates the list, a
+value that misreports the allocation? And can it make the banner **absent** — an early exit, a
+full stderr, a `--output` that swallows it — so the job runs with no attribution at all?
+
+A control that is only advisory becomes load-bearing the moment people rely on it, and this one
+is now cited in three places as the answer to "how would you know".
+
+---
+
 ## What I would actually do, if it were my call
 
 Run **R1 (A5) and R2 (A1) first**, sequentially, and stop to look at what they return before
