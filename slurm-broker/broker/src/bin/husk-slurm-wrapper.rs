@@ -33,6 +33,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
 use std::ptr;
 
 // The one internal, dependency-free shared const (keeps this binary's zero-crate
@@ -283,6 +284,118 @@ fn spawn_broker(broker: &Path, spool: &Path, log_path: &Path) -> io::Result<Brok
     Ok(BrokerHandle(child))
 }
 
+// ---- the second witness: the broker is actually SERVING ---------------------
+
+/// Proof that the broker came up and claimed its spool.
+///
+/// `spawn_broker` returns as soon as `execve` succeeds, which says nothing about whether the
+/// broker survived its own startup. It has a fail-closed path — unreadable settings, an
+/// unusable spool — where it prints a precise reason and exits(2). Nothing checked.
+///
+/// **2026-08-06, Balfrin.** A zero-byte `.claude/settings.json` sent it down that path. The
+/// wrapper had already `exec`d the agent, so the dead broker became a zombie nobody reaped,
+/// every `sbatch` and `squeue` went into a spool with no reader, and each one returned
+/// `timed out after 120s waiting for the SLURM broker`. Four sessions in a row, for hours.
+/// The actual reason — naming the file, the parse error and the fix — was sitting in
+/// `~/.husk/log/`, which the cage masks from the agent and which no human thinks to open
+/// while a command is merely slow.
+///
+/// The same shape had already cost a day on the compute side, where the guard started the
+/// step broker and did not check it either. Fixing one half and not the other is how it got
+/// two chances.
+///
+/// So: no agent runs unless a broker is serving it. `exec_agent` demands this token, and the
+/// only way to mint one is to watch the spool get claimed. The wrapper's stderr is the
+/// terminal the human is looking at, so the refusal lands where a decision can be made
+/// instead of in a file nobody opens.
+struct BrokerReady(#[allow(dead_code)] BrokerHandle);
+
+/// How long the broker may take to claim its spool. Generous: it parses a little JSON and
+/// writes one file, but the project dir can be on a cold Lustre mount.
+const BROKER_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+impl BrokerReady {
+    /// Wait for `<spool>/owner` to appear, or for the child to die trying.
+    ///
+    /// `owner` is the right signal rather than a heuristic: the broker writes it only after
+    /// its settings have resolved and it has taken the spool, which is precisely the state
+    /// that failed. Dropping `handle` on the error paths kills the broker, so a half-started
+    /// one is not left behind — that is `BrokerHandle`'s `Drop` doing its job.
+    fn establish(handle: BrokerHandle, spool: &Path, log_path: &Path) -> io::Result<Self> {
+        Self::establish_within(handle, spool, log_path, BROKER_READY_TIMEOUT)
+    }
+
+    /// The timeout is a parameter so the "alive but never claims" path is testable without
+    /// a fifteen-second test. Everything else is identical.
+    fn establish_within(
+        mut handle: BrokerHandle,
+        spool: &Path,
+        log_path: &Path,
+        limit: Duration,
+    ) -> io::Result<Self> {
+        let owner = spool.join("owner");
+        let start = Instant::now();
+        loop {
+            if owner.exists() {
+                return Ok(BrokerReady(handle));
+            }
+            // Ask the child before the clock: a broker that has already exited will never
+            // create the file, and waiting the full timeout to say so wastes the operator's
+            // attention at the moment they are most confused.
+            if let Some(status) = handle.0.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "the SLURM broker exited during startup ({status}), so nothing would \
+                     serve this session.\nhusk: refusing to launch the agent — otherwise \
+                     every sbatch and squeue it runs would hang for 120s with no \
+                     explanation.\nhusk: the broker said:\n{}",
+                    broker_refusal_reason(log_path)
+                )));
+            }
+            if start.elapsed() > limit {
+                return Err(io::Error::other(format!(
+                    "the SLURM broker did not claim its spool within {}s (it is still \
+                     running, but not serving).\nhusk: refusing to launch the agent rather \
+                     than hand it a broker that may never answer.\nhusk: spool {}\nhusk: \
+                     the broker said:\n{}",
+                    limit.as_secs(),
+                    spool.display(),
+                    broker_refusal_reason(log_path)
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// The broker's own words, for relaying to the terminal.
+///
+/// Its messages are already good — they name the file, the error and the fix. The failure was
+/// never their content, it was that they landed somewhere neither party reads. So quote them
+/// rather than paraphrase: a second wording of the same fact is one more thing to drift.
+fn broker_refusal_reason(log_path: &Path) -> String {
+    let text = match fs::read_to_string(log_path) {
+        Ok(t) => t,
+        Err(e) => {
+            return format!("      (could not read {}: {e})", log_path.display());
+        }
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("husk:") || l.starts_with("broker:"))
+        .collect();
+    if lines.is_empty() {
+        return format!("      (nothing in {} — it died before saying why)", log_path.display());
+    }
+    lines
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .map(|l| format!("      {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ---- the witness: only mintable by a verified bind --------------------------
 struct SandboxReady;
 
@@ -340,7 +453,7 @@ fn enter_user_mount_ns() -> io::Result<()> {
 /// keeps it alive to end of scope.)
 fn exec_agent(
     _ready: SandboxReady,
-    _broker: BrokerHandle,
+    _broker: BrokerReady,
     agent: &[String],
     spool: &Path,
 ) -> io::Result<Infallible> {
@@ -444,6 +557,9 @@ fn run() -> io::Result<Infallible> {
 
             // Broker first, in the clean outer namespaces (keeps MUNGE + network).
             let broker_handle = spawn_broker(broker, &cfg.spool, &session_log)?;
+            // Spawning proves only that execve worked. Wait for the broker to CLAIM its
+            // spool before anything depends on it — see BrokerReady.
+            let serving = BrokerReady::establish(broker_handle, &cfg.spool, &session_log)?;
 
             // Now shrink OUR world and swap sbatch for the stub.
             enter_user_mount_ns()?;
@@ -458,7 +574,7 @@ fn run() -> io::Result<Infallible> {
                 session_log.display(),
                 cfg.agent.join(" ")
             );
-            exec_agent(ready, broker_handle, &cfg.agent, &cfg.spool)
+            exec_agent(ready, serving, &cfg.agent, &cfg.spool)
         }
     }
 }
@@ -497,6 +613,69 @@ USAGE: husk-slurm-wrapper --stub PATH --broker PATH [--spool DIR]\n\
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn no_agent_launches_without_a_broker_that_actually_claimed_its_spool() {
+        // **2026-08-06, Balfrin.** A zero-byte settings.json sent the broker down its
+        // fail-closed path. It exited(2) having said exactly why; the wrapper had already
+        // exec'd the agent, so the corpse became a zombie and every sbatch and squeue the
+        // agent ran timed out at 120s against a spool with no reader. Four sessions, hours.
+        //
+        // spawn() succeeding says only that execve worked. This pins the difference.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("husk-brokerready-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("session.log");
+        fs::write(
+            &log,
+            "broker: no uenv session detected\n\
+             husk: refusing to start - /p/.claude/settings.json: not valid JSON: EOF while \
+             parsing a value at line 1 column 0\n\
+             husk: Fix the JSON and start husk again.\n",
+        )
+        .unwrap();
+
+        // A broker that dies during startup, exactly like the real one did.
+        let dead = BrokerHandle(Command::new("false").spawn().unwrap());
+        let err = match BrokerReady::establish(dead, &dir, &log) {
+            Err(e) => e,
+            Ok(_) => panic!("a broker that exited must NOT yield a serving witness"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("exited during startup"), "must name what happened: {msg}");
+        assert!(
+            msg.contains("refusing to launch the agent"),
+            "must say husk chose not to proceed: {msg}"
+        );
+        assert!(
+            msg.contains("120s"),
+            "must name the symptom it is replacing, or nobody connects the two: {msg}"
+        );
+        // ...and it must RELAY the broker's own words rather than paraphrase them.
+        assert!(
+            msg.contains("not valid JSON") && msg.contains("settings.json"),
+            "the reason was in the log all along; the fix is surfacing it: {msg}"
+        );
+
+        // A broker that is alive but never claims the spool: also not serving.
+        let stalled = BrokerHandle(Command::new("sleep").arg("30").spawn().unwrap());
+        let err = match BrokerReady::establish_within(stalled, &dir, &log, Duration::from_millis(300)) {
+            Err(e) => e,
+            Ok(_) => panic!("alive is not the same as serving"),
+        };
+        assert!(err.to_string().contains("did not claim its spool"), "{err}");
+
+        // And the success path: the owner file is the claim.
+        fs::write(dir.join("owner"), "pid=1\n").unwrap();
+        let live = BrokerHandle(Command::new("sleep").arg("30").spawn().unwrap());
+        match BrokerReady::establish_within(live, &dir, &log, Duration::from_secs(2)) {
+            Ok(w) => drop(w), // BrokerHandle::drop reaps the sleep
+            Err(e) => panic!("a claimed spool must mint the witness: {e}"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
     use super::*;
 
     fn args(a: &[&str]) -> std::vec::IntoIter<String> {

@@ -1332,10 +1332,6 @@ struct ScanResult {
     truncated: bool,
 }
 
-/// Bounded walk of `root` (the workdir) returning absolute paths of files whose
-/// basename matches a credential pattern. Depth- and entry-count-capped so it can
-/// never turn into a filesystem-wide walk; symlinks are not followed. Any error
-/// yields fewer results (fail-safe — the base cage still hides homes).
 // Counts calls to the workdir walk, so a test can assert which code paths reach it.
 //
 // THREAD-LOCAL, not a global: cargo runs tests as threads of one process, and a shared
@@ -1352,6 +1348,10 @@ thread_local! {
     pub static SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Bounded walk of `root` (the workdir) returning absolute paths of files whose
+/// basename matches a credential pattern. Depth- and entry-count-capped so it can
+/// never turn into a filesystem-wide walk; symlinks are not followed. Any error
+/// yields fewer results (fail-safe — the base cage still hides homes).
 fn scan_credentials(root: &Path) -> ScanResult {
     #[cfg(test)]
     SCAN_CALLS.with(|c| c.set(c.get() + 1));
