@@ -899,7 +899,21 @@ pub fn cancel_base_id(s: &str) -> Option<u64> {
 /// A LIST, not a root. `sandbox.filesystem.allowWrite` adds paths beyond the project dir,
 /// so announcing one root would be a new way to mislead. The project dir is only special
 /// in that it is where husk was launched and where `.claude/` lives.
-fn cage_banner(writable: &[String]) -> String {
+/// Files husk masked as credentials, read back out of the bwrap arguments it is about to
+/// emit — `--ro-bind /dev/null <path>`.
+///
+/// DERIVED from the mount table rather than passed alongside it, because a second list of
+/// "what we masked" is a second thing to drift from what was actually mounted. The mount
+/// table is the oracle; this just reads it.
+fn masked_credentials(bwrap_args: &[String]) -> Vec<String> {
+    bwrap_args
+        .windows(3)
+        .filter(|w| w[0] == "--ro-bind" && w[1] == "/dev/null")
+        .map(|w| w[2].clone())
+        .collect()
+}
+
+fn cage_banner(writable: &[String], masked: &[String]) -> String {
     let mut b = String::from(
         "echo \"husk: compute cage active - the filesystem is READ-ONLY except:\" >&2\n",
     );
@@ -933,6 +947,63 @@ fn cage_banner(writable: &[String]) -> String {
     // that is the point - but whoever reads this output is on the login node, where it is
     // an ordinary file. Naming it here is the difference between one place to look and a
     // search.
+    // NAME the masked files. The banner already says credential files read as empty or
+    // EACCES, which tells an agent the SHAPE of the failure but not which file it will hit.
+    //
+    // `var3d.env` cost three failed 128-rank jobs and a misdiagnosis (LETKF, 2026-08-05/06):
+    // it is DACE's module-load script, husk masked it as a credential, and `source var3d.env`
+    // reported a bare `Permission denied` that named nobody. The scan is a heuristic and will
+    // be wrong again — so it must say what it did, at the one moment the job can still act on
+    // it. Capped, because a workdir full of keys should not bury the rest of the banner.
+    if !masked.is_empty() {
+        b.push_str(
+            "echo \"husk: masked as credentials (they read as empty or refuse):\" >&2\n",
+        );
+        for p in masked.iter().take(8) {
+            b.push_str(&format!(
+                "echo \"husk:   {}\" >&2\n",
+                settings::sh_quote(p).trim_matches('\'')
+            ));
+        }
+        if masked.len() > 8 {
+            b.push_str(&format!(
+                "echo \"husk:   ... and {} more\" >&2\n",
+                masked.len() - 8
+            ));
+        }
+        b.push_str(
+            "echo \"husk: this is a HEURISTIC on the file name and it can be wrong. If one of\" >&2\n",
+        );
+        b.push_str(
+            "echo \"husk: those is not a secret, rename it or declare the real ones in\" >&2\n",
+        );
+        b.push_str(
+            "echo \"husk: sandbox.credentials.files and they will be the only ones masked.\" >&2\n",
+        );
+    }
+    // WHAT THIS JOB ACTUALLY HOLDS.
+    //
+    // An agent that asked for 64 tasks and silently got 1 concluded "husk grants 2 CPUs per
+    // job" — right about the symptom, wrong about the cause, and it said why: husk was the
+    // only layer it could see, and it had no way to tell whether its request had been
+    // modified. That was a real husk bug (`#SBATCH` resource directives never reached SLURM,
+    // fixed in `da7a6e6`), but the reason it cost an hour rather than a minute is that
+    // nothing stated the allocation. Print it, so the next disagreement is one line of
+    // evidence instead of an inference about husk.
+    b.push_str(
+        "echo \"husk: this job HOLDS: nodes=${SLURM_JOB_NUM_NODES:-?} \
+         ntasks=${SLURM_NTASKS:-<unset>} cpus-per-task=${SLURM_CPUS_PER_TASK:-<unset>} \
+         cpus-on-node=${SLURM_CPUS_ON_NODE:-?}\" >&2\n",
+    );
+    b.push_str(
+        "echo \"husk: if that is not what you asked for, husk forces only --nodes=1,\" >&2\n",
+    );
+    b.push_str(
+        "echo \"husk: --export=ALL, --open-mode=append and the output paths - every other\" >&2\n",
+    );
+    b.push_str(
+        "echo \"husk: resource option is passed through, so a mismatch is upstream of husk.\" >&2\n",
+    );
     b.push_str("echo \"husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}\" >&2\n");
     b
 }
@@ -1213,7 +1284,7 @@ fi
     };
     // The writable set as the job will see it: the project dir first, then any
     // `sandbox.filesystem.allowWrite` roots. One list, one source, announced verbatim.
-    let banner = cage_banner(writable);
+    let banner = cage_banner(writable, &masked_credentials(bwrap_args));
     // Colon-separated like PATH, so an agent can split it without a parser. A path
     // containing a colon would be ambiguous - as it is for PATH - and is not worth a
     // format nobody would guess.

@@ -373,6 +373,49 @@ against the suite before they are believed.
 
 ---
 
+## P13 — The sandbox is the only layer the agent can see, so it is blamed for everything it does not explain
+
+Announce what husk **changed**, not only what it refused. A modification the confined party
+cannot observe becomes a theory about husk, and the theory is usually wrong.
+
+**Why it isn't obvious.** `P11` covers refusals, and a refusal at least tells you something
+happened. This is the quieter half: husk drops an option, masks a file, forces a value — the work
+proceeds, differently, and nothing marks the difference. The agent then reasons from the only
+layer it can name.
+
+**Said best by the party it costs.** From a caged agent's own friction log, after husk silently
+discarded its `#SBATCH` resource directives and it concluded "husk grants 2 CPUs per job":
+
+> *"That was right about the symptom and wrong to name husk as the cause without evidence — but
+> the reason I reached for husk is that it was the one layer I could see, and I had no way to
+> tell whether my request had been modified."*
+
+That is the asymmetry stated exactly. Every other layer — SLURM, the filesystem, the module
+system — is either invisible or trusted. husk is visible and new, so it is the available
+explanation for anything surprising, whether or not it is the cause. **Being the visible layer is
+a duty to narrate, not just a duty to refuse.**
+
+**Taught by** `#SBATCH` resource directives that were validated and then dropped: the job ran with
+SLURM's defaults, `SLURM_NTASKS` came back empty, and nothing anywhere said husk had changed the
+request. One hour, and a confident wrong conclusion about husk's design.
+
+**Caught again** by the credential auto-scan masking `var3d.env`, a module-load script named by
+DACE's own build instructions. Two layers agreed it was a secret; neither said so, and `source`
+reported a bare `Permission denied`. Three failed 128-rank jobs. And a third time the same week,
+when a broker that had exited left every call to time out at 120s with a message that named no
+cause — the reason sat in a log the cage hides from the agent by design.
+
+**The remedy is the banner, and it is already proven.** The same log records what worked:
+*"The compute-cage banner listing the writable set. That one prevented several wrong turns."*
+So the banner is husk's attribution channel, and everything husk silently changed belongs in
+it — the masked files, the allocation the job actually holds, the options husk forced. It costs
+a few lines at job start and converts an hour of inference into a glance.
+
+**The tension with `P11`'s A7-1 resolution.** Splitting the audience — teaching to the confined
+party, detail to the operator — is right for *refusals*, where the detail can be an existence
+oracle. It is wrong for *modifications*: what husk changed about the agent's own request is not
+a host fact, and withholding it is what caused all three incidents above.
+
 # Not yet earned
 
 Candidates with one instance. Recorded so the bar stays visible, and so they can be promoted when a

@@ -302,6 +302,10 @@ echo "husk:   credential files read as empty or refuse with EACCES." >&2
 echo "husk: If a file you expect is empty or absent, that may be husk" >&2
 echo "husk: hiding it rather than the file being gone. Copy what the job" >&2
 echo "husk: needs to the writable set above." >&2
+echo "husk: this job HOLDS: nodes=${SLURM_JOB_NUM_NODES:-?} ntasks=${SLURM_NTASKS:-<unset>} cpus-per-task=${SLURM_CPUS_PER_TASK:-<unset>} cpus-on-node=${SLURM_CPUS_ON_NODE:-?}" >&2
+echo "husk: if that is not what you asked for, husk forces only --nodes=1," >&2
+echo "husk: --export=ALL, --open-mode=append and the output paths - every other" >&2
+echo "husk: resource option is passed through, so a mismatch is upstream of husk." >&2
 echo "husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}" >&2
 # --- hand off to the agent's script, inside the cage ---
 exec /bin/bash "$_husk_body" "$@"

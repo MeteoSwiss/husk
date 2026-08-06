@@ -1301,7 +1301,7 @@ const SCAN_MAX_ENTRIES: usize = 20_000;
 /// human's explicit `sandbox.credentials.files` and the HIDDEN_FLOOR.
 fn matches_credential(name: &str) -> bool {
     name.starts_with(".env")            // .env, .env.local   (Read(//**/.env*))
-        || name.ends_with(".env")       // foo.env            (Read(//**/*.env))
+        // NOT `*.env`: see `is_ambiguous_env`. `<name>.env` is resolved by CONTENT.
         || name.ends_with(".pem")       //                    (Read(//**/*.pem))
         || name.ends_with(".key")       //                    (Read(//**/*.key))
         || name.ends_with(".p12")       // PKCS#12 keystore/cert bundle
@@ -1321,6 +1321,59 @@ fn matches_credential(name: &str) -> bool {
         || name.starts_with("id_dsa")
         || name.starts_with("id_ed25519")
         || name.starts_with("id_ecdsa")
+}
+
+/// `<name>.env` — a dotenv secret file, or an HPC environment script?
+///
+/// **Both, depending on the site, and the extension cannot tell you which.** The rule used to
+/// be a flat `ends_with(".env")`, copied from the vendor's `Read(//**/*.env)` glob. On an HPC
+/// system that is wrong more often than it is right: `var3d.env` is DACE's module-load script,
+/// named that way by the operational benchmark data and by the build instructions.
+///
+/// It cost three failed 128-rank jobs and a misdiagnosis (LETKF session, 2026-08-05/06):
+/// `source var3d.env` failed with a bare `Permission denied`, no modules loaded, and every
+/// rank died on `libnetcdff.so.7: cannot open shared object file`. Two layers agreed the file
+/// was a credential and neither said so.
+///
+/// `.env` and `.env.local` stay masked unconditionally — that basename IS the dotenv
+/// convention and is not ambiguous. Only `<name>.env` gets asked what is in it.
+fn is_ambiguous_env(name: &str) -> bool {
+    name.ends_with(".env") && !name.starts_with(".env")
+}
+
+/// Environment-variable names that make a file look like secrets rather than a module script.
+const SECRET_KEY_HINTS: &[&str] = &[
+    "TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY", "ACCESS_KEY",
+    "PRIVATE_KEY", "CREDENTIAL", "AUTH", "SESSION_KEY", "CLIENT_SECRET",
+];
+
+/// Does an ambiguous `<name>.env` actually hold secrets?
+///
+/// Looks for `KEY=VALUE` where KEY reads like a secret. Deliberately NOT "contains an `=`":
+/// a module script is full of `export PATH=...`, and that is the whole false positive.
+///
+/// **Unreadable means masked.** That keeps the previous behaviour whenever we cannot tell, so
+/// this change can only ever mask FEWER files than before on evidence, never more, and never
+/// silently on a guess. Only the first 64 KiB is read — a dotenv file is small, and a
+/// multi-megabyte `.env` is not one.
+fn env_content_looks_like_secrets(path: &Path) -> bool {
+    use std::io::Read;
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut buf)) {
+        Ok(n) => n,
+        Err(_) => return true, // cannot tell -> previous behaviour
+    };
+    let text = String::from_utf8_lossy(&buf[..n]);
+    text.lines().any(|line| {
+        let line = line.trim_start().trim_start_matches("export ").trim_start();
+        match line.split_once('=') {
+            Some((key, _)) => {
+                let k = key.trim().to_ascii_uppercase();
+                SECRET_KEY_HINTS.iter().any(|h| k.contains(h))
+            }
+            None => false,
+        }
+    })
 }
 
 /// Result of a credential auto-scan: the matched files plus whether the scan ran
@@ -1397,9 +1450,16 @@ fn scan_credentials_rec(
             if depth > 0 {
                 scan_credentials_rec(&entry.path(), depth - 1, budget, out, truncated);
             }
-        } else if ft.is_file() && matches_credential(&entry.file_name().to_string_lossy()) {
-            if let Some(s) = entry.path().to_str() {
-                out.push(s.to_string());
+        } else if ft.is_file() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Name decides, EXCEPT for `<name>.env`, where the extension is genuinely
+            // ambiguous on an HPC and the content is asked instead. See `is_ambiguous_env`.
+            let is_cred = matches_credential(&name)
+                || (is_ambiguous_env(&name) && env_content_looks_like_secrets(&entry.path()));
+            if is_cred {
+                if let Some(s) = entry.path().to_str() {
+                    out.push(s.to_string());
+                }
             }
         }
     }
@@ -2622,7 +2682,9 @@ mod tests {
     #[test]
     fn matches_credential_recognizes_secrets_and_ignores_normal_files() {
         for n in [
-            ".env", ".env.local", "prod.env", "server.pem", "tls.key", "credentials",
+            // NOTE `prod.env` is deliberately absent: `<name>.env` is no longer decided by
+            // name — see `is_ambiguous_env` and the test below it.
+            ".env", ".env.local", "server.pem", "tls.key", "credentials",
             ".git-credentials", ".netrc", "id_rsa", "id_rsa.pub", "id_ed25519",
             // F23 — keystore/token files the base globs miss
             "keystore.p12", "cert.pfx", "release.jks", "app.keystore", "server.ppk",
@@ -2636,6 +2698,54 @@ mod tests {
         ] {
             assert!(!matches_credential(n), "{n} should NOT match");
         }
+    }
+
+    #[test]
+    fn a_name_dot_env_is_judged_by_content_not_by_extension() {
+        // **LETKF session, 2026-08-05/06. Cost: three failed 128-rank jobs and a
+        // misdiagnosis.** `var3d.env` is DACE's module-load script — the operational
+        // benchmark data ships it under that name and the build instructions use it. The
+        // flat `ends_with(".env")` rule, copied from the vendor's `Read(//**/*.env)` glob,
+        // masked it. `source var3d.env` then failed with a bare `Permission denied`, no
+        // modules loaded, and all 128 ranks died on a missing libnetcdff.
+        //
+        // On an HPC the extension is wrong more often than right, so `<name>.env` is asked
+        // what is inside it. `.env`/`.env.local` are NOT ambiguous and stay masked by name.
+        let dir = std::env::temp_dir().join(format!("husk-envscan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The real thing that broke: a module script.
+        std::fs::write(
+            dir.join("var3d.env"),
+            "#!/bin/bash\nmodule load netcdf-fortran\nexport PATH=/opt/bin:$PATH\n\
+             export DACE_ROOT=/scratch/dace\n",
+        )
+        .unwrap();
+        // A real dotenv file that happens to be named <name>.env.
+        std::fs::write(dir.join("prod.env"), "API_TOKEN=abc123\nDB_HOST=localhost\n").unwrap();
+        // The unambiguous convention, masked by name regardless of content.
+        std::fs::write(dir.join(".env"), "module load foo\n").unwrap();
+
+        let found = scan_credentials(&dir).files;
+        let has = |n: &str| found.iter().any(|f| f.ends_with(n));
+
+        assert!(!has("var3d.env"), "a module script must not be masked: {found:?}");
+        assert!(has("prod.env"), "a <name>.env holding a token must still be masked: {found:?}");
+        assert!(has("/.env"), ".env is the dotenv convention and is not ambiguous: {found:?}");
+
+        // `export PATH=` must not be enough to call something secrets — that is the whole
+        // false positive, and a module script is full of them.
+        assert!(!env_content_looks_like_secrets(&dir.join("var3d.env")));
+        assert!(env_content_looks_like_secrets(&dir.join("prod.env")));
+
+        // Unreadable means masked: this change may only ever mask FEWER files on evidence,
+        // never more, and never on a guess.
+        assert!(
+            env_content_looks_like_secrets(&dir.join("does-not-exist.env")),
+            "when husk cannot read it, it keeps the old behaviour"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
