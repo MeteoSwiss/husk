@@ -147,7 +147,15 @@ impl Broker {
         // confined side a way to author its own cage — exactly F17, and exactly the rule
         // that the confined side must not supply its own boundary. So this reads the files
         // only to answer "would the compute side choke on these?" and throws the result away.
-        if let Err(e) = FsPolicy::resolve(&self.home, &self.project_dir) {
+        //
+        // PARSE-ONLY, and that distinction is load-bearing. This first shipped calling
+        // `resolve`, which is a CONSTRUCTION, not a read: it ends in a 20 000-entry, depth-4
+        // walk of the workdir whose own comment says "scan-once at construction". Running it
+        // per request put that walk on the submission path, and on a Lustre tree the size of
+        // a LETKF benchmark every `sbatch` hit the stub's 120s wall — the agent saw only
+        // "timed out after 120s waiting for the SLURM broker", with the broker healthy and
+        // simply busy stat-ing. Same shape as the original husk freezes.
+        if let Err(e) = FsPolicy::settings_parse_ok(&self.home, &self.project_dir) {
             let msg = format!(
                 "husk cannot submit this job: {e}\n\
                  That file decides what a job may read and write, and husk's compute-node \
@@ -890,8 +898,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join(".claude")).unwrap();
         fs::create_dir_all(dir.join("spool")).unwrap();
-        // Exactly what `:wq` on an empty buffer leaves behind.
-        fs::write(dir.join(".claude/settings.json"), b"").unwrap();
+        // CONTENT that does not parse. An EMPTY file is deliberately NOT this case any
+        // more: as of 2026-08-06 empty means absent, because Anthropic's runtime creates
+        // zero-byte settings files on its own and `:wq` on an empty buffer leaves one — and
+        // a zero-byte file has no denies in it to lose. A file with content that will not
+        // parse is a typo in real policy, and that still refuses. See
+        // `an_empty_settings_file_is_absent_but_a_broken_one_still_refuses`.
+        fs::write(dir.join(".claude/settings.json"), b"{\"permissions\": }").unwrap();
 
         let broker = Broker {
             spool: dir.join("spool"),

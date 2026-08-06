@@ -416,6 +416,28 @@ pub fn confine_output_pattern(value: &str, workdir: &str) -> Result<String, Stri
 /// deny there hands the agent a writable policy input, which matters more once policy
 /// includes the network allowlist. `settings_sources_are_all_write_denied` asserts the
 /// pairing against the shipped file.
+/// Read one settings layer, or `None` if it makes no claims.
+///
+/// **An EMPTY file is treated as an ABSENT file**, and that is a deliberate definition
+/// rather than a leniency. `resolve` already says why absence is safe — *"the human made no
+/// claims in a file they did not write"* — and a zero-byte file is precisely that case: there
+/// are no denies in it to lose, so failing closed protects nothing.
+///
+/// It is also, empirically, the normal state of these paths. Anthropic's runtime creates
+/// zero-byte `settings.json` / `settings.local.json` in a project's `.claude/` directory on
+/// its own, and a human who opens one in vim and `:wq`s leaves the same thing. Refusing to
+/// start on it made husk unusable in a directory it had itself been run in (2026-08-06: four
+/// consecutive sessions in one project dir died at startup, and every `sbatch` and `squeue`
+/// the agent made then timed out at 120s against a broker that was no longer there).
+///
+/// What must NOT change: a file with CONTENT that does not parse still refuses. That one is a
+/// typo in real policy, where denies genuinely are being lost, and "deny that cannot be read
+/// must never resolve to deny nothing" still holds. Whitespace counts as empty.
+fn settings_layer_text(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    if text.trim().is_empty() { None } else { Some(text) }
+}
+
 pub const SETTINGS_SOURCES: [(bool, &str); 3] = [
     (true, ".claude/settings.json"),   // ~/.claude/settings.json
     (false, ".claude/settings.json"),  // <project>/.claude/settings.json
@@ -675,6 +697,38 @@ impl FsPolicy {
     /// project's `settings.json`, then `settings.local.json` (where the CLI
     /// `/sandbox` toggle and permission grants land). Missing/unreadable files
     /// are skipped — fail-safe.
+    /// Would `resolve` choke on the settings files as they stand right now? **Parse only.**
+    ///
+    /// `resolve` is not a read, it is a CONSTRUCTION. After parsing it stats every deny
+    /// entry, lstats every path component of every carve-out, and ends in `scan_credentials`
+    /// — a walk of the workdir bounded at `SCAN_MAX_ENTRIES` (20 000) and depth 4, guarded
+    /// by a comment stating the reason it is affordable: **"Scan-once at construction"**.
+    ///
+    /// Calling it per request put that walk on the submission path. On Lustre, in a workdir
+    /// the size of a LETKF benchmark, every `sbatch` then blew through the stub's 120-second
+    /// wall and the agent saw `timed out after 120s waiting for the SLURM broker` — with the
+    /// broker perfectly healthy and merely stat-ing (2026-08-06, production). Same shape as
+    /// the original husk freezes: an in-process tree walk blocking on Lustre metadata, moved
+    /// onto a path that runs often.
+    ///
+    /// This reads at most three small JSON files and parses them, which is the entire
+    /// question the submit-time check asks — *would the compute side refuse these?* — and the
+    /// answer does not depend on a single directory entry in the workdir.
+    pub fn settings_parse_ok(home: &Path, project_dir: &Path) -> Result<(), String> {
+        let files = SETTINGS_SOURCES.map(|(from_home, rel)| {
+            if from_home { home.join(rel) } else { project_dir.join(rel) }
+        });
+        for f in files {
+            // The SAME rule `resolve` uses — via the same function, not a second copy of the
+            // condition. Two readers of one policy that disagree about what "empty" means is
+            // the divergence class this project keeps paying for (A4-F3).
+            if let Some(text) = settings_layer_text(&f) {
+                FsPolicy::parse(&text).map_err(|e| format!("{}: {e}", f.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve(home: &Path, project_dir: &Path) -> Result<FsPolicy, String> {
         let mut pol = FsPolicy::default();
         let files = SETTINGS_SOURCES.map(|(from_home, rel)| {
@@ -687,10 +741,22 @@ impl FsPolicy {
             // so a stray comma silently dropped that layer's denyRead, denyWrite and
             // credential masks, and husk carried on with a weaker cage and said nothing.
             // Deny that cannot be read must never resolve to deny nothing.
-            if let Ok(text) = std::fs::read_to_string(&f) {
-                let layer = FsPolicy::parse(&text)
-                    .map_err(|e| format!("{}: {e}", f.display()))?;
-                pol.union(layer);
+            // Empty == absent; see `settings_layer_text`. Announced rather than silent,
+            // because this runs ONCE at startup: an operator who truncated a real policy
+            // file should see that husk read nothing from it, and a per-request warning
+            // would be the crying-wolf failure instead.
+            match settings_layer_text(&f) {
+                None if f.exists() => eprintln!(
+                    "husk: {} is empty, so it sets no policy — husk is treating it as absent. \
+                     If you meant to configure something, it did not take effect.",
+                    f.display()
+                ),
+                None => {}
+                Some(text) => {
+                    let layer = FsPolicy::parse(&text)
+                        .map_err(|e| format!("{}: {e}", f.display()))?;
+                    pol.union(layer);
+                }
             }
         }
         // Route denyRead entries that are regular FILES to /dev/null binds:
@@ -1270,7 +1336,26 @@ struct ScanResult {
 /// basename matches a credential pattern. Depth- and entry-count-capped so it can
 /// never turn into a filesystem-wide walk; symlinks are not followed. Any error
 /// yields fewer results (fail-safe — the base cage still hides homes).
+// Counts calls to the workdir walk, so a test can assert which code paths reach it.
+//
+// THREAD-LOCAL, not a global: cargo runs tests as threads of one process, and a shared
+// counter is bumped by whatever else happens to be running — the first version of this
+// failed 7 != 8 for exactly that reason.
+//
+// Test-only, and it exists because the obvious test does not work: the submit-time settings
+// check must never trigger this walk, but "the verdict is the same either way" is satisfied
+// by the BUGGY version too — `resolve` returns Ok whether the tree is empty or full. A
+// verdict-comparison test passes against the very bug it was written for. Counting the walk
+// is the assertion that actually discriminates.
+#[cfg(test)]
+thread_local! {
+    pub static SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn scan_credentials(root: &Path) -> ScanResult {
+    #[cfg(test)]
+    SCAN_CALLS.with(|c| c.set(c.get() + 1));
+
     scan_credentials_capped(root, SCAN_MAX_DEPTH, SCAN_MAX_ENTRIES)
 }
 
@@ -1346,6 +1431,86 @@ fn path_has_symlink_component(p: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_empty_settings_file_is_absent_but_a_broken_one_still_refuses() {
+        // **2026-08-06, production.** A zero-byte `.claude/settings.json` in the project dir
+        // stopped the LOGIN broker from starting. It printed a good message and exited; the
+        // wrapper had already exec'd the agent, so the broker became a zombie and every
+        // sbatch/squeue the agent made timed out at 120s against a spool nobody was watching.
+        // Four consecutive sessions in that directory died the same way.
+        //
+        // Empty files are the NORMAL state of these paths: Anthropic's runtime creates them,
+        // and `:wq` on an empty vim buffer leaves one. So empty is now defined as absent —
+        // there are no denies in a zero-byte file to lose, which is why that is safe.
+        //
+        // The half that must never regress is the other one, so both are asserted here.
+        let base = std::env::temp_dir().join(format!("husk-emptyset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let proj = base.join("proj");
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let nothing = FsPolicy::resolve(&home, &proj).expect("no settings at all must resolve");
+
+        for empty in ["", "   ", "\n", " \n\t\n "] {
+            std::fs::write(proj.join(".claude/settings.json"), empty).unwrap();
+            let got = FsPolicy::resolve(&home, &proj)
+                .unwrap_or_else(|e| panic!("{empty:?} must be treated as absent, got: {e}"));
+            assert_eq!(got, nothing, "{empty:?} must resolve exactly like no file at all");
+            assert!(
+                FsPolicy::settings_parse_ok(&home, &proj).is_ok(),
+                "and the submit-time check must agree about {empty:?}"
+            );
+        }
+
+        // A file with CONTENT that does not parse is a typo in real policy — denies ARE
+        // being lost there, so it still fails closed, on both readers.
+        for broken in ["{", "{\"permissions\": }", "not json at all"] {
+            std::fs::write(proj.join(".claude/settings.json"), broken).unwrap();
+            assert!(
+                FsPolicy::resolve(&home, &proj).is_err(),
+                "{broken:?} has content and must still refuse"
+            );
+            assert!(
+                FsPolicy::settings_parse_ok(&home, &proj).is_err(),
+                "and the two readers must not disagree about {broken:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_submit_time_check_never_walks_the_workdir() {
+        // The submit-time check first shipped calling `resolve`, which is a CONSTRUCTION: it
+        // ends in a 20 000-entry depth-4 walk of the workdir whose own comment says
+        // "scan-once at construction". Per request, on Lustre, that is a timeout generator.
+        //
+        // The obvious test does not catch it: comparing verdicts passes against the bug,
+        // because `resolve` returns Ok whether the tree is empty or full. Counting the walk
+        // is the only assertion that discriminates.
+        let base = std::env::temp_dir().join(format!("husk-nowalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join(".claude")).unwrap();
+        std::fs::write(base.join(".claude/settings.json"), b"{}").unwrap();
+        let home = base.join("nonexistent-home");
+
+        let before = SCAN_CALLS.with(|c| c.get());
+        FsPolicy::settings_parse_ok(&home, &base).expect("valid settings parse");
+        assert_eq!(
+            SCAN_CALLS.with(|c| c.get()), before,
+            "the submit-time check must not trigger the workdir credential walk"
+        );
+
+        // ...and the counter is not vacuous: the construction path DOES walk.
+        FsPolicy::resolve(&home, &base).expect("resolve");
+        assert!(
+            SCAN_CALLS.with(|c| c.get()) > before,
+            "resolve must still walk, or this test proves nothing"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn settings_sources_are_all_write_denied_by_the_shipped_config() {
