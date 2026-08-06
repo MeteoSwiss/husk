@@ -156,7 +156,37 @@ That is the hardest sub-case: an address used as identity cannot be rewritten th
 proxy target can, so option 4 would have to supply a *bindable* address, not merely
 reachability.
 
-**The one refinement still worth measuring** is the PEER of that connection: does a rank talk
+**MEASURED 2026-08-06 (job 5022735), and it settles the boundary question.** Instrumented
+`mpi_hello` dumped its own fd table after `MPI_Init` in an uncaged 2-node run:
+
+```
+rank=0 host=nid001227 fd=3 local=0.0.0.0:27702        peer=0.0.0.0:0      st=0A  <- LISTENING
+rank=0 host=nid001227 fd=4 local=…97.54:27702  peer=…97.74:56708  st=01
+rank=1 host=nid001237 fd=4 local=…97.74:56708  peer=…97.54:27702  st=01
+```
+
+**Each rank LISTENS and they cross-connect directly across nodes.** So option 4 is out for
+this stack: there is no pre-existing connection to inherit when the rank itself creates the
+listener, and an inherited fd cannot cover a listener plus N inbound.
+
+**The decision that follows is robust to what that traffic actually is:** either way a rank
+must bind a listener and advertise an address another node can dial, and loopback is not
+advertisable — which is exactly what `_pmi_set_af_in_use` reports. **Multi-node therefore means
+dropping the per-rank netns, or building real container networking (veth + bridge + routes).**
+
+**Still genuinely open, and it decides how big the fix is, not whether one is needed:** is
+27702 the PALS/PMI control plane or MPI's own transport? It is NOT `PMI_CONTROL_PORT` (that was
+22125/22275, always the first of `SLURM_STEP_RESV_PORTS`), and both ranks listen on the same
+number, which reads as a derived service port rather than an ephemeral data socket. The
+discriminator is one run with the TCP provider disabled and CXI forced: if 27702 survives it is
+control, if it vanishes it was transport.
+
+**Not answered: whether PMI accepts an address it is handed.** The `pmi_addr_hint` arm came
+back inconclusive because the caged run died at `pals_init2() failed: 2` — the PALS launcher
+failing UPSTREAM of the address lookup, so `MPICH_INTERFACE_HOSTNAME` was never reached.
+
+Superseded, kept for the reasoning: the refinement worth measuring was the PEER of that
+connection: does a rank talk
 to its LOCAL stepd, or to a remote node? Local-only would mean a per-node relay is enough;
 remote means full inter-node routing. `C13` does not answer it yet — it inspects a `sh -c`,
 which never calls `MPI_Init` and so never opens the socket. It needs to dump the fd table from
