@@ -146,8 +146,29 @@ its sockets. The in-process variant — the workload calling `unshare(CLONE_NEWN
 after `MPI_Init` — is mechanically fine but requires the confined side to cooperate, which is
 the one thing husk's axiom forbids.
 
-**This option is cheaper than (1)–(3) if it applies, and free if the transport is already a
-socket path — but the existing evidence points the other way and should not be waved past.**
+**ANSWERED 2026-08-06 (jobs 5021103/5021116), and the answer is the expensive one.** Neither
+cheap mechanism exists on this stack: `C12` measured **zero AF_UNIX socket/connect calls** in a
+caged 2-rank run, so the rendezvous is not a Unix socket; and the rank's environment offers
+neither `PMIX_SERVER_URI` nor `PMI_FD`, so there is no filesystem path and no inherited fd to
+adopt. What is offered is `PMI_CONTROL_PORT` + `SLURM_STEP_RESV_PORTS`, and the netns failure
+is `_pmi_set_af_in_use: Unable to obtain IP address` — PMI determining **its own** address.
+That is the hardest sub-case: an address used as identity cannot be rewritten the way an HTTP
+proxy target can, so option 4 would have to supply a *bindable* address, not merely
+reachability.
+
+**The one refinement still worth measuring** is the PEER of that connection: does a rank talk
+to its LOCAL stepd, or to a remote node? Local-only would mean a per-node relay is enough;
+remote means full inter-node routing. `C13` does not answer it yet — it inspects a `sh -c`,
+which never calls `MPI_Init` and so never opens the socket. It needs to dump the fd table from
+inside the probe's own `mpi_hello` after `MPI_Init`, which is a small change to a binary the
+probe already builds.
+
+**Also now measured, and it narrows the problem a lot:** intra-node ranks in separate netns
+wire up **fine** — `cs_1node2rank_netns_shm` and `cs_1node2rank_netns_jobdir` both form real
+2-rank communicators, twice, reproducibly. PMI finds its same-node peer through the filesystem.
+So the netns boundary is not broken by PMI in general, only by the **inter-node** hop.
+
+Historic framing kept for the record:
 `_pmi_set_af_in_use: Unable to obtain IP address` is a real failure mode naming a real IP
 lookup, not merely a variable being set; and "obtain **its own** address" is the harder
 sub-case, because an address used as *identity* cannot be rewritten the way an HTTP proxy
