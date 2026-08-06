@@ -103,6 +103,23 @@ VALUE_OPTS = {
 }
 
 
+def submitted_line(job_id, argv):
+    """What sbatch prints on success — `--parsable` is an OUTPUT CONTRACT, not a preference.
+
+    husk classed `--parsable` as Ignored (accepted, silently discarded) and the stub always
+    printed the human line, so a driver doing `jobid=$(sbatch --parsable ...)` captured
+    "Submitted batch job 5023456" as its job id and its wait loop exited immediately (LETKF
+    session, 2026-08-07). The agent diagnosed it exactly and lost the run.
+
+    Nothing here is security-relevant: husk already has the id and prints it either way. This
+    is only which shape the caller asked for. Real sbatch prints `<jobid>`, or
+    `<jobid>;<cluster>` on a federation — we have no federation, so the bare id is right.
+
+    A function rather than an inline branch so it can be tested without a broker and a spool.
+    """
+    return str(job_id) if "--parsable" in argv else f"Submitted batch job {job_id}"
+
+
 def parse_invocation(argv):
     """Split argv into (script_source, script_name, script_body, job_args).
 
@@ -217,8 +234,17 @@ def main():
     status = resp.get("status")
     if tool == "sbatch":
         if status == "submitted":
-            # Mirror real sbatch's success line so the agent's tooling parses it.
-            print(f"Submitted batch job {resp.get('job_id')}")
+            # `--parsable` is an OUTPUT CONTRACT, so honour it here rather than dropping it.
+            #
+            # husk classed it Ignored — accepted, silently discarded — and the stub always
+            # printed the human line. A driver doing `jobid=$(sbatch --parsable ...)` then got
+            # "Submitted batch job 5023456" as its job id, and its wait loop exited at once
+            # (LETKF session, 2026-08-07). The agent diagnosed it correctly and lost the run.
+            #
+            # Nothing about the format is security-relevant: husk already knows the id and
+            # prints it either way. This is purely which shape the caller asked for.
+            # Real sbatch prints `<jobid>` (or `<jobid>;<cluster>` on a federation).
+            print(submitted_line(resp.get("job_id"), sys.argv[1:]))
             # Advice (e.g. the wall limit this job just inherited) goes to STDERR, where
             # real sbatch puts its own warnings — stdout stays exactly the line above so
             # anything parsing it is unaffected. A guardrail that moves a job somewhere

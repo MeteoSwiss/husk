@@ -202,7 +202,25 @@ pub const REGISTRY: &[OptSpec] = &[
     // single-threaded broker for the whole job runtime (the F2/F16 DoS shape). Dropped
     // rather than rejected: the submission is still perfectly valid without it, the
     // agent just gets its job id immediately and polls with squeue.
-    spec!("--wait", "-W", false, Class::Ignored, always_true),
+    // REJECTED, not Ignored. `--wait` blocks until the job finishes and returns its exit
+    // status, so silently dropping it makes `sbatch --wait && collect_results` proceed as
+    // though a job that is still queued had already succeeded. That is the same failure as
+    // the silently-dropped `--parsable` (LETKF, 2026-08-07) with a far worse consequence, and
+    // it is a control-flow contract rather than a preference — the caller cannot compensate
+    // for it, because from the outside a dropped `--wait` is indistinguishable from a job
+    // that finished instantly. Refusing teaches; dropping misleads. (P13)
+    spec!(
+        "--wait",
+        "-W",
+        false,
+        Class::Rejected(
+            "husk cannot block until a job finishes: the broker answers each request and \
+             returns, so --wait would exit immediately and your script would treat a queued \
+             job as a completed one. Submit without it and poll with `squeue -j <id>` or \
+             `sacct -j <id> -o State`."
+        ),
+        always_true
+    ),
     spec!("--quiet", "-Q", false, Class::Ignored, always_true),
     spec!("--verbose", "-v", false, Class::Ignored, always_true),
     spec!("--mail-type", "", true, Class::Ignored, always_true),
@@ -783,11 +801,32 @@ mod tests {
     }
 
     #[test]
-    fn wait_is_dropped_not_forwarded() {
-        // sbatch --wait blocks until the job COMPLETES, which would wedge the broker for
-        // the whole runtime. It must be swallowed, not passed through.
-        let out = interpret_cli(&v(&["--wait"])).expect("--wait must not be a hard error");
-        assert!(out.is_empty(), "--wait leaked into the submission: {out:?}");
+    fn wait_is_refused_because_silently_dropping_it_misleads_the_caller() {
+        // This test used to assert the opposite — that `--wait` is swallowed and "must not be
+        // a hard error". That was right about the mechanism and wrong about the contract.
+        //
+        // `sbatch --wait` blocks until the job COMPLETES and returns its exit status, so it
+        // must not be forwarded (it would wedge the broker for the whole runtime). But
+        // dropping it SILENTLY means `sbatch --wait && collect_results` runs the collection
+        // immediately, against a job that is still queued — and from the caller's side a
+        // dropped `--wait` is indistinguishable from a job that finished instantly, so it
+        // cannot compensate.
+        //
+        // The same class cost a run the day this changed: `--parsable` was also Ignored, so a
+        // driver's `jobid=$(sbatch --parsable ...)` captured "Submitted batch job N" and its
+        // wait loop exited at once. `--parsable` is honoured now (it is an output format, and
+        // husk has the id either way); `--wait` cannot be honoured, so it is refused with the
+        // reason. Refusing teaches, dropping misleads (P13), and the registry's own doc for
+        // `Rejected` already says so: dropping an option the user meant changes what their job
+        // does without telling them.
+        let e = interpret_cli(&v(&["--wait"])).expect_err("--wait must be refused, not dropped");
+        assert!(e.contains("--wait"), "the refusal must name it: {e}");
+        assert!(
+            e.contains("squeue") || e.contains("sacct"),
+            "and must say what to do instead, or it is a wall: {e}"
+        );
+        // The short form is the same option and must not slip through.
+        assert!(interpret_cli(&v(&["-W"])).is_err(), "-W is --wait");
     }
 
     #[test]
