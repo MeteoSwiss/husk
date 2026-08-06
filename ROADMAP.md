@@ -156,6 +156,29 @@ That is the hardest sub-case: an address used as identity cannot be rewritten th
 proxy target can, so option 4 would have to supply a *bindable* address, not merely
 reachability.
 
+### DECIDED 2026-08-06: ship it as a named, weaker profile; real support is v0.7
+
+Dropping `--unshare-net` for multi-node is **unsatisfying, and that is the point** — so it
+gets advertised as what it is rather than hidden. A `MultiNode` profile whose boundary is
+explicitly weaker: ranks share the host network, so **the egress proxy and its allowlist do
+not apply**, and AV8 (broker bypass) is reachable from a rank. Everything else — the
+filesystem cage, the seccomp profile, the resource envelope — is unchanged.
+
+Two constraints on how it ships, both from `P7` and from this project's own history:
+
+- **It must be LOUD.** `Profile::select` currently *rejects* multi-node rather than silently
+  downgrading to one node, for exactly the right reason (a wrong answer that looks like a
+  right one is the worst outcome available). The same rule applies here: a job that gets the
+  weaker boundary must say so, in the banner and in the job log, every time. An operator who
+  discovers the difference by reading the roadmap has been failed.
+- **It must be opt-in at the operator level**, not something an agent reaches by asking for
+  `--nodes=2`. The agent picks from what the operator allows; it does not pick its own
+  boundary.
+
+**Real multi-node containment is v0.7**: per-rank routable addressing (veth + bridge +
+routes), which is real container networking and the first thing husk would have built that
+needs it. Not before the v0.6 boundary work — owning the login cage is worth more.
+
 **MEASURED 2026-08-06 (job 5022735), and it settles the boundary question.** Instrumented
 `mpi_hello` dumped its own fd table after `MPI_Init` in an uncaged 2-node run:
 
