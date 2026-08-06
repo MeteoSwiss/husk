@@ -103,6 +103,45 @@ VALUE_OPTS = {
 }
 
 
+# Options husk ACCEPTS and then does not apply, with the reason the caller needs.
+#
+# `Class::Ignored` in the registry means "recognised, dropped" — and a silent drop is a
+# behaviour change the caller asked for and is not told about. That cost a run when
+# `--parsable` was dropped (the driver parsed "Submitted batch job N" as a job id), and it
+# had already cost an hour when `#SBATCH` resource options were dropped. Same class, twice.
+# So the ones that cannot be honoured say so instead (P13).
+#
+# `--parsable` is not here: it IS honoured now. `--wait` is not here either: it is refused by
+# the broker, because a dropped `--wait` makes a caller treat a queued job as a finished one
+# and there is no way for it to notice.
+UNAPPLIED = {
+    "--mail-type": "husk does not forward job mail",
+    "--mail-user": "husk does not forward job mail — it is sent by slurmctld and carries the "
+                   "job name, so it would leave the cluster without passing husk's egress "
+                   "allowlist",
+    "--verbose": "husk constructs its own sbatch invocation; what it forced is in the job "
+                 "banner and in husk's log for this session",
+    "-v": "husk constructs its own sbatch invocation; what it forced is in the job banner "
+          "and in husk's log for this session",
+}
+
+
+def unapplied_note(argv):
+    """One line naming every option husk accepted but did not apply, or None."""
+    seen = []
+    for a in argv:
+        name = a.split("=", 1)[0]
+        if name in UNAPPLIED and name not in [n for n, _ in seen]:
+            seen.append((name, UNAPPLIED[name]))
+    if not seen:
+        return None
+    if len(seen) == 1:
+        return f"{seen[0][0]} was accepted but not applied: {seen[0][1]}."
+    names = ", ".join(n for n, _ in seen)
+    why = "; ".join(f"{n}: {w}" for n, w in seen)
+    return f"these options were accepted but not applied: {names} ({why})."
+
+
 def submitted_line(job_id, argv):
     """What sbatch prints on success — `--parsable` is an OUTPUT CONTRACT, not a preference.
 
@@ -244,14 +283,23 @@ def main():
             # Nothing about the format is security-relevant: husk already knows the id and
             # prints it either way. This is purely which shape the caller asked for.
             # Real sbatch prints `<jobid>` (or `<jobid>;<cluster>` on a federation).
-            print(submitted_line(resp.get("job_id"), sys.argv[1:]))
+            argv_rest = sys.argv[1:]
+            print(submitted_line(resp.get("job_id"), argv_rest))
             # Advice (e.g. the wall limit this job just inherited) goes to STDERR, where
             # real sbatch puts its own warnings — stdout stays exactly the line above so
             # anything parsing it is unaffected. A guardrail that moves a job somewhere
             # with different limits should say so at submit time, not leave it to squeue.
+            # `--quiet` is honoured for husk's OWN advisories, which are the analogue of the
+            # informational messages real sbatch suppresses. stdout is left alone either way:
+            # it is the machine-readable contract, and suppressing it would break a caller
+            # that greps for the id — the very failure this whole change is about.
+            quiet = "--quiet" in argv_rest or "-Q" in argv_rest
             note = resp.get("message", "")
-            if note:
+            if note and not quiet:
                 sys.stderr.write(f"{tool_name()}: husk: {note.strip()}\n")
+            unapplied = unapplied_note(argv_rest)
+            if unapplied and not quiet:
+                sys.stderr.write(f"{tool_name()}: husk: {unapplied}\n")
             sys.exit(int(resp.get("exit_code", 0)))
         die(resp.get("message", "submission rejected by broker"), from_husk=True,
             code=int(resp.get("exit_code", 1)))

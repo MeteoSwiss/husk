@@ -52,6 +52,30 @@ check "--parsable-ish is not --parsable" "Submitted batch job 5023456" "$(line -
 check "a script named --parsable is not the flag" \
       "Submitted batch job 5023456" "$(line --comment=--parsable)"
 
+note() { # argv...
+  python3 - "$STUB" "$@" <<'PY2'
+import importlib.util as u, sys
+spec = u.spec_from_file_location("stub", sys.argv[1])
+m = u.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.unapplied_note(sys.argv[2:]) or "<none>")
+PY2
+}
+
+echo "-- an option husk accepts and does not apply must SAY so (P13) --"
+check "nothing dropped -> silent" "<none>" "$(note --partition=pp-short)"
+case "$(note --mail-user=a@b.c)" in
+  *"--mail-user was accepted but not applied"*egress*)
+     pass=$((pass+1)); printf '  ok    %s\n' "--mail-user names itself and the reason" ;;
+  *) fail=$((fail+1)); printf '  FAIL  --mail-user note: %s\n' "$(note --mail-user=a@b.c)" ;;
+esac
+case "$(note --mail-type=END --mail-user=a@b.c)" in
+  *"--mail-type, --mail-user"*)
+     pass=$((pass+1)); printf '  ok    %s\n' "two dropped options are listed together" ;;
+  *) fail=$((fail+1)); printf '  FAIL  combined note: %s\n' "$(note --mail-type=END --mail-user=a@b.c)" ;;
+esac
+# --parsable is HONOURED, so it must never appear in the not-applied list.
+check "--parsable is applied, not announced" "<none>" "$(note --parsable)"
+
 echo
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

