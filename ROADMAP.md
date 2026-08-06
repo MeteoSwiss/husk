@@ -159,7 +159,46 @@ broker, which session, which policy, which partitions, is the boundary actually 
 
 ---
 
-## Track F — the guard becomes a program
+## Track F — break up the two functions that carry the bug history
+
+**The module structure survived 213 commits; the function structure did not.** Measured
+2026-08-06, on the code that ships v0.5:
+
+| | |
+|---|---|
+| `wrap_script` | 624 lines |
+| `decide` | 454 lines |
+| **together** | **1,078 of `policy.rs`'s 1,563 code lines — 69%** |
+
+The dependency graph is still a clean DAG with no cycles, and the seven modules added since
+v0.4 (`rank`, `step`, `srun`, `netproxy`, `netallow`, `profile`, `cage`) all landed as proper
+layers rather than as extensions of existing files. That is the part that usually rots first
+under incremental growth, and it held.
+
+What drifted is inside those two functions, and **they are the two most security-critical in
+the project**: `decide` is the submission gate (F13/F14/F24/F26/F27 and the `#SBATCH` CRITICAL
+all lived there), `wrap_script` is the guard generator (B5's *4 of 7 shipped guard bugs were
+quoting, interpolation or scoping*, plus the 2026-08-06 silent hang).
+
+That is not coincidence. **Both of this project's recurring bug classes are the failure mode of
+a 500-line linear sequence of conditionals** — in a function that long, "is this handled on
+every path" is not visible by reading, so it does not get checked. The srun hang was a nested
+`if` with no `else` at line ~1375 of a 624-line emitter. The `#SBATCH` outage was a branch that
+validated body directives and then failed to re-emit them.
+
+Three ordered steps. **The order is the point:** each one makes the next checkable.
+
+### F1 — split `guard.rs` out of `policy.rs`
+
+`policy.rs` does two unrelated jobs that share a name and nothing else: a **gate** (decide what
+is permitted) and a **code generator** (emit the guard). Separating them halves the file and
+gives the guard a defined input type instead of eight captured locals.
+
+Mechanical, and **verifiable byte-for-byte against `tests/golden/guard-net-{on,off}.sh`** —
+"prove the bytes are identical." Do it FIRST, because F2 retires that oracle: a program emits
+no bytes to compare. This is the last moment the goldens can check a refactor of this code.
+
+### F2 — the guard becomes a program
 
 **Decided 2026-08-06: the job guard should be compiled Rust, not generated bash.** This
 supersedes the "deferred typed shell builder" that `review-v0.5/B5-guard-generation.md` left
@@ -205,10 +244,28 @@ is observable — mount table, processes, exit status, messages, what survives c
 that harness is the first deliverable, not the second; without it this is the act of faith the
 goldens exist to prevent.
 
-**Sequencing.** After v0.5 ships. The current guard is freshly hardware-verified on both
-clusters and the pen-test re-run targets it; rewriting it now would discard that verification
-and invalidate briefs that were just refreshed against it. It likely lands with or before 6a,
-since both are "husk owns this layer rather than driving someone else's".
+### F3 — `decide` becomes a sequence of named rules
+
+A different argument from F2's, and worth keeping distinct: this one is not about types or
+RAII, it is about **making a property checkable that is currently only hoped for**.
+
+454 lines of inline conditionals decide, among other things, which options reach sbatch. The
+`#SBATCH` CRITICAL was an option that no rule re-emitted, and nothing could have told you that
+by reading — there is no place where "every option is decided by exactly once rule" is
+expressible. As a sequence of named rules over a request, it becomes a test: enumerate the
+registry, assert each entry is claimed by exactly one rule, fail on an option that is claimed
+by none or by two.
+
+That directly retires the shape of F13/F14/F24/F26/F27 and the `#SBATCH` outage, none of which
+were quoting bugs and none of which F2 would catch either.
+
+### Sequencing for the whole track
+
+**After v0.5 ships.** The guard is hardware-verified at 91/0/0 on Balfrin and 92/0/1 on Santis
+at `7505d67`, and the pen-test briefs were refreshed against exactly this code; refactoring now
+discards that verification and sends reviewers at a ghost. F2 likely lands with or before 6a,
+since both are "husk owns this layer rather than driving someone else's". F1 is cheap and
+should not wait long after the release — it is the one step whose oracle expires.
 
 ---
 
