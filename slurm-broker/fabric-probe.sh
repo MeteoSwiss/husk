@@ -203,11 +203,81 @@ head2 "C5/C6/C1-def — MPI: singleton, 1-rank NIC dependency, 2-rank over the c
 cat > "$WORK/mpi_hello.c" <<'C'
 #include <mpi.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <unistd.h>
+
+/* Dump the sockets THIS process holds, after MPI_Init.
+ *
+ * Three earlier attempts to answer "which PMI transport is in use" all failed the same
+ * way: they inspected a process that had no reason to open one — a singleton, then a
+ * `sh -c`. Only a real rank that has completed MPI_Init holds the connection, so the
+ * only honest place to look is from inside this program.
+ *
+ * Gated behind an env var because several probe arms parse this program's stdout and
+ * COUNT its lines to detect singleton fallback; extra lines would break them.
+ *
+ * Resolved from our own fd table against the /proc/net tables, so it is process-scoped
+ * construction — `ss` without filtering returned the whole node's Lustre mounts. */
+static void fmt4(const char *hex, char *out, size_t n){
+  unsigned a, port;
+  if (sscanf(hex, "%8X:%4X", &a, &port) == 2)
+    snprintf(out, n, "%u.%u.%u.%u:%u",
+             a & 0xff, (a >> 8) & 0xff, (a >> 16) & 0xff, (a >> 24) & 0xff, port);
+  else snprintf(out, n, "%s", hex);
+}
+static void scan_net(const char *file, unsigned long want, int rank, const char *host,
+                     const char *fd, int v6){
+  FILE *f = fopen(file, "r"); if (!f) return;
+  char line[512]; if (!fgets(line, sizeof line, f)) { fclose(f); return; }
+  while (fgets(line, sizeof line, f)) {
+    char loc[128], rem[128], st[16]; unsigned long ino = 0;
+    if (sscanf(line, " %*d: %127s %127s %15s %*s %*s %*s %*d %*d %lu",
+               loc, rem, st, &ino) == 4 && ino == want) {
+      char l[132], r[132];
+      if (v6) { snprintf(l, sizeof l, "%s", loc); snprintf(r, sizeof r, "%s", rem); }
+      else { fmt4(loc, l, sizeof l); fmt4(rem, r, sizeof r); }
+      printf("SOCK rank=%d host=%s fd=%s proto=%s local=%s peer=%s st=%s\n",
+             rank, host, fd, v6 ? "tcp6" : "tcp", l, r, st);
+    }
+  }
+  fclose(f);
+}
+static void dump_sockets(int rank){
+  if (!getenv("HUSK_PROBE_DUMP_SOCKETS")) return;
+  char host[256] = "?"; gethostname(host, sizeof host);
+  DIR *d = opendir("/proc/self/fd"); if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d))) {
+    char p[512], t[512]; int n;
+    if (e->d_name[0] == '.') continue;
+    snprintf(p, sizeof p, "/proc/self/fd/%s", e->d_name);
+    n = readlink(p, t, sizeof t - 1); if (n < 0) continue; t[n] = 0;
+    if (strncmp(t, "socket:[", 8) != 0) continue;
+    unsigned long ino = strtoul(t + 8, NULL, 10);
+    scan_net("/proc/net/tcp",  ino, rank, host, e->d_name, 0);
+    scan_net("/proc/net/tcp6", ino, rank, host, e->d_name, 1);
+    /* A unix hit means the rendezvous is a filesystem path and a netns cannot block it. */
+    FILE *u = fopen("/proc/net/unix", "r");
+    if (u) { char line[512];
+      while (fgets(line, sizeof line, u)) {
+        unsigned long uino = 0; char path[256] = "";
+        if (sscanf(line, "%*x: %*x %*x %*x %*x %*x %lu %255s", &uino, path) >= 1 && uino == ino)
+          printf("SOCK rank=%d host=%s fd=%s proto=unix path=%s\n",
+                 rank, host, e->d_name, path[0] ? path : "(unnamed)");
+      }
+      fclose(u); }
+  }
+  closedir(d);
+}
+
 int main(int argc, char** argv){
   int rank=0,size=1; MPI_Init(&argc,&argv);
   MPI_Comm_rank(MPI_COMM_WORLD,&rank); MPI_Comm_size(MPI_COMM_WORLD,&size);
   int sum=0; MPI_Allreduce(&rank,&sum,1,MPI_INT,MPI_SUM,MPI_COMM_WORLD);
   printf("MPI rank %d/%d allreduce=%d\n", rank, size, sum);
+  dump_sockets(rank);
   MPI_Finalize(); return 0;
 }
 C
@@ -739,6 +809,87 @@ elif [ -n "${SLURM_JOB_ID:-}" ]; then
   fnd C13 pmi_transport "SKIP — needs -N2. Intra-node PMI wires up through the filesystem (C10: netns_shm and netns_jobdir both OK), so a 1-node run cannot see the transport that fails."
 else
   fnd C13 pmi_transport "SKIP — not in a SLURM allocation"
+fi
+
+# ============================================================================
+# C14 — DAYS OR WEEKS? The peer of the PMI connection decides it.
+#
+# `_pmi_set_af_in_use: Unable to obtain IP address` does NOT mean the rank has no address.
+# Loopback works in there — the egress relay binds 127.0.0.1:3128 inside exactly this
+# namespace and `steps.egress` passes on both clusters. It means PMI REJECTED loopback and
+# found nothing else, because it wants an address it can ADVERTISE, not one to connect from.
+#
+# So the cost of multi-node containment turns on who the rank actually talks to:
+#
+#   peer on the SAME node   ranks only reach their own node's stepd, and the control planes
+#                           carry the inter-node traffic themselves. A bind-mounted socket
+#                           or a per-node relay is then enough. DAYS.
+#   peer on ANOTHER node    ranks connect directly across nodes, so a caged rank needs a
+#                           genuinely routable address: veth, bridge, routes. That is real
+#                           container networking, which husk has deliberately never needed.
+#                           WEEKS.
+#
+# Measured UNCAGED on purpose: the question is what a WORKING bootstrap does. A failing one
+# tells us nothing about the topology it would have used.
+head2 "C14 — days or weeks: who is the PMI peer, and will PMI take an address we give it?"
+[ "${#TMO[@]}" -gt 0 ] 2>/dev/null || { TMO=(); have timeout && TMO=(timeout -k 5 60); }
+if [ -n "${CCX:-}" ] && [ -n "${SLURM_JOB_ID:-}" ] && [ "${SLURM_NNODES:-1}" -ge 2 ]; then
+  # The allocation's node addresses, so "same node" is decided by data rather than by eye.
+  ${TMO[@]+"${TMO[@]}"} srun -N2 -n2 --overlap sh -c 'echo "$(hostname) $(hostname -i)"' \
+    2>/dev/null | sort -u > "$WORK/nodeips"
+  say "-- allocation node addresses --"; sed 's/^/   /' "$WORK/nodeips"
+
+  c14="$(HUSK_PROBE_DUMP_SOCKETS=1 ${TMO[@]+"${TMO[@]}"} \
+         srun -N2 -n2 "$SHARED/mpi_hello" 2>&1)"
+  say ""
+  say "-- sockets held by each rank after MPI_Init (uncaged 2-node) --"
+  printf '%s\n' "$c14" | grep '^SOCK' | sed 's/^/   /'
+  if ! printf '%s\n' "$c14" | grep -q '^SOCK'; then
+    fnd C14 pmi_peer "NO SOCKETS reported — either the run failed ($(one_line "$c14" | cut -c1-140)) or this MPI holds no PMI socket past MPI_Init"
+  else
+    # Classify every tcp peer: is its IP one of THIS rank's own node, or another node's?
+    local_hits=0; remote_hits=0; unix_hits=0
+    while read -r host peer proto; do
+      case "$proto" in
+        unix) unix_hits=$((unix_hits+1)); continue ;;
+      esac
+      ownip="$(awk -v h="$host" '$1==h {print $2}' "$WORK/nodeips" | head -1)"
+      case "$peer" in
+        "${ownip%%:*}":*|127.0.0.1:*) local_hits=$((local_hits+1)) ;;
+        0.0.0.0:*|"") ;;
+        *) remote_hits=$((remote_hits+1)) ;;
+      esac
+    done <<EOF
+$(printf '%s\n' "$c14" | sed -n 's/^SOCK .*host=\([^ ]*\).*peer=\([^ ]*\).*proto=\([^ ]*\).*/\1 \2 \3/p'
+  printf '%s\n' "$c14" | sed -n 's/^SOCK .*host=\([^ ]*\) .*proto=\([^ ]*\) local=[^ ]* peer=\([^ ]*\).*/\1 \3 \2/p')
+EOF
+    if [ "$unix_hits" -gt 0 ]; then
+      fnd C14 pmi_peer "UNIX socket(s) held — the rendezvous is a filesystem path; a netns never blocked it. HOURS."
+    elif [ "$remote_hits" -gt 0 ]; then
+      fnd C14 pmi_peer "REMOTE peer(s) ($remote_hits local=$local_hits) — ranks talk ACROSS nodes, so a caged rank needs a routable address. WEEKS."
+    elif [ "$local_hits" -gt 0 ]; then
+      fnd C14 pmi_peer "LOCAL peers only ($local_hits) — ranks reach their own node's stepd; the control planes carry the rest. A per-node relay or bound socket suffices. DAYS."
+    else
+      fnd C14 pmi_peer "sockets found but no peer classified — read the SOCK lines above"
+    fi
+  fi
+
+  # THE CHEAP SHOT. If PMI will accept an address we hand it, the netns needs a dummy
+  # address rather than a route, and this becomes hours instead of days. Cray MPICH reads
+  # MPICH_INTERFACE_HOSTNAME; if that is enough to get past _pmi_set_af_in_use inside a
+  # netns, the whole routing question is moot.
+  say ""
+  out="$(${TMO[@]+"${TMO[@]}"} srun -N2 -n2 \
+         bwrap "${BWRAP_BASE[@]}" ${CXIB[@]+"${CXIB[@]}"} --unshare-net \
+               --bind "$SHARED" "$SHARED" -- \
+         env MPICH_INTERFACE_HOSTNAME=127.0.0.1 "$SHARED/mpi_hello" 2>&1)"
+  case "$out" in
+    *"allreduce=1"*) fnd C14 pmi_addr_hint "OK — MPICH_INTERFACE_HOSTNAME got a CAGED 2-node run past the address lookup. HOURS, not days: $(one_line "$out")" ;;
+    *_pmi_set_af_in_use*) fnd C14 pmi_addr_hint "no — still 'Unable to obtain IP address' with the hint set; PMI does not take an address it is given here" ;;
+    *) fnd C14 pmi_addr_hint "inconclusive [$(why "$out")]: $(one_line "$out" | cut -c1-200)" ;;
+  esac
+else
+  fnd C14 pmi_peer "SKIP — needs a compiler and -N2 (the failing geometry is inter-node only)"
 fi
 
 # ============================================================================
