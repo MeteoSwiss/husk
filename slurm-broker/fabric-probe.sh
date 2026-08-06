@@ -7,11 +7,25 @@
 # yet; these are the facts that will inform it. Output is a report; read it back into
 # the design doc's "verify-on-hardware" section.
 #
-# HOW TO RUN — inside your OWN allocation (you have the rights; this bypasses husk):
-#     salloc -N1 -n2 -p <partition> [-A <acct>]      # -N2 for a true inter-node fabric test
-#     <activate your uenv>                            # so fi_info / cc / MPI are on PATH
-#     slurm-broker/fabric-probe.sh
-#   or:  sbatch -N1 -n2 -p <partition> slurm-broker/fabric-probe.sh
+# HOW TO RUN — inside your OWN allocation (you have the rights; this bypasses husk).
+#
+# USE sbatch. This probe must execute ON a compute node, and on Alps `salloc` returns a
+# shell that is STILL ON THE LOGIN NODE — so running the script after `salloc` measures
+# the login node while looking exactly like a compute-node run. That cost a full round
+# (2026-08-05) and produced a C1 claim that had to be withdrawn. There is now a guard that
+# warns when an allocation is held but the shell is not on a compute node; heed it rather
+# than working around it.
+#
+#     sbatch -N2 -n4 -p <partition> --time=00:20:00 -o fabric-probe-%j.out \
+#            --uenv=<label> --view=<view> slurm-broker/fabric-probe.sh
+#
+#   -N2 is the one that matters: a single node can satisfy 2 ranks over shared memory and
+#   hide the netns x CXI question entirely. -N1 answers the intra-node arms only.
+#   --uenv/--view so fi_info / cc / MPI are on PATH inside the job; without them the
+#   compile arms skip and most of the report is empty.
+#
+# If you really want an interactive shell on the node: `srun --overlap --pty bash` from
+# INSIDE an existing allocation, not `salloc` alone.
 #
 # SAFE: read-only discovery + two throwaway test binaries in a tempdir. No writes
 # outside $TMPDIR, no scheduler state changed.
