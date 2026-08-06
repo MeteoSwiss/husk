@@ -679,31 +679,64 @@ fi
 #
 # So: dump what a rank actually sees, and look at what the rank actually has OPEN. The
 # environment says what was offered; the fd table and the socket list say what was taken.
+# Run 2026-08-06 (job 5021103) proved the FIRST version of this arm useless, twice over, and
+# both mistakes are worth stating because they are the ones this probe keeps making:
+#
+#   * it ran `-n1`. A singleton never wires PMI up at all (MPICH goes singleton-init), so it
+#     observed a process that had no reason to touch the transport. PMI_SIZE=1 in the output
+#     says so plainly.
+#   * it dumped `ss` NODE-WIDE. What came back was chronyd, systemd, dbus, sssd and the
+#     node's Lustre mounts on port 988 — none of it the rank's. The Process column was empty
+#     because ss could not attribute any of it.
+#
+# The fix for both: run MULTI-RANK ACROSS TWO NODES (the only geometry that fails), and scope
+# the socket list to the rank's OWN fds by resolving socket:[inode] against /proc/net/*.
+# That is process-scoped by construction and needs no ss attribution.
 head2 "C13 — PMI transport: what is offered vs what is actually used"
-if [ -n "${SLURM_JOB_ID:-}" ]; then
-  say "-- PMI/PMIX environment as a rank sees it --"
-  srun --overlap -n1 sh -c 'env | grep -E "^(PMI|PMIX|SLURM_STEP_RESV_PORTS|SLURM_MPI)" | sort' \
-    2>/dev/null | sed 's/^/   /'
+# TMO is set inside the compile block above, which does not run without a compiler. Without
+# this, C13's sruns would be the only UNBOUNDED ones in the probe — and an srun that cannot
+# wire up does not fail, it stalls (C10 measured exactly that: HANG killed at the 90s wall).
+[ "${#TMO[@]}" -gt 0 ] 2>/dev/null || { TMO=(); have timeout && TMO=(timeout -k 5 60); }
+if [ -n "${SLURM_JOB_ID:-}" ] && [ "${SLURM_NNODES:-1}" -ge 2 ]; then
+  say "-- PMI/PMIX environment, as rank 0 of a REAL 2-node step sees it --"
+  ${TMO[@]+"${TMO[@]}"} srun -N2 -n2 --overlap sh -c '
+      [ "${PMI_RANK:-${SLURM_PROCID:-0}}" = 0 ] || exit 0
+      env | grep -E "^(PMI|PMIX|SLURM_STEP_RESV_PORTS|SLURM_MPI)" | sort' 2>/dev/null \
+    | sed 's/^/   /'
   say ""
-  say "-- what a rank has OPEN during MPI init (the deciding evidence) --"
-  # ls -l /proc/self/fd shows socket:[inode] for sockets; ss maps inode -> endpoint.
-  # A unix socket here means the netns is irrelevant; a tcp socket means it is not.
-  srun --overlap -n1 sh -c '
-      ls -l /proc/self/fd 2>/dev/null | sed -n "s/.*-> //p" | grep -E "socket|pipe" | sort | uniq -c
-      echo "--- unix sockets this rank holds ---"
-      ss -xp 2>/dev/null | head -20
-      echo "--- tcp sockets this rank holds ---"
-      ss -tnp 2>/dev/null | head -20' 2>/dev/null | sed 's/^/   /'
+  say "-- the sockets THIS RANK holds, resolved from its own fd table --"
+  # For each socket:[inode] in our fd table, find that inode in /proc/net/{unix,tcp,tcp6}.
+  # A unix hit means the rendezvous is a filesystem path and a netns cannot block it; a tcp
+  # hit means it is an address, and then the peer column says who it is talking to.
+  ${TMO[@]+"${TMO[@]}"} srun -N2 -n2 --overlap sh -c '
+      [ "${PMI_RANK:-${SLURM_PROCID:-0}}" = 0 ] || exit 0
+      for fd in /proc/self/fd/*; do
+        t=$(readlink "$fd" 2>/dev/null) || continue
+        case "$t" in
+          socket:\[*\])
+            ino=${t#socket:[}; ino=${ino%]}
+            if hit=$(grep -w "$ino" /proc/net/unix 2>/dev/null); then
+              echo "  fd ${fd##*/}  UNIX   $hit"
+            elif hit=$(grep -w "$ino" /proc/net/tcp /proc/net/tcp6 2>/dev/null); then
+              echo "  fd ${fd##*/}  TCP    $hit"
+            else
+              echo "  fd ${fd##*/}  socket inode $ino (not in /proc/net/{unix,tcp,tcp6})"
+            fi ;;
+          *) echo "  fd ${fd##*/}  $t" ;;
+        esac
+      done' 2>/dev/null | sed 's/^/   /'
   say ""
-  if srun --overlap -n1 sh -c 'env | grep -q "^PMIX_SERVER_URI"' 2>/dev/null; then
-    fnd C13 pmi_transport "PMIX_SERVER_URI is set — the rendezvous is a FILESYSTEM path, so a netns does not block it. Bind it like the egress socket."
-  elif srun --overlap -n1 sh -c 'env | grep -q "^PMI_FD"' 2>/dev/null; then
-    fnd C13 pmi_transport "PMI_FD is set — the transport is an INHERITED FD, which survives unshare-net for free."
-  elif srun --overlap -n1 sh -c 'env | grep -q "^PMI_CONTROL_PORT"' 2>/dev/null; then
-    fnd C13 pmi_transport "only PMI_CONTROL_PORT — LOOKS like TCP, but check the ss output above before believing it: a variable being SET is not proof it is used."
-  else
-    fnd C13 pmi_transport "no PMI_* rendezvous variable found — read the dumps above"
-  fi
+  # The verdict is read from the ENV, but only as a hint — the fd table above is the evidence.
+  _c13env=$(${TMO[@]+"${TMO[@]}"} srun -N2 -n2 --overlap sh -c \
+      '[ "${PMI_RANK:-${SLURM_PROCID:-0}}" = 0 ] && env' 2>/dev/null)
+  case "$_c13env" in
+    *PMIX_SERVER_URI=*) fnd C13 pmi_transport "PMIX_SERVER_URI is set — a FILESYSTEM rendezvous, which crosses a netns natively. Bind it like the egress socket." ;;
+    *PMI_FD=*)          fnd C13 pmi_transport "PMI_FD is set — an INHERITED FD, which survives unshare-net for free." ;;
+    *PMI_CONTROL_PORT=*) fnd C13 pmi_transport "PMI_CONTROL_PORT only. Read the fd table above before concluding TCP — the variable being SET is not proof it is used, and run 5021103 showed a rank holding exactly ONE socket." ;;
+    *)                  fnd C13 pmi_transport "no PMI_* rendezvous variable found — read the dumps above" ;;
+  esac
+elif [ -n "${SLURM_JOB_ID:-}" ]; then
+  fnd C13 pmi_transport "SKIP — needs -N2. Intra-node PMI wires up through the filesystem (C10: netns_shm and netns_jobdir both OK), so a 1-node run cannot see the transport that fails."
 else
   fnd C13 pmi_transport "SKIP — not in a SLURM allocation"
 fi
