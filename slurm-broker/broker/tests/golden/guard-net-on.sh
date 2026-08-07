@@ -416,6 +416,25 @@ echo "husk:   strace -f -o trace.log <your command>" >&2
 echo "husk: the cage stays fully enforcing; the last call before the SIGSYS kill in" >&2
 echo "husk: trace.log is the blocked one. Send it to us if it should be allowed." >&2
 fi
+# THE LAST LINE, on every path husk controls.
+#
+# Its ABSENCE is the diagnostic. A trapped signal gets the block above, which names sacct.
+# But SIGKILL - the OOM killer, a cgroup limit, scancel -9 - cannot be trapped, so the job
+# vanishes and husk writes nothing at all. An agent then cannot tell a husk refusal from
+# the machine taking the job away, and the LETKF session burned a second 128-rank
+# allocation on exactly that ambiguity: it read a silent death as a transient node fault
+# and retried.
+#
+# So: if this line is in the job output, husk reached the end and the exit status is the
+# workload own. If it is missing, the job was killed in a way nothing inside it could
+# observe, and sacct is the only place the reason exists.
+#
+# ONE terse line, deliberately. The first version explained all of that here, on every
+# job including every successful one, and a test caught it: husk must not comment on an
+# ordinary failure or every failing job looks like a sandbox problem. The marker has to
+# be PRESENT to make its absence mean something; it does not have to be loud. The
+# explanation belongs in the skill, which is read once, not in every job output.
+echo "husk: job guard finished (rc=$_husk_rc)" >&2
 exit "$_husk_rc"
 fi
 # --- injected by husk-slurm-broker: egress relay into the cage ---

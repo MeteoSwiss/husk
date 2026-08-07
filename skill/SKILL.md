@@ -168,6 +168,33 @@ Anything not listed anywhere is refused as an unsupported option: husk submits a
 - **`scontrol` and `sacctmgr` cannot reach the controller.** You cannot check partition limits
   or QOS from inside; ask the human.
 
+## If a job dies and nothing says why
+
+husk's guard prints a last line on every path it controls:
+
+```
+husk: job guard finished (rc=N)
+```
+
+**If that line is missing from the job's output, husk never got to the end** — the job was
+killed in a way nothing inside it could catch: the OOM killer, a cgroup limit, `scancel -9`.
+That is not husk refusing you, and husk cannot report it, because the process was gone before
+any handler could run.
+
+Do not read it as a transient node fault and retry. A previous session did exactly that and
+burned a second 128-rank allocation. Ask for:
+
+```
+sacct -j <jobid> -o State,ExitCode,MaxRSS,ReqMem
+```
+
+`State=OUT_OF_MEMORY` with `MaxRSS` near `ReqMem` is the common one. Remember that `/dev/shm`
+counts against your memory allocation.
+
+If the job was *trapped* instead — preemption, the wall limit, `scancel` — husk prints a
+loud block saying the output is INCOMPLETE. Believe it: a model that does not checkpoint
+leaves an output directory that looks like a finished run.
+
 ## What to do when you are stuck
 
 1. **Read the banner and husk's messages.** They name the layer and usually the remedy.

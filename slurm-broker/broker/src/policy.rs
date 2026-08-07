@@ -1647,6 +1647,25 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
     echo \"husk: the cage stays fully enforcing; the last call before the SIGSYS kill in\" >&2\n\
     echo \"husk: trace.log is the blocked one. Send it to us if it should be allowed.\" >&2\n\
   fi\n\
+  # THE LAST LINE, on every path husk controls.\n\
+  #\n\
+  # Its ABSENCE is the diagnostic. A trapped signal gets the block above, which names sacct.\n\
+  # But SIGKILL - the OOM killer, a cgroup limit, scancel -9 - cannot be trapped, so the job\n\
+  # vanishes and husk writes nothing at all. An agent then cannot tell a husk refusal from\n\
+  # the machine taking the job away, and the LETKF session burned a second 128-rank\n\
+  # allocation on exactly that ambiguity: it read a silent death as a transient node fault\n\
+  # and retried.\n\
+  #\n\
+  # So: if this line is in the job output, husk reached the end and the exit status is the\n\
+  # workload own. If it is missing, the job was killed in a way nothing inside it could\n\
+  # observe, and sacct is the only place the reason exists.\n\
+  #\n\
+  # ONE terse line, deliberately. The first version explained all of that here, on every\n\
+  # job including every successful one, and a test caught it: husk must not comment on an\n\
+  # ordinary failure or every failing job looks like a sandbox problem. The marker has to\n\
+  # be PRESENT to make its absence mean something; it does not have to be loud. The\n\
+  # explanation belongs in the skill, which is read once, not in every job output.\n\
+  echo \"husk: job guard finished (rc=$_husk_rc)\" >&2\n\
   exit \"$_husk_rc\"\n\
 fi\n\
 {net_relay}{banner}# --- hand off to the agent's script, inside the cage ---\n"
@@ -2376,11 +2395,20 @@ mod tests {
         // The guard may report CONFIGURATION (an inactive step pair) — that is a startup
         // fact, not a verdict on the job. What it must never do is comment on the
         // failure itself, or every failing job would look like a sandbox problem.
+        //
+        // `job guard finished` is exempt for the same reason: it is a statement about the
+        // GUARD, not about the workload, and it carries no opinion. It has to appear on
+        // every normal path — including success — because the whole signal is its ABSENCE:
+        // a job killed by SIGKILL (OOM, a cgroup, `scancel -9`) traps nothing and writes
+        // nothing, and a previous session read that silence as a node fault and burned a
+        // second 128-rank allocation retrying. One line, no editorialising; the meaning is
+        // explained in the skill rather than in every job's output.
         let about_failure: Vec<&str> = err
             .lines()
             .filter(|l| l.contains("husk:") && !l.contains("srun") && !l.contains("stub=")
                         && !l.contains("broker=") && !l.contains("slurmctld")
-                        && !l.contains("installed prefix"))
+                        && !l.contains("installed prefix")
+                        && !l.contains("job guard finished"))
             .collect();
         assert!(
             about_failure.is_empty(),
