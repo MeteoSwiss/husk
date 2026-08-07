@@ -33,6 +33,63 @@ pub enum Class {
     Rejected(&'static str),
 }
 
+/// The option contract, as markdown, for husk's user-facing skill.
+///
+/// GENERATED FROM `REGISTRY`, because the alternative is a second statement of the same
+/// contract in prose, and two statements of one thing drift (`P8`). Every friction report so
+/// far has been about this table — options silently dropped, options refused without a
+/// reason — so a stale copy of it would actively mislead the party it exists to help.
+///
+/// Emitted by `husk-slurm-broker --print-option-contract` and pasted into the skill by
+/// `slurm-broker/skill/build.sh`, so regenerating is one command and reviewing is a diff.
+pub fn option_contract_markdown() -> String {
+    let mut forced = Vec::new();
+    let mut allowed = Vec::new();
+    let mut ignored = Vec::new();
+    let mut rejected = Vec::new();
+    for spec in REGISTRY {
+        let name = if spec.short.is_empty() {
+            format!("`{}`", spec.long)
+        } else {
+            format!("`{}` / `{}`", spec.long, spec.short)
+        };
+        match spec.class {
+            Class::Forced => forced.push(name),
+            Class::Allowed => allowed.push(name),
+            Class::Ignored => ignored.push(name),
+            Class::Rejected(why) => rejected.push(format!("{name} — {why}")),
+        }
+    }
+    let mut m = String::new();
+    m.push_str("### husk FORCES these — your value is discarded and husk emits its own\n\n");
+    m.push_str(&forced.join(", "));
+    m.push_str("\n\nThese are the security-relevant ones. Setting them is not an error; it \
+                simply has no effect, and husk announces what it forced.\n\n");
+    m.push_str("### husk PASSES THROUGH these, after checking the value\n\n");
+    m.push_str(&allowed.join(", "));
+    m.push_str("\n\nValues are charset-checked (no whitespace, no shell metacharacters) and \
+                re-emitted canonically. If one is refused, the message names the option.\n\n");
+    m.push_str("### husk ACCEPTS but does NOT APPLY these\n\n");
+    m.push_str(&ignored.join(", "));
+    m.push_str("\n\nThe submission succeeds and the option is not forwarded to sbatch. \
+                husk says so on stderr — read it, because this is where a script quietly does \
+                the wrong thing. Job mail in particular is never sent, and `--mail-user` \
+                would be a way out of the cluster that husk's egress allowlist cannot see.\n\n\
+                **Exception: `--parsable` IS honoured.** There is nothing to forward — husk \
+                builds its own sbatch invocation — but it is an output contract, so the stub \
+                prints the bare job id as you asked. `jobid=$(sbatch --parsable job.sh)` \
+                works. It appears in this list because of where it sits in the registry, not \
+                because it is ignored.\n\n");
+    m.push_str("### husk REFUSES these, with a reason\n\n");
+    for r in &rejected {
+        m.push_str(&format!("- {r}\n"));
+    }
+    m.push_str("\nAnything not listed anywhere is refused as an unsupported option: husk \
+                submits an explicit set and rejects what it does not model, so a new option \
+                is a conversation with your operator rather than a silent pass-through.\n");
+    m
+}
+
 /// One option's spelling(s), arity, class, and value grammar.
 pub struct OptSpec {
     pub long: &'static str,

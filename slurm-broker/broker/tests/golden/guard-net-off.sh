@@ -306,6 +306,9 @@ echo "husk: this job HOLDS: nodes=${SLURM_JOB_NUM_NODES:-?} ntasks=${SLURM_NTASK
 echo "husk: if that is not what you asked for, husk forces only --nodes=1," >&2
 echo "husk: --export=ALL, --open-mode=append and the output paths - every other" >&2
 echo "husk: resource option is passed through, so a mismatch is upstream of husk." >&2
+echo "husk: network: this job has NO outbound network. A connection that" >&2
+echo "husk: hangs or refuses is husk, not the site. Fetch what the job needs" >&2
+echo "husk: before submitting, into the writable set above." >&2
 echo "husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}" >&2
 # --- hand off to the agent's script, inside the cage ---
 exec /bin/bash "$_husk_body" "$@"

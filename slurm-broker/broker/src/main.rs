@@ -366,6 +366,12 @@ fn main() {
         policy::print_query_options();
         std::process::exit(0);
     }
+    // The option contract as markdown, generated from REGISTRY for husk's user-facing skill.
+    // Diagnostic only: reads no spool, touches no policy, exits.
+    if argv.first().map(String::as_str) == Some("--print-option-contract") {
+        print!("{}", sbatch::option_contract_markdown());
+        std::process::exit(0);
+    }
     if argv.first().map(String::as_str) == Some("--net-proxy") {
         net_proxy_mode(&argv[1..]);
     }

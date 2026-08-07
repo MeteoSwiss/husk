@@ -198,7 +198,31 @@ fn serve_one(client: UnixStream, allow: &Allowlist) -> Verdict {
             "{host}:{port} is not on husk's network allowlist. Ask your operator to add it \
              to sandbox.network.allowedDomains if the work genuinely needs it."
         );
-        let _ = write!(out, "HTTP/1.1 403 Forbidden\r\n\r\nhusk: {why}\r\n");
+        // THE REASON PHRASE, not just the body.
+        //
+        // This refusal answers a CONNECT, and almost no client shows a CONNECT response
+        // BODY. curl prints `curl: (56) CONNECT tunnel failed, response 403`; Python raises
+        // `Tunnel connection failed: 403 Forbidden`. Both discard the careful explanation
+        // below and leave the caller with a bare number that names neither husk nor the host
+        // — a good message on a channel nobody reads, which is the shape that cost this
+        // project three incidents in one week (P13).
+        //
+        // The status line survives, because both of those quote it. So the short form goes
+        // there and the full form stays in the body for clients that do show it.
+        //
+        // SANITISED, because `host` is adversary-supplied and a reason phrase is a header
+        // line: anything with CR or LF in it would be response splitting. Bounded too — a
+        // 4 KiB "hostname" must not become a 4 KiB status line.
+        let safe_host: String = host
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || ".-_:".contains(*c))
+            .take(64)
+            .collect();
+        let _ = write!(
+            out,
+            "HTTP/1.1 403 husk blocked {safe_host}:{port} (not on the egress allowlist)\r\n\
+             \r\nhusk: {why}\r\n"
+        );
         return Verdict::Refused(why);
     }
 

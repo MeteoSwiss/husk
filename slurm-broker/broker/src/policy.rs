@@ -913,7 +913,7 @@ fn masked_credentials(bwrap_args: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn cage_banner(writable: &[String], masked: &[String]) -> String {
+fn cage_banner(writable: &[String], masked: &[String], net_enabled: bool) -> String {
     let mut b = String::from(
         "echo \"husk: compute cage active - the filesystem is READ-ONLY except:\" >&2\n",
     );
@@ -1004,6 +1004,29 @@ fn cage_banner(writable: &[String], masked: &[String]) -> String {
     b.push_str(
         "echo \"husk: resource option is passed through, so a mismatch is upstream of husk.\" >&2\n",
     );
+    // NETWORK: name the exact string the failure will wear.
+    //
+    // The proxy's refusal is well written and almost never seen: it answers a CONNECT, and
+    // clients discard a CONNECT response body. What the agent actually gets is
+    // `curl: (56) CONNECT tunnel failed, response 403` — no husk, no host, no remedy. The
+    // status line carries a short form now, but the cheaper fix is the one this banner
+    // already uses for writes: say in advance what husk's refusal will LOOK like, so an
+    // unattributed error becomes attributable retroactively.
+    //
+    // The allowlist itself is deliberately NOT printed here. The proxy re-reads it on the
+    // compute node and is the single source of truth; a copy baked in at submit time is a
+    // second list to drift (P8), and it would be the stale one.
+    if net_enabled {
+        b.push_str("echo \"husk: network: outbound traffic goes through husk's proxy, and only\" >&2\n");
+        b.push_str("echo \"husk: hosts on the operator's allowlist are reachable. A blocked host\" >&2\n");
+        b.push_str("echo \"husk: fails as 'CONNECT tunnel failed, response 403' or a 403 from the\" >&2\n");
+        b.push_str("echo \"husk: proxy - that is husk, NOT the site being down. Ask your operator\" >&2\n");
+        b.push_str("echo \"husk: to add it to sandbox.network.allowedDomains.\" >&2\n");
+    } else {
+        b.push_str("echo \"husk: network: this job has NO outbound network. A connection that\" >&2\n");
+        b.push_str("echo \"husk: hangs or refuses is husk, not the site. Fetch what the job needs\" >&2\n");
+        b.push_str("echo \"husk: before submitting, into the writable set above.\" >&2\n");
+    }
     b.push_str("echo \"husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}\" >&2\n");
     b
 }
@@ -1284,7 +1307,7 @@ fi
     };
     // The writable set as the job will see it: the project dir first, then any
     // `sandbox.filesystem.allowWrite` roots. One list, one source, announced verbatim.
-    let banner = cage_banner(writable, &masked_credentials(bwrap_args));
+    let banner = cage_banner(writable, &masked_credentials(bwrap_args), net_enabled);
     // Colon-separated like PATH, so an agent can split it without a parser. A path
     // containing a colon would be ambiguous - as it is for PATH - and is not worth a
     // format nobody would guess.
