@@ -11,13 +11,13 @@
 #
 # Regenerating is one command; reviewing is a diff. Run it whenever REGISTRY changes.
 #
-#   slurm-broker/skill/build.sh          # rewrite the generated block
-#   slurm-broker/skill/build.sh --check  # fail if it is out of date (for CI)
+#   skill/build.sh          # rewrite the generated block
+#   skill/build.sh --check  # fail if it is out of date (for CI)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SKILL="$HERE/SKILL.md"
-BROKER="${HUSK_BROKER:-$HERE/../broker/target/debug/husk-slurm-broker}"
+BROKER="${HUSK_BROKER:-$HERE/../slurm-broker/broker/target/debug/husk-slurm-broker}"
 
 if [ ! -x "$BROKER" ]; then
     echo "build.sh: no broker binary at $BROKER" >&2
@@ -48,7 +48,7 @@ if [ "${1:-}" = "--check" ]; then
         exit 0
     fi
     echo "build.sh: SKILL.md is STALE — the registry changed and the skill did not." >&2
-    echo "build.sh: run slurm-broker/skill/build.sh to regenerate. Diff:" >&2
+    echo "build.sh: run skill/build.sh to regenerate. Diff:" >&2
     diff -u "$SKILL" "$tmp" >&2 || true
     exit 1
 fi

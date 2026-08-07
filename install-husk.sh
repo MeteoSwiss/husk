@@ -21,6 +21,7 @@
 #                      detected; no broker and no trace on a laptop)
 #
 # What this configures:
+#   ~/.claude/skills/husk/SKILL.md — tells the agent it is inside husk
 #   ~/.claude/settings.json — enables sandbox, points to apply-seccomp,
 #                             restricts filesystem reads to the current project,
 #                             and hard-blocks the agent from editing settings files
@@ -123,11 +124,14 @@ if [[ "${1:-}" == "--uninstall" ]]; then
            "$PREFIX/lib/husk/srun-stub.py" \
            "$PREFIX/lib/husk/slurm-partition" \
            "$PREFIX/lib/husk/slurm-account" \
+           "${HOME}/.claude/skills/husk/SKILL.md" \
            "$MANIFEST"; do
     if [[ -e "$f" ]]; then rm -f "$f"; printf '  [ok]   removed %s\n' "$f"; fi
   done
   rmdir "$PREFIX/lib/husk" 2>/dev/null \
     && printf '  [ok]   removed %s\n' "$PREFIX/lib/husk" || true
+  rmdir "${HOME}/.claude/skills/husk" 2>/dev/null \
+    && printf '  [ok]   removed %s\n' "${HOME}/.claude/skills/husk" || true
 
   echo ""
   echo "husk removed. Your ~/.bashrc PATH line (if you added one) and socat"
@@ -526,6 +530,29 @@ fi
 # any manual edits inside them will be lost.
 # If apply-seccomp was not installed (unsupported arch), the seccomp.applyPath
 # key is omitted rather than pointing to a non-existent binary.
+
+# ── the husk skill ────────────────────────────────────────────────────────────
+# Shipped and installed, not "documentation the user might find".
+#
+# husk is the layer an agent can SEE, so it is blamed for everything it does not explain
+# (`P13`). The single cheapest correction is telling the agent it is inside husk: the one
+# report this project got that named a mechanism instead of guessing came from an agent that
+# had been told. A skill does that for every user, automatically.
+#
+# Installed rather than copied by hand for a second reason: it carries an option contract
+# GENERATED from the broker's registry, so the skill and the binary must move together. A
+# skill vendored into some other repo drifts, and a confidently wrong skill is worse than
+# none.
+log "husk skill"
+SKILL_SRC="$SCRIPT_DIR/skill/SKILL.md"
+SKILL_DEST_DIR="${HOME}/.claude/skills/husk"
+if [[ -f "$SKILL_SRC" ]]; then
+  mkdir -p "$SKILL_DEST_DIR"
+  install -m 0644 "$SKILL_SRC" "$SKILL_DEST_DIR/SKILL.md"
+  ok "agent skill → $SKILL_DEST_DIR/SKILL.md"
+else
+  warn "skill/SKILL.md not found — agents will not be told they are inside husk"
+fi
 
 log "~/.claude/settings.json"
 
