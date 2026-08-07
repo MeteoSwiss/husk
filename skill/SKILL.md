@@ -154,6 +154,17 @@ Anything not listed anywhere is refused as an unsupported option: husk submits a
   file in the project directory.
 - **`git commit` may fail with "Author identity unknown"** — `.gitconfig` is masked. Set
   `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_*` in the environment.
+- **A from-scratch build that dies where an incremental one worked may be the ACL problem.**
+  Files here can carry a POSIX ACL naming a group the sandbox cannot map (it shows as group
+  `4294967295`). Anything that copies an ACL then fails with `EINVAL`: `shutil.copystat`,
+  `copytree`, `setfacl`, and therefore `spack install`. **husk warns about this at session
+  start** — and it cannot fix it, because an unprivileged sandbox maps exactly one group.
+  Copy with `cp`/`shutil.copy` (contents only) rather than `copy2`/`copystat`, and if a build
+  script runs under `set -e` check whether it reached its final step: the symptom often
+  appears much later and looks unrelated.
+- **`/dev/shm` is RAM.** Staging data there consumes your job's memory allocation, and SLURM
+  will kill the job for exceeding it. That kill comes from SLURM, not husk, and looks like a
+  node fault. Use the project directory for staging.
 - **`scontrol` and `sacctmgr` cannot reach the controller.** You cannot check partition limits
   or QOS from inside; ask the human.
 

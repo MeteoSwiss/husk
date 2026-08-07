@@ -145,6 +145,26 @@ adapter layer (§6). The first and third close with ROADMAP 6a. They are written
 requirements in the spec on purpose — a clause softened to match today's implementation
 stops being a contract — and each row is deleted when closed, never reworded.
 
+**Unmappable ACL groups — a permanent cost of the axiom, not a backlog item.**
+An unprivileged user namespace can map exactly **one** gid. Every other group on a file's ACL
+is therefore unmapped, the kernel renders it as `(gid_t)-1`, and any operation that COPIES an
+ACL fails with `EINVAL` — `shutil.copystat`, `copytree`, `setfacl`, and so `spack install`.
+The KENDA session paid two from-scratch builds for it, because the symptom surfaces seven
+steps later as ICON failing at runtime with a missing GRIB variable.
+
+**No husk version fixes this, including 6a.** Owning the login cage changes whose namespace it
+is, not what a namespace may do. `newgidmap`/`subgid` would need site cooperation *and* still
+would not help — it grants unused ids to map, not permission to map a foreign real gid, and the
+ACL usually names a group the user is not in. Dropping the user namespace means dropping the
+cage; a privileged helper means dropping "no root". Each escape costs the property that let
+husk be installed at CSCS without asking anyone.
+
+So the disposition is: **husk detects and explains, and the real fix is upstream.** The wrapper
+checks the project dir's ACL at session start and prints the chain before any of it happens.
+Beyond that, `shutil._copyxattr` tolerating `ENOTSUP`/`EACCES`/`ENODATA` but not `EINVAL` looks
+like a CPython bug — a best-effort metadata copy should not abort a file copy because an ACL
+cannot be represented — and fixing it there would silently repair every tool in the chain.
+
 **H4 — data destruction in the writable set.** No in-cage defence, by design: the
 project directory *is* the agent's working surface. Disposition is operational —
 see the table at the end of `constraints.md`. No sandbox-layer fix exists without
