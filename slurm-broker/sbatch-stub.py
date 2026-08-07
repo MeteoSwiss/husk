@@ -126,6 +126,29 @@ UNAPPLIED = {
 }
 
 
+def export_note(argv):
+    """`--export=ALL,VAR=val` silently loses the assignments — say so.
+
+    `--export` is Forced: husk emits `--export=ALL` and discards whatever the caller wrote,
+    because the uenv view lives in PATH and a narrowed export breaks it. But the value people
+    actually pass is `ALL,VAR=val`, and the VAR=val half is how a scientific code is A/B'd
+    without touching a tracked file. Dropping it means the run is subtly not the run that was
+    asked for, and the KENDA session spent an unresolved investigation on exactly that:
+    `--export=ALL,ICON_REPORT_AFFINITY=1` produced zero affinity lines in a 1.9 MB log, and
+    the agent could not tell whether husk or the runscript had eaten it (2026-08-07).
+
+    Only fires when there is something to lose: a bare `--export=ALL` is what husk emits
+    anyway.
+    """
+    for a in argv:
+        if a.startswith("--export=") and a != "--export=ALL":
+            return ("--export was replaced with --export=ALL, so any VAR=val assignments in "
+                    "it did NOT reach the job. husk forces ALL because the uenv view lives in "
+                    "PATH. To set a variable for the job, export it before submitting (husk "
+                    "forwards an allowlist) or set it inside the job script.")
+    return None
+
+
 def unapplied_note(argv):
     """One line naming every option husk accepted but did not apply, or None."""
     seen = []
@@ -300,6 +323,9 @@ def main():
             unapplied = unapplied_note(argv_rest)
             if unapplied and not quiet:
                 sys.stderr.write(f"{tool_name()}: husk: {unapplied}\n")
+            exported = export_note(argv_rest)
+            if exported and not quiet:
+                sys.stderr.write(f"{tool_name()}: husk: {exported}\n")
             sys.exit(int(resp.get("exit_code", 0)))
         die(resp.get("message", "submission rejected by broker"), from_husk=True,
             code=int(resp.get("exit_code", 1)))

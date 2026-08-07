@@ -1,4 +1,4 @@
-# husk / sandbox friction log — LETKF session, 2026-08-05/06
+# husk / sandbox friction log — LETKF session, 2026-08-05/07
 
 Written for the husk author.  Ordered by cost to the work, not chronologically.
 "Cost" is my time lost plus, where relevant, wasted node allocations.
@@ -125,3 +125,81 @@ those mounts.  Worked around by never reusing a directory name — which is why 
   wrong turns.
 * Reads of `/store_new` and `/scratch` from inside jobs were unrestricted, which is
   what made any of the measurement possible.
+
+
+---
+
+# Addendum — issues found in the second half of the session
+
+## 8. Writes outside the project dir kill the job with no attribution
+
+**Cost: medium.** Two dead 128-rank jobs and a misdiagnosis.
+
+To measure how much of the LETKF read time is filesystem versus eccodes decode, I
+staged input into `/dev/shm` from inside a batch job. The `cp` **appeared to
+succeed** — `df` showed 16 GiB used — and the job was then terminated shortly
+afterwards with no message attributing the kill to husk. I diagnosed it as a
+transient node problem and retried, wasting a second allocation, before the user
+told me writes outside the project dir are refused.
+
+A standalone probe confirmed `/dev/shm` is writable and readable at full speed
+(2.2 GB/s write, 5.7 GB/s read) and that such a job *completes* — so the failure is
+specifically the combination of writing there and then continuing to run.
+
+*Suggestion:* this is the same class as issue 1. The compute-cage banner already
+lists the writable set beautifully; when a job is killed **for violating** it, say
+so in the job output. As it stands the observable behaviour is "job cancelled,
+no reason", which is indistinguishable from a node fault — and I treated it as one.
+
+## 9. Core dumps from aborted MPI jobs fill scratch silently
+
+**Cost: 343 GB of scratch.**
+
+`MPICH_ABORT_ON_ERROR=1` plus the default `ulimit -c unlimited` means every crash
+writes one core file **per rank**. Two failed 128-rank runs left **256 cores
+totalling 343 GB**, which survived the obvious cleanup (`rm -rf */output`) because
+they sit in the experiment directory, not in `output/`. At 1152 ranks a single
+failed run would write ~1.6 TB.
+
+Not a husk issue — it is the job template — but worth knowing about in a sandbox
+where an agent is expected to iterate on crashing configurations. `ulimit -c 0` in
+the generated job scripts fixes it.
+
+## 10. `/tmp` is cleaned during the session
+
+**Cost: low, but confusing.** Build environment scripts written to `/tmp/claude-*`
+vanished mid-session, and the next `make` failed with `Error 127` (`mpif90: command
+not found`) — which looks like a toolchain problem, not a missing file. Moved the
+scripts into the project directory afterwards.
+
+*Suggestion:* if the scratch directory is periodically cleaned, saying so in the
+system prompt would be cheap. The guidance to "use $TMPDIR for temporary files"
+implies more permanence than exists.
+
+## 11. Long builds versus the 10-minute foreground limit
+
+**Cost: low, recurring.** A full DACE build is 12–20 minutes; the foreground tool
+limit is 10. `run_in_background` works correctly and was the right tool, but the
+natural idiom — `until [ -z "$(pgrep make)" ]; do sleep; done` — itself times out at
+10 minutes, so each build needed two or three polling calls. Not a bug, just
+friction worth knowing when sizing agent tasks on HPC codebases.
+
+---
+
+# Summary of cost
+
+| issue | cost |
+|---|---|
+| 4. in-script `#SBATCH` silently discarded | ~1 h, plus a confidently wrong conclusion |
+| 1. `*.env` treated as a credential | ~30 min, 3 dead jobs |
+| 2. `<project>/config` bind-mounted read-only | blocked the build, cost a session restart |
+| 5. SLURM broker timeouts | ~40 min |
+| 8. writes outside project dir, unattributed kill | 2 dead 128-rank jobs |
+| 3. multi-node blocked | structural: 2 of 4 requested items could not be done |
+
+The recurring theme in 1, 2, 4 and 8 is not that the sandbox refused something —
+refusals were mostly correct and the explicit ones (multi-node, `--account`) were
+*excellent*, giving reason, mechanism and alternative. It is that when a refusal
+arrived **unattributed** — as a bare `Permission denied`, a silent directive drop,
+or an unexplained job cancellation — I reliably misdiagnosed it, usually blaming
+the most visible new component. Attribution is worth more than permissiveness.

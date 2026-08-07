@@ -47,6 +47,12 @@ const MS_BIND: c_ulong = 0x1000;
 
 extern "C" {
     fn unshare(flags: c_int) -> c_int;
+    fn getxattr(
+        path: *const c_char,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+    ) -> isize;
     fn mount(
         src: *const c_char,
         target: *const c_char,
@@ -432,6 +438,92 @@ impl SandboxReady {
 /// at all). Identity mapping keeps EUID != 0, so the inner sandbox takes its normal,
 /// working path. Identity is also the least surprising view: files keep their real
 /// owner inside the namespace instead of appearing to belong to root.
+/// Warn if the project's files carry a POSIX ACL naming a group this namespace cannot map.
+///
+/// **The worst cost-to-diagnose defect reported against husk so far** (KENDA session,
+/// 2026-08-07: two full from-scratch builds). The chain, which nothing along the way names:
+///
+///   1. an unprivileged user namespace can map exactly ONE gid — its own — so every other
+///      group on a file's ACL is unmapped, and the kernel renders it as `(gid_t)-1`,
+///      i.e. `group:4294967295:` in `getfacl`;
+///   2. `shutil.copystat` copies `system.posix_acl_access`, and setting a blob containing an
+///      unmapped group returns **EINVAL**;
+///   3. Python's `shutil._copyxattr` tolerates ENOTSUP/EACCES/ENODATA but not EINVAL, so it
+///      raises;
+///   4. `spack install` dies copying its package repo;
+///   5. the site's `spack_install` runs under `set -e` and never reaches `create_sh_env`;
+///   6. `create_sh_env` writes `<build>/setting`, which the ICON runscript sources;
+///   7. `ECCODES_DEFINITION_PATH` is therefore unset, and the model dies at RUNTIME with
+///      `get_cdi_varID: Variable RAD_PRECIP not found!`
+///
+/// Incremental builds hid it entirely, because `setting` survived from an earlier build.
+///
+/// **husk cannot fix the cause.** Mapping the group is what an unprivileged userns is not
+/// allowed to do, and the ACL frequently names a group the user is not even in, so mapping
+/// every supplementary group would not help either. What husk can do is refuse to let this
+/// be silent: say it at session start, seven steps before the symptom (`P13`).
+///
+/// Cheap by construction — one `getxattr` on the project directory. ACLs are inherited from
+/// the directory, so the directory is the right place to look, and Lustre is never walked.
+fn warn_on_unmappable_acl_groups(project_dir: &Path) {
+    // POSIX ACL xattr layout: u32 version, then 8-byte entries of
+    // { u16 tag, u16 perm, u32 id }. ACL_GROUP == 0x0008; an unmapped id reads as u32::MAX.
+    const ACL_GROUP: u16 = 0x0008;
+    let Ok(cpath) = CString::new(project_dir.as_os_str().as_bytes()) else { return };
+    let Ok(name) = CString::new("system.posix_acl_access") else { return };
+    let mut buf = [0u8; 1024];
+    // SAFETY: both pointers are valid NUL-terminated C strings, and the length matches buf.
+    let n = unsafe {
+        getxattr(
+            cpath.as_ptr(),
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len(),
+        )
+    };
+    // No ACL, or one bigger than any real ACL: nothing to say. Absence is the normal case.
+    if n < 4 || n as usize > buf.len() {
+        return;
+    }
+    let mut unmapped = 0usize;
+    let mut i = 4usize; // skip the version word
+    while i + 8 <= n as usize {
+        let tag = u16::from_ne_bytes([buf[i], buf[i + 1]]);
+        let id = u32::from_ne_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]);
+        if tag == ACL_GROUP && id == u32::MAX {
+            unmapped += 1;
+        }
+        i += 8;
+    }
+    if unmapped == 0 {
+        return;
+    }
+    eprintln!(
+        "husk-slurm-wrapper: WARNING: {} carries a POSIX ACL naming a group this sandbox \
+         cannot map (it shows as group 4294967295).",
+        project_dir.display()
+    );
+    eprintln!(
+        "husk: an unprivileged sandbox maps exactly one group, so husk cannot fix this and \
+         neither can you from inside."
+    );
+    eprintln!(
+        "husk: what it breaks: anything that COPIES a file's ACL fails with EINVAL — \
+         Python's shutil.copystat and copytree, `setfacl`, and therefore `spack install`, \
+         which dies copying its package repo."
+    );
+    eprintln!(
+        "husk: the symptom appears far away. A spack build under `set -e` stops before its \
+         final step, an environment file is never written, and the model fails at RUNTIME \
+         with a missing variable. Suspect this FIRST if a from-scratch build behaves \
+         differently from an incremental one."
+    );
+    eprintln!(
+        "husk: workarounds: run the build's final env-generation step by hand, or copy with \
+         `cp` / `shutil.copy` (contents only) rather than `copy2` / `copystat`."
+    );
+}
+
 fn enter_user_mount_ns() -> io::Result<()> {
     // SAFETY: pure getters.
     let (uid, gid) = unsafe { (getuid(), getgid()) };
@@ -556,6 +648,9 @@ fn run() -> io::Result<Infallible> {
             std::env::set_var("HUSK_SESSION_LOG", &session_log);
 
             // Broker first, in the clean outer namespaces (keeps MUNGE + network).
+            // Seven steps before the symptom. See the function.
+            warn_on_unmappable_acl_groups(&std::env::current_dir().unwrap_or_default());
+
             let broker_handle = spawn_broker(broker, &cfg.spool, &session_log)?;
             // Spawning proves only that execve worked. Wait for the broker to CLAIM its
             // spool before anything depends on it — see BrokerReady.
@@ -613,6 +708,53 @@ USAGE: husk-slurm-wrapper --stub PATH --broker PATH [--spool DIR]\n\
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_unmappable_acl_group_is_detected_from_the_xattr_blob() {
+        // The parse, against real POSIX ACL layout: u32 version, then 8-byte entries of
+        // { u16 tag, u16 perm, u32 id }. Only ACL_GROUP (0x0008) with id == u32::MAX is the
+        // unmapped case; a normal group entry and the non-group tags must not trip it.
+        //
+        // Tested at the blob level because the alternative — setting a real ACL naming an
+        // unmapped group — is not something a test can arrange, and this is the part that
+        // could get the offsets wrong.
+        fn scan(blob: &[u8]) -> usize {
+            const ACL_GROUP: u16 = 0x0008;
+            let mut n = 0;
+            let mut i = 4;
+            while i + 8 <= blob.len() {
+                let tag = u16::from_ne_bytes([blob[i], blob[i + 1]]);
+                let id = u32::from_ne_bytes([blob[i + 4], blob[i + 5], blob[i + 6], blob[i + 7]]);
+                if tag == ACL_GROUP && id == u32::MAX {
+                    n += 1;
+                }
+                i += 8;
+            }
+            n
+        }
+        let entry = |tag: u16, id: u32| {
+            let mut e = Vec::new();
+            e.extend_from_slice(&tag.to_ne_bytes());
+            e.extend_from_slice(&5u16.to_ne_bytes()); // r-x
+            e.extend_from_slice(&id.to_ne_bytes());
+            e
+        };
+        let mut blob = vec![2, 0, 0, 0]; // ACL_EBADF version word
+        blob.extend(entry(0x0001, u32::MAX)); // ACL_USER_OBJ — id is unused, must NOT count
+        blob.extend(entry(0x0004, 30382)); //    ACL_GROUP_OBJ
+        blob.extend(entry(0x0008, 30382)); //    ACL_GROUP, mapped — fine
+        assert_eq!(scan(&blob), 0, "a fully mapped ACL must be silent");
+
+        blob.extend(entry(0x0008, u32::MAX)); // ACL_GROUP, UNMAPPED — this is the one
+        assert_eq!(scan(&blob), 1, "the unmapped group entry must be found");
+
+        blob.extend(entry(0x0008, u32::MAX));
+        assert_eq!(scan(&blob), 2, "and counted, not just detected once");
+
+        // A truncated trailing entry must not panic or be miscounted.
+        blob.truncate(blob.len() - 3);
+        assert_eq!(scan(&blob), 1, "a partial entry is ignored, not read past");
+    }
 
     #[test]
     fn no_agent_launches_without_a_broker_that_actually_claimed_its_spool() {
