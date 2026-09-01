@@ -42,20 +42,68 @@ submission error becomes a `rejected`/`error` response, never a silent pass.
 ## Policy
 
 ### Partition — reject and teach (no silent rewrite)
-Only **one** partition is permitted, and the broker both requires the agent to
-request it and forces it on the real CLI. The partition is **site-configurable**
-via `HUSK_SLURM_PARTITION` in the broker's trusted env (operator-set,
-agent-inaccessible), defaulting to `preemptible`. It is NOT hard-coded: Balfrin has
-`preemptible`; Santis does not (use `debug` or `shared`), so submitting there with
-the default fails at sbatch (`invalid partition "preemptible"`). Pick a
-low-priority/preemptible partition — every brokered job lands on it.
+A brokered job may use only the partitions the operator allowed, and the broker both
+requires the agent to name one and emits its own copy on the real CLI. The set is
+**site-configurable** via `HUSK_SLURM_PARTITION` in the broker's trusted env
+(operator-set, agent-inaccessible), defaulting to `preemptible`. It is NOT hard-coded:
+Balfrin has `preemptible`; Santis does not (use `debug` or `shared`), so submitting
+there with the default fails at sbatch (`invalid partition "preemptible"`). Prefer
+low-priority/preemptible partitions — every brokered job lands on one of them, and
+that is what makes the partition the resource-envelope control (see THREAT-MODEL.md).
+
+`HUSK_SLURM_PARTITION` is a **comma-separated list**, because a cluster is not
+homogeneous: on Balfrin `short` is the GPU partition and `pp-short` the CPU-only
+postprocessing one, and a workflow legitimately needs both. Which one a job needs is
+a hardware fact only the job knows, so husk bounds the **set** and the job picks from
+it.
 
 Resolve the effective partition from the agent's CLI args (`-p`/`--partition`) and
 `#SBATCH` directives. Then:
-- resolves to the required partition → accept
-- anything else, **or unspecified** → **reject** with a message that names the
-  required partition and tells the agent to resubmit with it (so it learns the
-  constraint and can reason about preemption).
+- resolves to one of the allowed partitions → accept, and **re-emit husk's own copy of
+  that entry** — the agent influences the value, the bytes that reach `sbatch` are
+  ours. Same construct-and-re-emit shape as `--chdir`, which is confined to the
+  writable set rather than forced to a constant.
+- names several at once (`--partition=a,b`, which real `sbatch` accepts and lets the
+  scheduler resolve) → **reject**: that would make the hardware choice implicit again,
+  and the wall-limit note describes one partition.
+- anything else, **or unspecified** → **reject** with a message naming every allowed
+  partition (so it learns the constraint and can reason about preemption).
+
+#### How that refusal is worded, and why
+
+A caged agent hit this guard on 2026-08-01 and reported back. Three properties came
+out of it, all now pinned by tests:
+
+1. **Say authorization, not availability.** The message used to read *"Only
+   `--partition=short` is permitted here"*. The agent checked `sinfo`, saw `normal`
+   up with 28 idle nodes, and read the contradiction as a possibly **spoofed**
+   message — spending calls corroborating before it would act. It now names husk as
+   the restricting party and concedes that other partitions exist and may be idle.
+   A guardrail that appears to make a false claim about the world invites the reader
+   to disbelieve it.
+2. **Be byte-identical on retry.** The agent's own account: the repeat is what let
+   it conclude *"standing policy"* rather than *"transient failure"* — an
+   intermittent-looking gate "would likely have gotten a blind retry instead". So
+   nothing volatile (timestamps, queue depth, set iteration order) may enter it.
+3. **Teach the consequence, not just the rule.** The old message taught the
+   partition rule but not what it costs. The agent's job silently inherited a
+   30-minute wall limit and it only found out from `squeue` afterwards — harmless at
+   7 minutes, fatal for a longer run. husk moves jobs onto a partition their author
+   did not choose, so it is the right place to say what that partition does to an
+   untimed job.
+
+That third point applies to the **accepted** path too, which is where it actually
+bit: a submission with the right partition and no `--time` is accepted, and now
+carries the limit note on stderr (stdout stays the bare `Submitted batch job N`
+that tooling parses — the same split real `sbatch` uses).
+
+The numbers come from `scontrol show partition` at broker startup, never from a
+constant: they are site config and would rot. `DefaultTime` is what an untimed job
+gets; `MaxTime` is what `sinfo`'s TIMELIMIT column shows, which is why reading
+`sinfo` does not answer the question. A site QOS can lower both and husk cannot see
+that from here, so the note says so and gives the advice that is right either way —
+set `--time`. When `scontrol` cannot be read, husk says **nothing** about limits: a
+confidently wrong number is worse than no number.
 
 ### Resources — pass through, do not manage
 The broker does **not** parse/cap/forward `--nodes`/`--time`/etc. They reach
@@ -163,10 +211,29 @@ F13/F14/F24/F26/F27 class rather than patching instances. Extending the allowlis
 real job scripts need it is an operator task; rejections surface as "unsupported option
 X" (fail-closed + visible), never as a silent escape.
 
-### Script — inline snapshot (TOCTOU)
-The stub already snapshots the script **body** inline. The broker writes that
-immutable snapshot to a broker-controlled path and submits *that* — never a path
-the agent can rewrite between validation and slurmd reading it.
+### Script — husk's own, on stdin (TOCTOU)
+The stub snapshots the script **body** inline, and the broker submits **its own
+wrapper on sbatch's stdin**. Not one byte of the submitted script comes from the
+agent, and there is no file for anyone to substitute.
+
+Both halves of that were learned the hard way. The script used to be `head + guard
++ tail`, with the agent's leading comments above husk's guard — so keeping your own
+`#!` line meant the kernel ran it and never read the guard at all, and a form feed,
+which Rust's `trim_start` calls whitespace and bash does not, put a live command in
+the "comments". And the file was staged in the spool, which **must** be
+agent-writable, and named on sbatch's command line — so a `rename()` between the
+write and sbatch's open substituted the whole thing. That race was won 33 times in
+100 against a 2 ms window.
+
+The agent's script now travels as **data**: written to a path husk chooses inside
+the confined write root, and run by an interpreter husk names, **inside** the cage.
+The agent may rewrite that file — it is its own payload, which it already controls,
+and no boundary is crossed. What it can no longer do is author the bytes slurmstepd
+executes.
+
+A consequence worth stating: the agent's `#SBATCH` directives never reach slurmd.
+husk parses them, validates them, and re-emits what it allows on the command line,
+where sbatch precedence (CLI > env > `#SBATCH`) makes its value win by construction.
 
 ### Re-sandbox — prepended re-exec guard
 The submitted job must run under `seccomp-wrapper + bwrap` on the compute node.

@@ -73,7 +73,7 @@ Then have the agent submit the job (honest, real intent):
 > with the Bash tool and show me the output."
 
 **Pass:**
-- agent sees `Submitted batch job N` (request flowed stub → `.husk-slurm-spool`
+- agent sees `Submitted batch job N` (request flowed stub → `$HUSK_SLURM_SPOOL`
   → broker → real sbatch);
 - `hello.sh` output shows the compute hostname and `[expect]` on both
   containment lines (external blocked, `/users` blocked).
@@ -131,6 +131,89 @@ the inter-rank fabric (the control plane, at least) and will hang or fail under
 not a broker bug. If a single-rank run itself needs a resource option (GPUs, a
 constraint, a specific `--gres`), that's Probe F step 2, not the MPI limit.
 
+## Probe G — the step pair (`srun` from inside a job)
+
+The first thing that exercises **Chapter 1**: a brokered job that calls `srun`. Inside
+the cage that is husk's stub, not the real srun — it hands the request to the
+step-broker, which runs outside the cage but inside the allocation (so it still holds
+MUNGE and a route to the daemons), validates it against the step allowlist, and launches
+each task wrapped in the rank cage.
+
+From a bounded scratch dir (see the watch-out below), submit it the way the agent would:
+
+```
+sbatch --partition=<site partition> srun-probe.sh
+```
+
+**Pass** — four lines in the job output:
+- `step : OK` — the pair worked end to end;
+- `cage : homes hidden inside the step` — the rank is sandboxed too, not merely launched;
+- `deny : --task-prolog refused by the step allowlist` — the allowlist is being applied
+  (that option runs code *outside* the per-task wrap, which is the one thing the wrap
+  exists to prevent). The check matches husk's *message*, not merely a non-zero exit:
+  the real `srun` accepts `--task-prolog` and then fails because the prolog is missing,
+  so a status-only check passes with no husk in the path at all. A third branch says
+  "real srun detected — stub NOT bound" when that happens;
+- `rank2 : OK — 2 ranks in ONE step` — the actual MPI shape, not merely several
+  separate steps: slurmstepd launches N tasks and each lands in its own rank cage;
+- `shm : rank 1 read what rank 0 wrote` — the ranks SHARE `/dev/shm`. This is the one
+  thing the rank cage does specially; a per-task tmpfs would give each rank an empty
+  shared-memory namespace and hang same-node MPI;
+- `env : the script's exported variable reached the rank` — a run script's `export`
+  carries across the broker. Without it, `export OMP_NUM_THREADS=4; srun ./solver` runs
+  with different settings than it asked for and says nothing;
+- `envx : SLURM_NTASKS not overridable from the job script` — scheduler-owned names are
+  NOT carried. They are inputs to srun's own option handling, and bwrap applies
+  `--setenv` last, so a forwarded one would win over the validated option;
+- `conc : ~3s for 2x 3s overlapping steps` — the broker runs steps concurrently.
+  **Read this one carefully**: two *plain* `srun` steps serialise even with no husk in
+  the path, because without `--overlap` a step claims the allocation's CPUs exclusively
+  and the second waits. That is SLURM's accounting. The check therefore uses `--overlap`
+  with `--ntasks=2`, and prints the non-overlap timing on a separate `conc-:` line for
+  contrast. Only serialisation *with* `--overlap` implicates the step-broker.
+
+**On failure**, in order of what to read:
+1. the job's `.err` file, not just `.out` — a guard-level failure (a stale
+   `seccomp-wrapper`, a bwrap bind error) never reaches stdout;
+2. `~/.husk/log/job-<jobid>.log` — husk's own record of the job, named in the job's
+   output by the cage banner. Both the step-broker (the request as parsed, the srun it
+   built, any rejection) and the egress proxy append here;
+3. `spool: <UNSET>` in the output means the guard did not bootstrap the pair at all —
+   check that `srun-stub.py` is installed (`$PREFIX/lib/husk/`) and that the broker and
+   wrapper were deployed together.
+
+The job log outlives the job; the step spool does not. The spool is created in the
+user's working directory and is removed when the job ends, so nothing accumulates
+there — and it never held the evidence, because a log inside a directory the job can
+write is one the job can rewrite.
+
+## What a green `--full` run looks like now
+
+Arms worth reading rather than tallying, because each is the only witness to something:
+
+| arm | what it alone proves |
+|---|---|
+| `steps.egress` | a RANK can reach the proxy. `net.live` tests the job cage and cannot see this — ranks had no socat and no socket until 2026-08-02, silently |
+| `tmp.reclaimed` | the node-local egress directory really disappears. Runs a second job pinned to the first job's node; SKIPs if that node is busy |
+| `proc.reclaimed` | the finished job left no husk process on the node. Rides the same follow-up job, and is the only check on the holder's lifetime that does not assume the site runs cgroup proctrack |
+| `sbatch.partition_list` | a job may request the SECOND allowed partition. SKIPs unless `HUSK_SLURM_PARTITION` holds a list |
+| `uenv.mounted` | the session uenv reached the cage. SKIPs unless a uenv was active before husk started |
+| `guard.preempt_*` | a job cut short says its output is incomplete, and still cleans up |
+| `cma.peers` / `cma.outside` | ranks can name each other (MPI works) while the step-broker is invisible to them |
+
+A SKIP is not a pass. Three of those skip unless you set something up first: start a uenv,
+install with a partition list, and leave the node free enough for the follow-up job.
+
+**And a PASS is not a pass either, if the probe could not have failed.** `tmp.reclaimed`
+first shipped as a brokered job like every other probe, which meant it ran *inside* the
+cage — and the cage mounts `--tmpfs /tmp`, binding back only the egress socket, never the
+directory. It looked for the previous job's directory in an empty tmpfs, so it reported
+PASS on its first hardware run without being able to observe a leak at all. The follow-up
+job is now submitted with plain `sbatch`, uncaged, because the selftest is the trusted
+layer and may do that. **The observer has to sit outside the boundary whose leakage it is
+measuring** — the same reason the caged agent never authors its own verdict. Both arms are
+checked against a planted directory and a planted process before being believed.
+
 ## Watch-outs
 - **Run from a bounded scratch project dir, not `/users` and not the scratch root
   (CSCS):** the broker rejects a job whose workdir is under a hidden home (`/users/...`)
@@ -159,8 +242,12 @@ constraint, a specific `--gres`), that's Probe F step 2, not the MPI limit.
 There is no disable-cage flag by design. Diagnose with the probes:
 - Probe A fails → SLURM/MUNGE/partition (outside the sandbox).
 - Probe B fails → compute-side userns/bwrap on this node.
-- Probe C fails but A+B pass → the broker pipeline (check `.husk-slurm-spool/`
-  and the broker log written there).
+- Probe C fails but A+B pass → the broker pipeline. Read the session log at
+  `$HUSK_SESSION_LOG` (`~/.husk/log/husk-<utc>-<pid>.log`) — one file per session,
+  headed by the pid, start time and project dir, so there is no question of which
+  run you are reading. It is outside the spool because the spool is writable by the
+  caged agent; the live spool itself is `$HUSK_SLURM_SPOOL`, and it is removed when
+  the session ends.
 - Probe E fails (a protected file changed) → the `sandbox.filesystem.denyWrite`
   entries aren't reaching the login cage; check the merged `~/.claude/settings.json`.
 - Probe F "unsupported sbatch option" → **expected, not a bug**; add the option to

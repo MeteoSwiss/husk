@@ -1,6 +1,6 @@
 [package]
 name = "husk-slurm-broker"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "Trusted out-of-sandbox broker for husk's SLURM gateway"
 license = "BSD-3-Clause"
@@ -17,4 +17,11 @@ serde_json = "1"
 opt-level = "z"
 lto = true
 strip = true
+# DELIBERATE, and it costs something worth writing down: cargo does not apply this to the
+# TEST profile, so every test in this crate runs under unwinding while the shipped binary
+# aborts. A panic in a release build therefore runs NO `Drop` at all — the resource-release
+# argument in PRINCIPLES `P6` holds on every path husk actually has EXCEPT this one, where
+# the process simply dies. For the broker that means the whole session's spool service goes
+# with it, so a panic is not a leak, it is an outage. Any test that proves a `Drop` fires on
+# the panic path is proving it for the test profile only (`B8-9`).
 panic = "abort"

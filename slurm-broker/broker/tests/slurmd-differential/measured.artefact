@@ -1,0 +1,711 @@
+HUSKDIFF	1
+META	generated	2026-09-01T07:55:48Z
+META	host	magpie
+META	source	cluster
+META	sbatch_path	/scratch/example/fixture/sbatch
+META	sbatch_version	husk-differential fake-sbatch (FIXTURE - NOT SLURM) model=measured
+META	account	acct01
+META	account_source	--account
+META	partition	debug
+META	partition_source	--partition
+META	rundir	/scratch/example/run
+META	uname	Linux 6.8.0-136-generic
+CONTROL	sbatch_present	PASS	/scratch/example/fixture/sbatch
+CONTROL	sbatch_getopt_canary	PASS	sbatch: unrecognized option '--husk-differential-canary'
+CONTROL	not_in_husk_session	PASS	no husk submission variable is set
+ARGV	j00-o	0	sbatch
+ARGV	j00-o	1	--account=acct01
+ARGV	j00-o	2	--partition=debug
+ARGV	j00-o	3	--time=00:01:00
+ARGV	j00-o	4	--nodes=1
+ARGV	j00-o	5	--ntasks=1
+ARGV	j00-o	6	--parsable
+ARGV	j00-o	7	--output=/scratch/example/run/cases/j00-o/ctrl-literal.log
+ARGV	j00-o	8	--error=/scratch/example/run/cases/j00-e/ctrl-literal.err
+ARGV	j00-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j00-e	0	sbatch
+ARGV	j00-e	1	--account=acct01
+ARGV	j00-e	2	--partition=debug
+ARGV	j00-e	3	--time=00:01:00
+ARGV	j00-e	4	--nodes=1
+ARGV	j00-e	5	--ntasks=1
+ARGV	j00-e	6	--parsable
+ARGV	j00-e	7	--output=/scratch/example/run/cases/j00-o/ctrl-literal.log
+ARGV	j00-e	8	--error=/scratch/example/run/cases/j00-e/ctrl-literal.err
+ARGV	j00-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j00	j00-o	output	cli	ctrl-literal.log	/scratch/example/run/cases/j00-o
+OPT	j00-o	array	ABSENT
+OPT	j00-o	jobname	ABSENT
+NOTE	j00-o	THE CONTROL: no % anywhere. If this name does not appear, nothing else here is readable
+CASE	j00	j00-e	error	cli	ctrl-literal.err	/scratch/example/run/cases/j00-e
+OPT	j00-e	array	ABSENT
+OPT	j00-e	jobname	ABSENT
+NOTE	j00-e	THE CONTROL: no % anywhere. If this name does not appear, nothing else here is readable
+JOB	j00	837601	SUBMITTED
+ARGV	j01-o	0	sbatch
+ARGV	j01-o	1	--account=acct01
+ARGV	j01-o	2	--partition=debug
+ARGV	j01-o	3	--time=00:01:00
+ARGV	j01-o	4	--nodes=1
+ARGV	j01-o	5	--ntasks=1
+ARGV	j01-o	6	--parsable
+ARGV	j01-o	7	--output=/scratch/example/run/cases/j01-o/%j
+ARGV	j01-o	8	--error=/scratch/example/run/cases/j01-e/x%jy.err
+ARGV	j01-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j01-e	0	sbatch
+ARGV	j01-e	1	--account=acct01
+ARGV	j01-e	2	--partition=debug
+ARGV	j01-e	3	--time=00:01:00
+ARGV	j01-e	4	--nodes=1
+ARGV	j01-e	5	--ntasks=1
+ARGV	j01-e	6	--parsable
+ARGV	j01-e	7	--output=/scratch/example/run/cases/j01-o/%j
+ARGV	j01-e	8	--error=/scratch/example/run/cases/j01-e/x%jy.err
+ARGV	j01-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j01	j01-o	output	cli	%j	/scratch/example/run/cases/j01-o
+OPT	j01-o	array	ABSENT
+OPT	j01-o	jobname	ABSENT
+NOTE	j01-o	a specifier alone, and one adjacent to literals on both sides
+CASE	j01	j01-e	error	cli	x%jy.err	/scratch/example/run/cases/j01-e
+OPT	j01-e	array	ABSENT
+OPT	j01-e	jobname	ABSENT
+NOTE	j01-e	a specifier alone, and one adjacent to literals on both sides
+JOB	j01	837602	SUBMITTED
+ARGV	j02-o	0	sbatch
+ARGV	j02-o	1	--account=acct01
+ARGV	j02-o	2	--partition=debug
+ARGV	j02-o	3	--time=00:01:00
+ARGV	j02-o	4	--nodes=1
+ARGV	j02-o	5	--ntasks=1
+ARGV	j02-o	6	--parsable
+ARGV	j02-o	7	--output=/scratch/example/run/cases/j02-o/all_j-%j_A-%A_a-%a_N-%N_n-%n_t-%t_s-%s_u-%u.log
+ARGV	j02-o	8	--error=/scratch/example/run/cases/j02-e/def_n-%n_t-%t_s-%s.err
+ARGV	j02-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j02-e	0	sbatch
+ARGV	j02-e	1	--account=acct01
+ARGV	j02-e	2	--partition=debug
+ARGV	j02-e	3	--time=00:01:00
+ARGV	j02-e	4	--nodes=1
+ARGV	j02-e	5	--ntasks=1
+ARGV	j02-e	6	--parsable
+ARGV	j02-e	7	--output=/scratch/example/run/cases/j02-o/all_j-%j_A-%A_a-%a_N-%N_n-%n_t-%t_s-%s_u-%u.log
+ARGV	j02-e	8	--error=/scratch/example/run/cases/j02-e/def_n-%n_t-%t_s-%s.err
+ARGV	j02-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j02	j02-o	output	cli	all_j-%j_A-%A_a-%a_N-%N_n-%n_t-%t_s-%s_u-%u.log	/scratch/example/run/cases/j02-o
+OPT	j02-o	array	ABSENT
+OPT	j02-o	jobname	ABSENT
+NOTE	j02-o	every specifier husk accepts, at once (ROADMAP probe P2)
+CASE	j02	j02-e	error	cli	def_n-%n_t-%t_s-%s.err	/scratch/example/run/cases/j02-e
+OPT	j02-e	array	ABSENT
+OPT	j02-e	jobname	ABSENT
+NOTE	j02-e	every specifier husk accepts, at once (ROADMAP probe P2)
+JOB	j02	837603	SUBMITTED
+ARGV	j03-o	0	sbatch
+ARGV	j03-o	1	--account=acct01
+ARGV	j03-o	2	--partition=debug
+ARGV	j03-o	3	--time=00:01:00
+ARGV	j03-o	4	--nodes=1
+ARGV	j03-o	5	--ntasks=1
+ARGV	j03-o	6	--parsable
+ARGV	j03-o	7	--output=/scratch/example/run/cases/j03-o/probe-A%A-a%a-s%s.log
+ARGV	j03-o	8	--error=/scratch/example/run/cases/j03-e/errA-%A.err
+ARGV	j03-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j03-e	0	sbatch
+ARGV	j03-e	1	--account=acct01
+ARGV	j03-e	2	--partition=debug
+ARGV	j03-e	3	--time=00:01:00
+ARGV	j03-e	4	--nodes=1
+ARGV	j03-e	5	--ntasks=1
+ARGV	j03-e	6	--parsable
+ARGV	j03-e	7	--output=/scratch/example/run/cases/j03-o/probe-A%A-a%a-s%s.log
+ARGV	j03-e	8	--error=/scratch/example/run/cases/j03-e/errA-%A.err
+ARGV	j03-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j03	j03-o	output	cli	probe-A%A-a%a-s%s.log	/scratch/example/run/cases/j03-o
+OPT	j03-o	array	ABSENT
+OPT	j03-o	jobname	ABSENT
+NOTE	j03-o	KNOWN ANSWER: the RA-2 divergence, non-array
+CASE	j03	j03-e	error	cli	errA-%A.err	/scratch/example/run/cases/j03-e
+OPT	j03-e	array	ABSENT
+OPT	j03-e	jobname	ABSENT
+NOTE	j03-e	KNOWN ANSWER: the RA-2 divergence, non-array
+JOB	j03	837604	SUBMITTED
+ARGV	j04-o	0	sbatch
+ARGV	j04-o	1	--account=acct01
+ARGV	j04-o	2	--partition=debug
+ARGV	j04-o	3	--time=00:01:00
+ARGV	j04-o	4	--nodes=1
+ARGV	j04-o	5	--ntasks=1
+ARGV	j04-o	6	--parsable
+ARGV	j04-o	7	--array=0-1
+ARGV	j04-o	8	--output=/scratch/example/run/cases/j04-o/arr_A-%A_a-%a_j-%j_s-%s.log
+ARGV	j04-o	9	--error=/scratch/example/run/cases/j04-e/arr_a-%a.err
+ARGV	j04-o	10	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j04-e	0	sbatch
+ARGV	j04-e	1	--account=acct01
+ARGV	j04-e	2	--partition=debug
+ARGV	j04-e	3	--time=00:01:00
+ARGV	j04-e	4	--nodes=1
+ARGV	j04-e	5	--ntasks=1
+ARGV	j04-e	6	--parsable
+ARGV	j04-e	7	--array=0-1
+ARGV	j04-e	8	--output=/scratch/example/run/cases/j04-o/arr_A-%A_a-%a_j-%j_s-%s.log
+ARGV	j04-e	9	--error=/scratch/example/run/cases/j04-e/arr_a-%a.err
+ARGV	j04-e	10	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j04	j04-o	output	cli	arr_A-%A_a-%a_j-%j_s-%s.log	/scratch/example/run/cases/j04-o
+OPT	j04-o	array	0-1
+OPT	j04-o	jobname	ABSENT
+NOTE	j04-o	the same specifiers WITH --array, which is the case they exist for
+CASE	j04	j04-e	error	cli	arr_a-%a.err	/scratch/example/run/cases/j04-e
+OPT	j04-e	array	0-1
+OPT	j04-e	jobname	ABSENT
+NOTE	j04-e	the same specifiers WITH --array, which is the case they exist for
+JOB	j04	837605	SUBMITTED
+ARGV	j05-o	0	sbatch
+ARGV	j05-o	1	--account=acct01
+ARGV	j05-o	2	--partition=debug
+ARGV	j05-o	3	--time=00:01:00
+ARGV	j05-o	4	--nodes=1
+ARGV	j05-o	5	--ntasks=1
+ARGV	j05-o	6	--parsable
+ARGV	j05-o	7	--output=/scratch/example/run/cases/j05-o/pct%%pct.log
+ARGV	j05-o	8	--error=/scratch/example/run/cases/j05-e/pct%%j.err
+ARGV	j05-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j05-e	0	sbatch
+ARGV	j05-e	1	--account=acct01
+ARGV	j05-e	2	--partition=debug
+ARGV	j05-e	3	--time=00:01:00
+ARGV	j05-e	4	--nodes=1
+ARGV	j05-e	5	--ntasks=1
+ARGV	j05-e	6	--parsable
+ARGV	j05-e	7	--output=/scratch/example/run/cases/j05-o/pct%%pct.log
+ARGV	j05-e	8	--error=/scratch/example/run/cases/j05-e/pct%%j.err
+ARGV	j05-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j05	j05-o	output	cli	pct%%pct.log	/scratch/example/run/cases/j05-o
+OPT	j05-o	array	ABSENT
+OPT	j05-o	jobname	ABSENT
+NOTE	j05-o	the escape %%, and a specifier immediately after one
+CASE	j05	j05-e	error	cli	pct%%j.err	/scratch/example/run/cases/j05-e
+OPT	j05-e	array	ABSENT
+OPT	j05-e	jobname	ABSENT
+NOTE	j05-e	the escape %%, and a specifier immediately after one
+JOB	j05	837608	SUBMITTED
+ARGV	j06-o	0	sbatch
+ARGV	j06-o	1	--account=acct01
+ARGV	j06-o	2	--partition=debug
+ARGV	j06-o	3	--time=00:01:00
+ARGV	j06-o	4	--nodes=1
+ARGV	j06-o	5	--ntasks=1
+ARGV	j06-o	6	--parsable
+ARGV	j06-o	7	--output=/scratch/example/run/cases/j06-o/jprobe-%J.log
+ARGV	j06-o	8	--error=/scratch/example/run/cases/j06-e/errJ-%J.err
+ARGV	j06-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j06-e	0	sbatch
+ARGV	j06-e	1	--account=acct01
+ARGV	j06-e	2	--partition=debug
+ARGV	j06-e	3	--time=00:01:00
+ARGV	j06-e	4	--nodes=1
+ARGV	j06-e	5	--ntasks=1
+ARGV	j06-e	6	--parsable
+ARGV	j06-e	7	--output=/scratch/example/run/cases/j06-o/jprobe-%J.log
+ARGV	j06-e	8	--error=/scratch/example/run/cases/j06-e/errJ-%J.err
+ARGV	j06-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j06	j06-o	output	cli	jprobe-%J.log	/scratch/example/run/cases/j06-o
+OPT	j06-o	array	ABSENT
+OPT	j06-o	jobname	ABSENT
+NOTE	j06-o	KNOWN ANSWER: %J, which husk refuses as unmeasured
+CASE	j06	j06-e	error	cli	errJ-%J.err	/scratch/example/run/cases/j06-e
+OPT	j06-e	array	ABSENT
+OPT	j06-e	jobname	ABSENT
+NOTE	j06-e	KNOWN ANSWER: %J, which husk refuses as unmeasured
+JOB	j06	837609	SUBMITTED
+ARGV	j07-o	0	sbatch
+ARGV	j07-o	1	--account=acct01
+ARGV	j07-o	2	--partition=debug
+ARGV	j07-o	3	--time=00:01:00
+ARGV	j07-o	4	--nodes=1
+ARGV	j07-o	5	--ntasks=1
+ARGV	j07-o	6	--parsable
+ARGV	j07-o	7	--job-name=huskdiffx
+ARGV	j07-o	8	--output=/scratch/example/run/cases/j07-o/x-%x.log
+ARGV	j07-o	9	--error=/scratch/example/run/cases/j07-e/x-%x-%j.err
+ARGV	j07-o	10	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j07-e	0	sbatch
+ARGV	j07-e	1	--account=acct01
+ARGV	j07-e	2	--partition=debug
+ARGV	j07-e	3	--time=00:01:00
+ARGV	j07-e	4	--nodes=1
+ARGV	j07-e	5	--ntasks=1
+ARGV	j07-e	6	--parsable
+ARGV	j07-e	7	--job-name=huskdiffx
+ARGV	j07-e	8	--output=/scratch/example/run/cases/j07-o/x-%x.log
+ARGV	j07-e	9	--error=/scratch/example/run/cases/j07-e/x-%x-%j.err
+ARGV	j07-e	10	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j07	j07-o	output	cli	x-%x.log	/scratch/example/run/cases/j07-o
+OPT	j07-o	array	ABSENT
+OPT	j07-o	jobname	huskdiffx
+NOTE	j07-o	%x, which husk refuses because slurmd expands it after husk confined the path
+CASE	j07	j07-e	error	cli	x-%x-%j.err	/scratch/example/run/cases/j07-e
+OPT	j07-e	array	ABSENT
+OPT	j07-e	jobname	huskdiffx
+NOTE	j07-e	%x, which husk refuses because slurmd expands it after husk confined the path
+JOB	j07	837610	SUBMITTED
+ARGV	j08-o	0	sbatch
+ARGV	j08-o	1	--account=acct01
+ARGV	j08-o	2	--partition=debug
+ARGV	j08-o	3	--time=00:01:00
+ARGV	j08-o	4	--nodes=1
+ARGV	j08-o	5	--ntasks=1
+ARGV	j08-o	6	--parsable
+ARGV	j08-o	7	--output=/scratch/example/run/cases/j08-o/q-%q.log
+ARGV	j08-o	8	--error=/scratch/example/run/cases/j08-e/Z-%Z.err
+ARGV	j08-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j08-e	0	sbatch
+ARGV	j08-e	1	--account=acct01
+ARGV	j08-e	2	--partition=debug
+ARGV	j08-e	3	--time=00:01:00
+ARGV	j08-e	4	--nodes=1
+ARGV	j08-e	5	--ntasks=1
+ARGV	j08-e	6	--parsable
+ARGV	j08-e	7	--output=/scratch/example/run/cases/j08-o/q-%q.log
+ARGV	j08-e	8	--error=/scratch/example/run/cases/j08-e/Z-%Z.err
+ARGV	j08-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j08	j08-o	output	cli	q-%q.log	/scratch/example/run/cases/j08-o
+OPT	j08-o	array	ABSENT
+OPT	j08-o	jobname	ABSENT
+NOTE	j08-o	specifiers no SLURM version defines: literal, error, or something else?
+CASE	j08	j08-e	error	cli	Z-%Z.err	/scratch/example/run/cases/j08-e
+OPT	j08-e	array	ABSENT
+OPT	j08-e	jobname	ABSENT
+NOTE	j08-e	specifiers no SLURM version defines: literal, error, or something else?
+JOB	j08	837611	SUBMITTED
+ARGV	j09-o	0	sbatch
+ARGV	j09-o	1	--account=acct01
+ARGV	j09-o	2	--partition=debug
+ARGV	j09-o	3	--time=00:01:00
+ARGV	j09-o	4	--nodes=1
+ARGV	j09-o	5	--ntasks=1
+ARGV	j09-o	6	--parsable
+ARGV	j09-o	7	--output=/scratch/example/run/cases/j09-o/trail%
+ARGV	j09-o	8	--error=/scratch/example/run/cases/j09-e/lead%.err
+ARGV	j09-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j09-e	0	sbatch
+ARGV	j09-e	1	--account=acct01
+ARGV	j09-e	2	--partition=debug
+ARGV	j09-e	3	--time=00:01:00
+ARGV	j09-e	4	--nodes=1
+ARGV	j09-e	5	--ntasks=1
+ARGV	j09-e	6	--parsable
+ARGV	j09-e	7	--output=/scratch/example/run/cases/j09-o/trail%
+ARGV	j09-e	8	--error=/scratch/example/run/cases/j09-e/lead%.err
+ARGV	j09-e	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j09	j09-o	output	cli	trail%	/scratch/example/run/cases/j09-o
+OPT	j09-o	array	ABSENT
+OPT	j09-o	jobname	ABSENT
+NOTE	j09-o	a dangling % at end of name, and a % in front of a non-letter
+CASE	j09	j09-e	error	cli	lead%.err	/scratch/example/run/cases/j09-e
+OPT	j09-e	array	ABSENT
+OPT	j09-e	jobname	ABSENT
+NOTE	j09-e	a dangling % at end of name, and a % in front of a non-letter
+JOB	j09	837612	SUBMITTED
+ARGV	j10-o	0	sbatch
+ARGV	j10-o	1	--account=acct01
+ARGV	j10-o	2	--partition=debug
+ARGV	j10-o	3	--time=00:01:00
+ARGV	j10-o	4	--nodes=1
+ARGV	j10-o	5	--ntasks=1
+ARGV	j10-o	6	--parsable
+ARGV	j10-o	7	--job-name=huskdiffd
+ARGV	j10-o	8	--output=/scratch/example/run/cases/j10-o/%x/out-%j.log
+ARGV	j10-o	9	--error=/scratch/example/run/cases/j10-e/%j/err.err
+ARGV	j10-o	10	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+ARGV	j10-e	0	sbatch
+ARGV	j10-e	1	--account=acct01
+ARGV	j10-e	2	--partition=debug
+ARGV	j10-e	3	--time=00:01:00
+ARGV	j10-e	4	--nodes=1
+ARGV	j10-e	5	--ntasks=1
+ARGV	j10-e	6	--parsable
+ARGV	j10-e	7	--job-name=huskdiffd
+ARGV	j10-e	8	--output=/scratch/example/run/cases/j10-o/%x/out-%j.log
+ARGV	j10-e	9	--error=/scratch/example/run/cases/j10-e/%j/err.err
+ARGV	j10-e	10	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j10	j10-o	output	cli	%x/out-%j.log	/scratch/example/run/cases/j10-o
+OPT	j10-o	array	ABSENT
+OPT	j10-o	jobname	huskdiffd
+NOTE	j10-o	D2-7: a % in a DIRECTORY component of an explicit --output
+CASE	j10	j10-e	error	cli	%j/err.err	/scratch/example/run/cases/j10-e
+OPT	j10-e	array	ABSENT
+OPT	j10-e	jobname	huskdiffd
+NOTE	j10-e	D2-7: a % in a DIRECTORY component of an explicit --output
+JOB	j10	837613	SUBMITTED
+ARGV	j11-o	0	sbatch
+ARGV	j11-o	1	--account=acct01
+ARGV	j11-o	2	--partition=debug
+ARGV	j11-o	3	--time=00:01:00
+ARGV	j11-o	4	--nodes=1
+ARGV	j11-o	5	--ntasks=1
+ARGV	j11-o	6	--parsable
+ARGV	j11-o	7	--chdir=/scratch/example/run/cases/j11-o/chd%x
+ARGV	j11-o	8	--job-name=huskdiffc
+ARGV	j11-o	9	--wrap=/scratch/example/run/bin/husk-diff-record.sh
+CASE	j11	j11-o	output	none	<default>	/scratch/example/run/cases/j11-o
+OPT	j11-o	array	ABSENT
+OPT	j11-o	jobname	huskdiffc
+NOTE	j11-o	KNOWN ANSWER: is --chdir literal, and which directory holds the DEFAULT output
+JOB	j11	837614	SUBMITTED
+ARGV	j12-o	0	sbatch
+ARGV	j12-o	1	--account=acct01
+ARGV	j12-o	2	--partition=debug
+ARGV	j12-o	3	--time=00:01:00
+ARGV	j12-o	4	--nodes=1
+ARGV	j12-o	5	--ntasks=1
+ARGV	j12-o	6	--parsable
+ARGV	j12-o	7	/scratch/example/run/scripts/j12.sh
+ARGV	j12-e	0	sbatch
+ARGV	j12-e	1	--account=acct01
+ARGV	j12-e	2	--partition=debug
+ARGV	j12-e	3	--time=00:01:00
+ARGV	j12-e	4	--nodes=1
+ARGV	j12-e	5	--ntasks=1
+ARGV	j12-e	6	--parsable
+ARGV	j12-e	7	/scratch/example/run/scripts/j12.sh
+CASE	j12	j12-o	output	dir	d_all_j-%j_A-%A_a-%a_N-%N_n-%n_t-%t_s-%s_u-%u.log	/scratch/example/run/cases/j12-o
+OPT	j12-o	array	ABSENT
+OPT	j12-o	jobname	ABSENT
+NOTE	j12-o	the same as j02 but as #SBATCH directives
+CASE	j12	j12-e	error	dir	d_x%jy.err	/scratch/example/run/cases/j12-e
+OPT	j12-e	array	ABSENT
+OPT	j12-e	jobname	ABSENT
+NOTE	j12-e	the same as j02 but as #SBATCH directives
+JOB	j12	837615	SUBMITTED
+ARGV	j13-o	0	sbatch
+ARGV	j13-o	1	--account=acct01
+ARGV	j13-o	2	--partition=debug
+ARGV	j13-o	3	--time=00:01:00
+ARGV	j13-o	4	--nodes=1
+ARGV	j13-o	5	--ntasks=1
+ARGV	j13-o	6	--parsable
+ARGV	j13-o	7	/scratch/example/run/scripts/j13.sh
+ARGV	j13-e	0	sbatch
+ARGV	j13-e	1	--account=acct01
+ARGV	j13-e	2	--partition=debug
+ARGV	j13-e	3	--time=00:01:00
+ARGV	j13-e	4	--nodes=1
+ARGV	j13-e	5	--ntasks=1
+ARGV	j13-e	6	--parsable
+ARGV	j13-e	7	/scratch/example/run/scripts/j13.sh
+CASE	j13	j13-o	output	dir	d_probe-A%A-a%a-s%s.log	/scratch/example/run/cases/j13-o
+OPT	j13-o	array	ABSENT
+OPT	j13-o	jobname	ABSENT
+NOTE	j13-o	the RA-2 divergence as a directive
+CASE	j13	j13-e	error	dir	d_errA-%A.err	/scratch/example/run/cases/j13-e
+OPT	j13-e	array	ABSENT
+OPT	j13-e	jobname	ABSENT
+NOTE	j13-e	the RA-2 divergence as a directive
+JOB	j13	837616	SUBMITTED
+ARGV	j14-o	0	sbatch
+ARGV	j14-o	1	--account=acct01
+ARGV	j14-o	2	--partition=debug
+ARGV	j14-o	3	--time=00:01:00
+ARGV	j14-o	4	--nodes=1
+ARGV	j14-o	5	--ntasks=1
+ARGV	j14-o	6	--parsable
+ARGV	j14-o	7	/scratch/example/run/scripts/j14.sh
+ARGV	j14-e	0	sbatch
+ARGV	j14-e	1	--account=acct01
+ARGV	j14-e	2	--partition=debug
+ARGV	j14-e	3	--time=00:01:00
+ARGV	j14-e	4	--nodes=1
+ARGV	j14-e	5	--ntasks=1
+ARGV	j14-e	6	--parsable
+ARGV	j14-e	7	/scratch/example/run/scripts/j14.sh
+CASE	j14	j14-o	output	dir	d_pct%%pct.log	/scratch/example/run/cases/j14-o
+OPT	j14-o	array	ABSENT
+OPT	j14-o	jobname	ABSENT
+NOTE	j14-o	the escape %% as a directive
+CASE	j14	j14-e	error	dir	d_pct%%j.err	/scratch/example/run/cases/j14-e
+OPT	j14-e	array	ABSENT
+OPT	j14-e	jobname	ABSENT
+NOTE	j14-e	the escape %% as a directive
+JOB	j14	837617	SUBMITTED
+ARGV	j15-o	0	sbatch
+ARGV	j15-o	1	--account=acct01
+ARGV	j15-o	2	--partition=debug
+ARGV	j15-o	3	--time=00:01:00
+ARGV	j15-o	4	--nodes=1
+ARGV	j15-o	5	--ntasks=1
+ARGV	j15-o	6	--parsable
+ARGV	j15-o	7	/scratch/example/run/scripts/j15.sh
+ARGV	j15-e	0	sbatch
+ARGV	j15-e	1	--account=acct01
+ARGV	j15-e	2	--partition=debug
+ARGV	j15-e	3	--time=00:01:00
+ARGV	j15-e	4	--nodes=1
+ARGV	j15-e	5	--ntasks=1
+ARGV	j15-e	6	--parsable
+ARGV	j15-e	7	/scratch/example/run/scripts/j15.sh
+CASE	j15	j15-o	output	dir	d_jprobe-%J.log	/scratch/example/run/cases/j15-o
+OPT	j15-o	array	ABSENT
+OPT	j15-o	jobname	ABSENT
+NOTE	j15-o	%J and an unknown specifier as directives
+CASE	j15	j15-e	error	dir	d_q-%q.err	/scratch/example/run/cases/j15-e
+OPT	j15-e	array	ABSENT
+OPT	j15-e	jobname	ABSENT
+NOTE	j15-e	%J and an unknown specifier as directives
+JOB	j15	837618	SUBMITTED
+CONTROL	all_jobs_terminal	PASS	done
+JOBSTATE	j00	837601	COMPLETED
+JOBSTATE	j01	837602	COMPLETED
+JOBSTATE	j02	837603	COMPLETED
+JOBSTATE	j03	837604	COMPLETED
+JOBSTATE	j04	837605	COMPLETED
+JOBSTATE	j05	837608	COMPLETED
+JOBSTATE	j06	837609	COMPLETED
+JOBSTATE	j07	837610	COMPLETED
+JOBSTATE	j08	837611	COMPLETED
+JOBSTATE	j09	837612	COMPLETED
+JOBSTATE	j10	837613	COMPLETED
+JOBSTATE	j11	837614	COMPLETED
+JOBSTATE	j12	837615	COMPLETED
+JOBSTATE	j13	837616	COMPLETED
+JOBSTATE	j14	837617	COMPLETED
+JOBSTATE	j15	837618	COMPLETED
+FILE	j10-o	huskdiffd	dir	0
+FILE	j10-o	huskdiffd/out-837613.log	file	34
+FILES	j10-o	1
+FILE	j10-e	837613	dir	0
+FILE	j10-e	837613/err.err	file	34
+FILES	j10-e	1
+FILE	j12-o	d_all_j-837615_A-837615_a-4294967294_N-nid00fake_n-0_t-0_s-batch_u-alice.log	file	34
+FILES	j12-o	1
+FILE	j06-e	errJ-837609.err	file	34
+FILES	j06-e	1
+FILE	j12-e	d_x837615y.err	file	34
+FILES	j12-e	1
+FILE	j06-o	jprobe-837609.log	file	34
+FILES	j06-o	1
+FILE	j02-e	def_n-0_t-0_s-batch.err	file	34
+FILES	j02-e	1
+FILE	j02-o	all_j-837603_A-837603_a-4294967294_N-nid00fake_n-0_t-0_s-batch_u-alice.log	file	34
+FILES	j02-o	1
+FILE	j08-e	Z-%Z.err	file	34
+FILES	j08-e	1
+FILE	j08-o	q-%q.log	file	34
+FILES	j08-o	1
+FILE	j07-o	x-huskdiffx.log	file	34
+FILES	j07-o	1
+FILE	j07-e	x-huskdiffx-837610.err	file	34
+FILES	j07-e	1
+FILE	j00-o	ctrl-literal.log	file	34
+FILES	j00-o	1
+FILE	j01-o	837602	file	34
+FILES	j01-o	1
+FILE	j00-e	ctrl-literal.err	file	34
+FILES	j00-e	1
+FILE	j01-e	x837602y.err	file	34
+FILES	j01-e	1
+FILE	j09-e	lead%.err	file	34
+FILES	j09-e	1
+FILE	j09-o	trail%	file	34
+FILES	j09-o	1
+FILE	j11-o	chd%x	dir	0
+FILE	j11-o	chd%x/slurm-837614.out	file	34
+FILES	j11-o	1
+FILE	j15-e	d_q-%q.err	file	34
+FILES	j15-e	1
+FILE	j15-o	d_jprobe-837618.log	file	34
+FILES	j15-o	1
+FILE	j04-e	arr_a-0.err	file	34
+FILE	j04-e	arr_a-1.err	file	34
+FILES	j04-e	2
+FILE	j04-o	arr_A-837605_a-0_j-837606_s-batch.log	file	34
+FILE	j04-o	arr_A-837605_a-1_j-837607_s-batch.log	file	34
+FILES	j04-o	2
+FILE	j03-e	errA-837604.err	file	34
+FILES	j03-e	1
+FILE	j03-o	probe-A837604-a4294967294-sbatch.log	file	34
+FILES	j03-o	1
+FILE	j14-e	d_pct%j.err	file	34
+FILES	j14-e	1
+FILE	j14-o	d_pct%pct.log	file	34
+FILES	j14-o	1
+FILE	j13-e	d_errA-837616.err	file	34
+FILES	j13-e	1
+FILE	j13-o	d_probe-A837616-a4294967294-sbatch.log	file	34
+FILES	j13-o	1
+FILE	j05-o	pct%pct.log	file	34
+FILES	j05-o	1
+FILE	j05-e	pct%j.err	file	34
+FILES	j05-e	1
+PWD	837601	none	/scratch/example/cwd
+ENV	837601	none	SLURM_JOB_ID	SET	837601
+ENV	837601	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837601	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837601	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837601	none	SLURM_NODEID	SET	0
+ENV	837601	none	SLURM_LOCALID	SET	0
+ENV	837601	none	SLURM_STEP_ID	UNSET
+ENV	837601	none	USER	SET	alice
+ENV	837601	none	SLURM_JOB_NAME	SET	wrap
+PWD	837602	none	/scratch/example/cwd
+ENV	837602	none	SLURM_JOB_ID	SET	837602
+ENV	837602	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837602	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837602	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837602	none	SLURM_NODEID	SET	0
+ENV	837602	none	SLURM_LOCALID	SET	0
+ENV	837602	none	SLURM_STEP_ID	UNSET
+ENV	837602	none	USER	SET	alice
+ENV	837602	none	SLURM_JOB_NAME	SET	wrap
+PWD	837603	none	/scratch/example/cwd
+ENV	837603	none	SLURM_JOB_ID	SET	837603
+ENV	837603	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837603	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837603	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837603	none	SLURM_NODEID	SET	0
+ENV	837603	none	SLURM_LOCALID	SET	0
+ENV	837603	none	SLURM_STEP_ID	UNSET
+ENV	837603	none	USER	SET	alice
+ENV	837603	none	SLURM_JOB_NAME	SET	wrap
+PWD	837604	none	/scratch/example/cwd
+ENV	837604	none	SLURM_JOB_ID	SET	837604
+ENV	837604	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837604	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837604	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837604	none	SLURM_NODEID	SET	0
+ENV	837604	none	SLURM_LOCALID	SET	0
+ENV	837604	none	SLURM_STEP_ID	UNSET
+ENV	837604	none	USER	SET	alice
+ENV	837604	none	SLURM_JOB_NAME	SET	wrap
+PWD	837605	0	/scratch/example/cwd
+ENV	837605	0	SLURM_JOB_ID	SET	837606
+ENV	837605	0	SLURM_ARRAY_JOB_ID	SET	837605
+ENV	837605	0	SLURM_ARRAY_TASK_ID	SET	0
+ENV	837605	0	SLURMD_NODENAME	SET	nid00fake
+ENV	837605	0	SLURM_NODEID	SET	0
+ENV	837605	0	SLURM_LOCALID	SET	0
+ENV	837605	0	SLURM_STEP_ID	UNSET
+ENV	837605	0	USER	SET	alice
+ENV	837605	0	SLURM_JOB_NAME	SET	wrap
+PWD	837605	1	/scratch/example/cwd
+ENV	837605	1	SLURM_JOB_ID	SET	837607
+ENV	837605	1	SLURM_ARRAY_JOB_ID	SET	837605
+ENV	837605	1	SLURM_ARRAY_TASK_ID	SET	1
+ENV	837605	1	SLURMD_NODENAME	SET	nid00fake
+ENV	837605	1	SLURM_NODEID	SET	0
+ENV	837605	1	SLURM_LOCALID	SET	0
+ENV	837605	1	SLURM_STEP_ID	UNSET
+ENV	837605	1	USER	SET	alice
+ENV	837605	1	SLURM_JOB_NAME	SET	wrap
+PWD	837608	none	/scratch/example/cwd
+ENV	837608	none	SLURM_JOB_ID	SET	837608
+ENV	837608	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837608	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837608	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837608	none	SLURM_NODEID	SET	0
+ENV	837608	none	SLURM_LOCALID	SET	0
+ENV	837608	none	SLURM_STEP_ID	UNSET
+ENV	837608	none	USER	SET	alice
+ENV	837608	none	SLURM_JOB_NAME	SET	wrap
+PWD	837609	none	/scratch/example/cwd
+ENV	837609	none	SLURM_JOB_ID	SET	837609
+ENV	837609	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837609	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837609	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837609	none	SLURM_NODEID	SET	0
+ENV	837609	none	SLURM_LOCALID	SET	0
+ENV	837609	none	SLURM_STEP_ID	UNSET
+ENV	837609	none	USER	SET	alice
+ENV	837609	none	SLURM_JOB_NAME	SET	wrap
+PWD	837610	none	/scratch/example/cwd
+ENV	837610	none	SLURM_JOB_ID	SET	837610
+ENV	837610	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837610	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837610	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837610	none	SLURM_NODEID	SET	0
+ENV	837610	none	SLURM_LOCALID	SET	0
+ENV	837610	none	SLURM_STEP_ID	UNSET
+ENV	837610	none	USER	SET	alice
+ENV	837610	none	SLURM_JOB_NAME	SET	huskdiffx
+PWD	837611	none	/scratch/example/cwd
+ENV	837611	none	SLURM_JOB_ID	SET	837611
+ENV	837611	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837611	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837611	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837611	none	SLURM_NODEID	SET	0
+ENV	837611	none	SLURM_LOCALID	SET	0
+ENV	837611	none	SLURM_STEP_ID	UNSET
+ENV	837611	none	USER	SET	alice
+ENV	837611	none	SLURM_JOB_NAME	SET	wrap
+PWD	837612	none	/scratch/example/cwd
+ENV	837612	none	SLURM_JOB_ID	SET	837612
+ENV	837612	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837612	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837612	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837612	none	SLURM_NODEID	SET	0
+ENV	837612	none	SLURM_LOCALID	SET	0
+ENV	837612	none	SLURM_STEP_ID	UNSET
+ENV	837612	none	USER	SET	alice
+ENV	837612	none	SLURM_JOB_NAME	SET	wrap
+PWD	837613	none	/scratch/example/cwd
+ENV	837613	none	SLURM_JOB_ID	SET	837613
+ENV	837613	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837613	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837613	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837613	none	SLURM_NODEID	SET	0
+ENV	837613	none	SLURM_LOCALID	SET	0
+ENV	837613	none	SLURM_STEP_ID	UNSET
+ENV	837613	none	USER	SET	alice
+ENV	837613	none	SLURM_JOB_NAME	SET	huskdiffd
+PWD	837614	none	/scratch/example/run/cases/j11-o/chd%x
+ENV	837614	none	SLURM_JOB_ID	SET	837614
+ENV	837614	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837614	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837614	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837614	none	SLURM_NODEID	SET	0
+ENV	837614	none	SLURM_LOCALID	SET	0
+ENV	837614	none	SLURM_STEP_ID	UNSET
+ENV	837614	none	USER	SET	alice
+ENV	837614	none	SLURM_JOB_NAME	SET	huskdiffc
+PWD	837615	none	/scratch/example/cwd
+ENV	837615	none	SLURM_JOB_ID	SET	837615
+ENV	837615	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837615	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837615	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837615	none	SLURM_NODEID	SET	0
+ENV	837615	none	SLURM_LOCALID	SET	0
+ENV	837615	none	SLURM_STEP_ID	UNSET
+ENV	837615	none	USER	SET	alice
+ENV	837615	none	SLURM_JOB_NAME	SET	j12.sh
+PWD	837616	none	/scratch/example/cwd
+ENV	837616	none	SLURM_JOB_ID	SET	837616
+ENV	837616	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837616	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837616	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837616	none	SLURM_NODEID	SET	0
+ENV	837616	none	SLURM_LOCALID	SET	0
+ENV	837616	none	SLURM_STEP_ID	UNSET
+ENV	837616	none	USER	SET	alice
+ENV	837616	none	SLURM_JOB_NAME	SET	j13.sh
+PWD	837617	none	/scratch/example/cwd
+ENV	837617	none	SLURM_JOB_ID	SET	837617
+ENV	837617	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837617	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837617	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837617	none	SLURM_NODEID	SET	0
+ENV	837617	none	SLURM_LOCALID	SET	0
+ENV	837617	none	SLURM_STEP_ID	UNSET
+ENV	837617	none	USER	SET	alice
+ENV	837617	none	SLURM_JOB_NAME	SET	j14.sh
+PWD	837618	none	/scratch/example/cwd
+ENV	837618	none	SLURM_JOB_ID	SET	837618
+ENV	837618	none	SLURM_ARRAY_JOB_ID	UNSET
+ENV	837618	none	SLURM_ARRAY_TASK_ID	UNSET
+ENV	837618	none	SLURMD_NODENAME	SET	nid00fake
+ENV	837618	none	SLURM_NODEID	SET	0
+ENV	837618	none	SLURM_LOCALID	SET	0
+ENV	837618	none	SLURM_STEP_ID	UNSET
+ENV	837618	none	USER	SET	alice
+ENV	837618	none	SLURM_JOB_NAME	SET	j15.sh
+CONTROL	literal_control_file	PASS	ctrl-literal.log
+END	ok

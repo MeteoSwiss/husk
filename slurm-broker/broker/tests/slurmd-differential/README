@@ -1,0 +1,21 @@
+Fixture artefacts for `slurmd_differential.rs`. NOT MEASUREMENTS.
+
+Every one of these was produced by `slurm-broker/slurmd-differential.sh` running against
+`slurm-broker/slurmd-differential-fixture/sbatch`, a fake whose substitution model is a COPY
+of what the operator measured by hand on Santis 2026-08-31 (`doc/review-v0.5/round3/RA.md`
+§6, §7, §8). They exist so the grader can be exercised end to end with no cluster; they are
+evidence about the harness and about nothing else. Their `META sbatch_version` says so, and
+the grader prints `SOURCE IS NOT SLURM` for all of them.
+
+  measured.artefact       the world the operator measured
+  husk-world.artefact     a counterfactual where slurmd does exactly what husk's table says
+  stepid-drift.artefact   the measured world with ONE open question resolved the other way:
+                          %s renders as `0` while SLURM_STEP_ID stays unset. This is the row
+                          the real cluster run exists to produce or to rule out, and it is
+                          what makes the grader's DISAGREE path testable offline.
+  dry-run.artefact        `--dry-run`: invocations recorded, nothing submitted
+  control-failed.artefact measured.artefact with the literal-name control marked FAIL
+  absent-file.artefact    measured.artefact with j01-o's file removed
+
+Regenerate with `slurm-broker/slurmd-differential.test.sh`, which runs the harness against
+the fixture and grades the result it just produced.

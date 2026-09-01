@@ -1,0 +1,4 @@
+#!/bin/sh
+# FIXTURE. The fake sbatch runs each job synchronously, so nothing is ever in the queue.
+# Printing nothing is what `slurmd-differential.sh` reads as "every job has finished".
+exit 0

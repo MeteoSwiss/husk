@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# srun-stub.py — in-cage stub that shadows `srun` INSIDE a brokered job.
+#
+# The compute-node counterpart of sbatch-stub.py, one level down: the job runs
+# caged, the step-broker runs outside the cage but inside the allocation, and this
+# stub is the plumbing between them. Bound over /usr/bin/srun by the job guard.
+#
+# It is DUMB PLUMBING and makes no trust decisions. All policy — which srun options
+# are permitted, and the forced per-task cage wrapper — lives in the step-broker.
+# See SRUN-MPI-DESIGN.md and PROTOCOL.md. Protocol version: 1.
+#
+# NOT A SECURITY BOUNDARY. If this stub is bypassed (a script calling the real
+# srun by some other path), the failure mode is "srun does not work", not an
+# escape: the cage has no route to slurmctld (--unshare-net) and no MUNGE socket,
+# so the real srun cannot create a step from in here. The stub exists so that
+# ordinary run scripts keep working, not to contain anything.
+#
+# WHY THIS DIFFERS FROM THE SBATCH STUB: sbatch returns a job id immediately, but
+# srun runs the tasks to completion and streams their output. So this stub tails
+# the step's stdout/stderr out of the spool while it runs, rather than waiting for
+# a single response and printing one line.
+#
+# Fails closed: any spool/IO problem exits non-zero and never reports success.
+
+import json
+import os
+import sys
+import time
+import uuid
+from datetime import datetime, timezone
+
+PROTOCOL_VERSION = 1
+POLL_INTERVAL = 0.05  # seconds; also the output-streaming granularity
+
+# How stale the broker's heartbeat may get before we call it dead. The broker rewrites it
+# once per scan pass (default 100ms), so this is ~200x its period — long enough that a
+# loaded Lustre metadata server or a broker busy launching ranks is never mistaken for a
+# corpse, short enough that nobody sits through a walltime to learn the truth.
+#
+# Both are overridable, because a heavily loaded metadata server is a real reason to want
+# them looser and no operator should have to patch a stub to get that. Safe to expose to the
+# cage: the only thing an agent can do by moving them is make its OWN srun give up sooner or
+# hang longer. Neither reaches past the job, and a bad value falls back to the default.
+HEARTBEAT_NAME = "broker.alive"
+
+
+def _env_seconds(name, default):
+    try:
+        v = float(os.environ.get(name, ""))
+        return v if v > 0 else default
+    except ValueError:
+        return default
+
+
+HEARTBEAT_STALE_AFTER = _env_seconds("HUSK_HEARTBEAT_STALE_AFTER", 20.0)
+HEARTBEAT_FIRST_WAIT = _env_seconds("HUSK_HEARTBEAT_FIRST_WAIT", 30.0)
+
+
+def broker_last_seen(spool):
+    """Seconds since the step broker said it was alive, or None if it never has.
+
+    Reads the CONTENT rather than the mtime: both sides run on the same node, but the spool
+    is on a shared filesystem whose attribute caching is not something to bet a diagnosis on.
+    """
+    try:
+        with open(os.path.join(spool, HEARTBEAT_NAME)) as f:
+            return max(0.0, time.time() - float(f.read().strip()))
+    except (OSError, ValueError):
+        return None
+
+
+def die(msg, code=1, from_husk=False):
+    """Fail, and be honest about WHO refused — see the same function in sbatch-stub.py.
+
+    `srun: error: ...` is byte-for-byte what real srun prints, so husk's own refusals were
+    indistinguishable from the scheduler's. An agent routes around a scheduler failure and
+    complies with a stated rule; it can only tell them apart if we say which this is.
+    """
+    if from_husk:
+        sys.stderr.write(f"husk: {msg}\n")
+    else:
+        sys.stderr.write(f"srun: error: {msg}\n")
+    sys.exit(code)
+
+
+def spool_dir():
+    # Set by the job guard before it re-execs the job into the cage. There is no
+    # cwd-relative fallback: unlike the login side, a compute job's cwd is not a
+    # reliable anchor (a run script may cd anywhere), and guessing wrong would
+    # silently produce a request nobody reads.
+    d = os.environ.get("HUSK_STEP_SPOOL")
+    if not d:
+        die("no step spool configured (HUSK_STEP_SPOOL unset) — is this job brokered by husk?")
+    if not os.path.isdir(d):
+        die(f"step spool directory not found: {d}")
+    if not os.access(d, os.W_OK):
+        die(f"step spool directory not writable: {d}")
+    return d
+
+
+def write_atomic(path, data):
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+class Tail:
+    """Stream a file that another process is appending to, without re-reading it."""
+
+    def __init__(self, path, sink):
+        self.path = path
+        self.sink = sink
+        self.pos = 0
+
+    def pump(self):
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.pos)
+                chunk = f.read()
+                self.pos += len(chunk)
+        except FileNotFoundError:
+            return
+        if chunk:
+            self.sink.buffer.write(chunk)
+            self.sink.flush()
+
+
+def response_mismatch(resp, req_id):
+    """Every way the step broker's answer fails to match the request this stub sent.
+
+    NEVER a refusal, for the reason spelled out in the sbatch stub's copy: a response means
+    the work has already happened, and turning a schema surprise into an error would discard
+    a step's exit status rather than report it.
+
+    On this side it matters more, not less. `step.rs` does NOT check the version of the
+    REQUEST (`B7-8`), and the step spool is where a stale `~/.local/lib/husk/srun-stub.py`
+    meets a freshly built broker. It is also the side with no timeout: a step legitimately
+    runs for hours, so a mismatch that this stub turned into a wait would be a job that hangs
+    to its walltime.
+
+    NOT COVERED: the request direction, which is the half with a consequence — a v2 request
+    against this v1 step broker is deserialized and read, not refused. The fix is in
+    `step.rs`, which this change does not own; see FIX-I.
+    """
+    out = []
+    v = resp.get("version")
+    if v != PROTOCOL_VERSION:
+        out.append(
+            f"the step broker answered with protocol version {v!r}, but this stub speaks "
+            f"version {PROTOCOL_VERSION}. husk's two halves are deployed separately, so this "
+            f"usually means one of them was upgraded and the other was not. What is reported "
+            f"below was read with the older schema.")
+    rid = resp.get("id")
+    if rid != req_id:
+        out.append(
+            f"the step broker's answer names request {rid!r}, and this is request {req_id!r}. "
+            f"The two are paired by filename, so an answer carrying a different id means the "
+            f"pairing and the content disagree; the exit status below may belong to another "
+            f"step.")
+    return out
+
+
+def main():
+    argv = sys.argv[1:]
+    spool = spool_dir()
+    req_id = str(uuid.uuid4())
+
+    request = {
+        "version": PROTOCOL_VERSION,
+        "id": req_id,
+        "tool": "srun",
+        "submitted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "cwd": os.getcwd(),
+        "argv": argv,
+        # A step has no script to snapshot: the command is in argv, and the broker
+        # wraps it rather than inspecting it.
+        "script": {"source": "none", "name": None, "body": ""},
+        "job_args": [],
+        # The job script's environment. A run script that does
+        #     export OMP_NUM_THREADS=4
+        #     srun ./solver
+        # expects its ranks to see that, and uncaged srun would propagate it — but here
+        # the script runs inside the cage while the real srun runs outside it, so the
+        # chain is broken unless we carry it across explicitly.
+        #
+        # This is NOT handed to srun. The broker filters it (scheduler-owned names,
+        # configured credentials, anything that is not a portable variable name) and
+        # applies the rest with bwrap's --setenv, i.e. INSIDE the rank cage. That
+        # matters: the rank wrapper's first process is a dynamically linked /bin/sh
+        # running before any cage exists, so an LD_PRELOAD reaching it would be an
+        # escape. Via --setenv it can only ever affect the caged command.
+        "env": dict(os.environ),
+    }
+
+    req_path = os.path.join(spool, f"req-{req_id}.json")
+    resp_path = os.path.join(spool, f"resp-{req_id}.json")
+    out_path = os.path.join(spool, f"out-{req_id}")
+    err_path = os.path.join(spool, f"err-{req_id}")
+    write_atomic(req_path, json.dumps(request))
+
+    # No timeout on the STEP: it legitimately runs for hours, and killing a simulation
+    # because a wall clock expired would be worse than waiting. The step ends when the
+    # broker says so (or when SLURM tears the job down).
+    #
+    # But "is the step still running" and "is anyone still listening" are different
+    # questions, and this loop used to ask only the first. With one unbounded wait, a broker
+    # that never started looks exactly like a six-hour simulation — so srun hung to the
+    # walltime, silently, five or six times in a row (Balfrin 2026-08-06; the broker had
+    # refused to start over an empty .claude/settings.json, and said so in a log nobody was
+    # reading). The heartbeat separates them: unbounded on the step, bounded on the broker.
+    out_tail = Tail(out_path, sys.stdout)
+    err_tail = Tail(err_path, sys.stderr)
+    waited = 0.0
+    try:
+        while not os.path.exists(resp_path):
+            out_tail.pump()
+            err_tail.pump()
+
+            age = broker_last_seen(spool)
+            if age is None:
+                # Never seen. Either the broker is still starting, or it is not coming.
+                waited += POLL_INTERVAL
+                if waited > HEARTBEAT_FIRST_WAIT:
+                    die("the step broker is not running, so this step cannot be launched.\n"
+                        "husk: husk is failing now rather than waiting for the job's "
+                        "walltime.\n"
+                        f"husk: no heartbeat appeared in {spool} within "
+                        f"{HEARTBEAT_FIRST_WAIT:.0f}s. The reason it did not start is in "
+                        "husk's job log ($HUSK_JOB_LOG, normally ~/.husk/log/job-<id>.log) "
+                        "-- the usual cause is a settings file that does not parse.",
+                        from_husk=True)
+            elif age > HEARTBEAT_STALE_AFTER:
+                die("the step broker stopped responding while this step was waiting.\n"
+                    f"husk: its last heartbeat was {age:.0f}s ago (limit "
+                    f"{HEARTBEAT_STALE_AFTER:.0f}s). Anything this step already wrote is "
+                    "above; the step itself may or may not have run.\n"
+                    "husk: see husk's job log ($HUSK_JOB_LOG) for what happened to it.",
+                    from_husk=True)
+
+            time.sleep(POLL_INTERVAL)
+        # The broker wrote the response after the step exited, but output written
+        # just before that may still be unread — drain both before reporting.
+        out_tail.pump()
+        err_tail.pump()
+        with open(resp_path) as f:
+            resp = json.load(f)
+    except KeyboardInterrupt:
+        # Ctrl-C / SIGINT: leave the request in place; the broker owns the step's
+        # lifetime and SLURM will tear it down with the job.
+        die("interrupted while waiting for the step", code=130)
+    finally:
+        for p in (req_path, resp_path, out_path, err_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    for line in response_mismatch(resp, req_id):
+        sys.stderr.write(f"husk: {line}\n")
+
+    if resp.get("status") == "ok":
+        sys.exit(int(resp.get("exit_code", 0)))
+    # Rejected by the step allowlist, or the launch failed. The message is written
+    # for whoever wrote the job script, so pass it through unedited.
+    die(resp.get("message", "step rejected by the husk step-broker"), from_husk=True,
+        code=int(resp.get("exit_code", 1)))
+
+
+if __name__ == "__main__":
+    main()

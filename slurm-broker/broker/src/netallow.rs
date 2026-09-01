@@ -1,0 +1,732 @@
+//! The network allowlist: which host and port a caged job may reach.
+//!
+//! This is the whole security decision of the network phase, so it lives on its own,
+//! is a pure function of its inputs, and is tested against the escapes rather than the
+//! happy path.
+//!
+//! # Why an allowlist at all, and why it is not the only wall
+//!
+//! Opening the network REACTIVATES AV8: a job with a route can reach `slurmctld` and
+//! submit work that never passes the broker — the exact bypass husk exists to prevent.
+//! Two independent things stop that, and the allowlist is only one of them:
+//!
+//! * the scheduler is not on the allowlist (enforced here, by construction — see
+//!   `SCHEDULER_PORTS`), and
+//! * `/run/munge` stays masked in every cage, so a job cannot authenticate to the
+//!   scheduler even if it somehow reaches it.
+//!
+//! The mask is the load-bearing one. AF_UNIX taught us that reachability has to be judged
+//! per DESTINATION and that a syscall filter cannot do it; the same reasoning says a
+//! host allowlist should not be the only thing between a job and the scheduler.
+//!
+//! # Where the shape comes from
+//!
+//! The pattern language matches Anthropic's `sandbox-runtime`, deliberately: it is a
+//! shape their users already write, and its three parsing defences are a bug list we get
+//! to inherit rather than rediscover (see `split_port`, `matches_host`). The
+//! implementation is ours — theirs lives inside the runtime husk removes in v0.6, so
+//! building on it would be a dead end, and it would put vendor code on the enforcement
+//! path, which the axiom forbids.
+
+/// Ports the scheduler speaks on. An allowlist entry naming one is refused outright,
+/// whatever host it names.
+///
+/// This is belt to the MUNGE mask's braces. It is *not* a claim that these are the only
+/// ways to reach a scheduler — a site can move them, and a compromised host on the
+/// allowlist could proxy onward — which is exactly why the mask, not this list, is what
+/// the guarantee rests on. What this buys is that the obvious mistake (an operator
+/// allowing the controller host "so job monitoring works") fails at configuration time
+/// with an explanation, rather than silently reopening AV8.
+const SCHEDULER_PORTS: &[u16] = &[6817, 6818, 6819, 6820];
+
+/// Why a candidate allowlist entry was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EntryError {
+    Empty,
+    TooLong,
+    /// A scheme, path, or credentials — an entry is a host, not a URL.
+    NotAHost(&'static str),
+    /// `*`, `*.com` and friends: broad enough to be indistinguishable from no policy.
+    TooBroad,
+    /// Names a port the scheduler speaks on (see `SCHEDULER_PORTS`).
+    SchedulerPort(u16),
+    BadPort,
+    BadHostChar,
+}
+
+impl std::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryError::Empty => write!(f, "an allowlist entry cannot be empty"),
+            EntryError::TooLong => write!(f, "an allowlist entry may be at most 255 characters"),
+            EntryError::NotAHost(what) => write!(
+                f,
+                "an allowlist entry is a host, not a URL: remove the {what}"
+            ),
+            EntryError::TooBroad => write!(
+                f,
+                "too broad. A wildcard must have at least two labels after it \
+                 (`*.example.com`, not `*.com` or `*`) — an entry that matches most of \
+                 the internet is not a policy"
+            ),
+            EntryError::SchedulerPort(p) => write!(
+                f,
+                "port {p} is a SLURM daemon port. A caged job that can reach the \
+                 scheduler could submit work that never passes the broker (AV8), which is \
+                 the bypass husk exists to prevent. Job control goes through the broker."
+            ),
+            EntryError::BadPort => write!(f, "the :port suffix must be a number in 1-65535"),
+            EntryError::BadHostChar => write!(f, "a host may contain only letters, digits, `.`, `-` and `_`"),
+        }
+    }
+}
+
+/// One validated allowlist entry.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct Entry {
+    host: String,
+    /// `None` matches any port.
+    port: Option<u16>,
+    wildcard: bool,
+    /// The explicit "everything" entry, `*` (or `*:443` for everything on one port).
+    ///
+    /// Kept as its own thing rather than as a wildcard with an empty base, so that
+    /// relaxing the rule for `*` does NOT relax it for `*.com`. A vague pattern is still
+    /// refused; only an unmistakable "I want the whole internet" is honoured. Some sites
+    /// legitimately want that, and husk refusing to express a policy an operator has
+    /// deliberately chosen would just push them to turn husk off.
+    everything: bool,
+}
+
+/// Split a trailing `:port`, if there is one.
+///
+/// **The suffix must be strictly numeric.** `evil.com:443.allowed.com` therefore does NOT
+/// split — it stays whole and fails host validation on the remaining `:`. Treating any
+/// trailing `:...` as a port would make that string parse as host `evil.com` with a
+/// nonsense port, which is a parser differential of exactly the F13/F14 kind: our reading
+/// and the connecting code's reading would disagree about which host was authorised.
+/// Borrowed from `sandbox-runtime`, which had already worked this out.
+fn split_port(s: &str) -> (&str, Option<&str>) {
+    match s.rfind(':') {
+        None => (s, None),
+        Some(i) => {
+            let suffix = &s[i + 1..];
+            let numeric = !suffix.is_empty()
+                && suffix.len() <= 5
+                && !suffix.starts_with('0')
+                && suffix.bytes().all(|b| b.is_ascii_digit());
+            if numeric {
+                (&s[..i], Some(suffix))
+            } else {
+                (s, None)
+            }
+        }
+    }
+}
+
+impl Entry {
+    /// Validate one operator-supplied entry.
+    pub fn parse(raw: &str) -> Result<Entry, EntryError> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(EntryError::Empty);
+        }
+        if raw.len() > 255 {
+            return Err(EntryError::TooLong);
+        }
+        if raw.contains("://") {
+            return Err(EntryError::NotAHost("scheme"));
+        }
+        if raw.contains('/') {
+            return Err(EntryError::NotAHost("path"));
+        }
+        if raw.contains('@') {
+            return Err(EntryError::NotAHost("credentials"));
+        }
+
+        let (host, port) = split_port(raw);
+        let port = match port {
+            None => None,
+            Some(p) => match p.parse::<u16>() {
+                Ok(0) | Err(_) => return Err(EntryError::BadPort),
+                Ok(p) => Some(p),
+            },
+        };
+        if let Some(p) = port {
+            if SCHEDULER_PORTS.contains(&p) {
+                return Err(EntryError::SchedulerPort(p));
+            }
+        }
+
+        if host == "*" {
+            return Ok(Entry { host: String::new(), port, wildcard: false, everything: true });
+        }
+
+        let (wildcard, base) = match host.strip_prefix("*.") {
+            Some(b) => (true, b),
+            None => (false, host),
+        };
+        if base.is_empty() || base.contains('*') || base.contains(':') {
+            return Err(EntryError::BadHostChar);
+        }
+        if !base
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+        {
+            return Err(EntryError::BadHostChar);
+        }
+        // A wildcard needs at least two labels after it, so `*.com` and `*` are refused.
+        // Anything that matches most of the internet is indistinguishable from no policy,
+        // and an allowlist nobody can reason about is worse than an honest deny-all.
+        if wildcard && base.split('.').filter(|l| !l.is_empty()).count() < 2 {
+            return Err(EntryError::TooBroad);
+        }
+        if !wildcard && host.contains('*') {
+            return Err(EntryError::TooBroad);
+        }
+        Ok(Entry { host: base.to_ascii_lowercase(), port, wildcard, everything: false })
+    }
+
+    /// Does this entry authorise a connection to `host:port`?
+    fn matches(&self, host: &str, port: u16) -> bool {
+        if let Some(p) = self.port {
+            if p != port {
+                return false;
+            }
+        }
+        if self.everything {
+            return true;
+        }
+        let h = host.to_ascii_lowercase();
+        if !self.wildcard {
+            return h == self.host;
+        }
+        // A wildcard never matches an IP literal. Without this,
+        // `1.2.3.4%x.allowed.com` — or any name crafted to end with the base — can satisfy
+        // a suffix test while the connection is made to the bare address. Suffix matching
+        // on something that is not a domain name is not meaningful.
+        if is_ip_literal(&h) {
+            return false;
+        }
+        // Strict subdomain only: `*.example.com` does not match `example.com` itself.
+        h.len() > self.host.len() + 1
+            && h.ends_with(&self.host)
+            && h.as_bytes()[h.len() - self.host.len() - 1] == b'.'
+    }
+}
+
+/// Is this a bare IP address rather than a hostname?
+///
+/// Deliberately crude and deliberately over-inclusive: it only decides whether wildcard
+/// suffix matching applies, and over-inclusion refuses a match rather than granting one.
+fn is_ip_literal(h: &str) -> bool {
+    h.contains(':') // any IPv6 form, bracketed or not
+        || (h.split('.').count() == 4
+            && h.split('.').all(|o| !o.is_empty() && o.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// The compiled policy: what a caged job may reach.
+#[derive(Debug, Default, Clone)]
+pub struct Allowlist {
+    entries: Vec<Entry>,
+}
+
+impl Allowlist {
+    /// Compile operator-supplied entries. Every rejection carries its reason, because an
+    /// allowlist that silently drops an entry is one an operator believes is in force.
+    pub fn parse(raw: &[String]) -> Result<Allowlist, String> {
+        let mut entries = Vec::new();
+        for r in raw {
+            match Entry::parse(r) {
+                Ok(e) => entries.push(e),
+                Err(why) => return Err(format!("network allowlist entry {r:?}: {why}")),
+            }
+        }
+        Ok(Allowlist { entries })
+    }
+
+    /// DEFAULT DENY. An empty allowlist permits nothing — it is not "unset, so allow".
+    /// This is the direction every mistake should fall in: a missing config file, a typo
+    /// in a key name, or a policy that failed to load must leave a job with no egress,
+    /// never with all of it.
+    pub fn permits(&self, host: &str, port: u16) -> bool {
+        if host.is_empty() || !is_valid_request_host(host) {
+            return false;
+        }
+        if SCHEDULER_PORTS.contains(&port) {
+            return false;
+        }
+        self.entries.iter().any(|e| e.matches(host, port))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Does this policy permit the whole internet?
+    ///
+    /// Exposed so the broker can SAY SO on every job. An operator who chose `*` should be
+    /// reminded, and one who did not should find out immediately — an egress policy nobody
+    /// notices is the one that silently outlives the reason for it.
+    pub fn is_open(&self) -> bool {
+        self.entries.iter().any(|e| e.everything && e.port.is_none())
+    }
+}
+
+/// Is the host in a CONNECT request even well-formed?
+///
+/// Checked before matching, not after: a request host carrying `%` (an IPv6 zone id), a
+/// NUL, or whitespace has no business being compared against a pattern at all, and
+/// rejecting it here means no matcher below has to be careful about it.
+fn is_valid_request_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.len() <= 255
+        && !h.contains('%')
+        && h.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_:[]".contains(&b))
+}
+
+/// Read `sandbox.network.allowedDomains` from the settings hierarchy.
+///
+/// Deliberately the SAME three files, in the same order, combined the same additive way as
+/// the filesystem lists — one policy source, one set of rules for operators to learn, and
+/// the pairing test in `settings` keeps every one of them write-denied so the agent cannot
+/// edit its own egress.
+///
+/// A consequence worth knowing rather than discovering: because the combination is
+/// additive, a PROJECT file can widen the allowlist and not only narrow it. That is
+/// consistent with `allowRead`/`allowWrite`, and safe by the same argument, but it does
+/// mean egress policy travels with a copied project directory.
+///
+/// Unreadable or invalid files are skipped, exactly like the filesystem side — and
+/// skipping is fail-SAFE here because the result of reading nothing is an empty
+/// allowlist, which permits nothing.
+#[derive(serde::Deserialize, Default)]
+struct NetSettings {
+    #[serde(default)]
+    sandbox: NetSandbox,
+}
+#[derive(serde::Deserialize, Default)]
+struct NetSandbox {
+    #[serde(default)]
+    network: NetSection,
+}
+#[derive(serde::Deserialize, Default)]
+struct NetSection {
+    #[serde(default, rename = "allowedDomains")]
+    allowed_domains: Vec<String>,
+}
+
+impl Allowlist {
+    /// Parse one settings file's worth of entries (used per file by `resolve`).
+    pub fn from_settings_json(json: &str) -> Vec<String> {
+        let s: NetSettings = serde_json::from_str(json).unwrap_or_default();
+        s.sandbox.network.allowed_domains
+    }
+
+    /// Resolve the hierarchy into a compiled allowlist.
+    ///
+    /// Returns the raw strings too, so the caller can report what it loaded: an operator
+    /// needs to be able to see the policy that is actually in force, and a network
+    /// boundary nobody can inspect is one nobody can trust.
+    pub fn resolve(
+        home: &std::path::Path,
+        project_dir: &std::path::Path,
+    ) -> Result<(Allowlist, Vec<String>), String> {
+        let mut raw: Vec<String> = Vec::new();
+        for (from_home, rel) in crate::settings::SETTINGS_SOURCES {
+            let f = if from_home { home.join(rel) } else { project_dir.join(rel) };
+            // THE SAME READER the filesystem policy uses, not a second copy of the condition.
+            // This was a bare `read_to_string` on the same three files, two of which the
+            // confined agent can create — so `husk-proxy`, which is the ONLY reader of these
+            // paths on the compute node, blocked forever on a FIFO and printed nothing at all
+            // (`RE-1`). Bounding one reader and not its twin is how a fix lands one level off
+            // from the class it names.
+            match crate::settings::settings_layer(&f) {
+                crate::settings::Layer::Absent => {}
+                // The filesystem reader announces this one at startup on the same file, so
+                // saying it twice would be noise. Losing allowlist entries moves the boundary
+                // tighter, so the disposition is safe on its own terms.
+                crate::settings::Layer::Unreadable(_) => {}
+                // Refuse, do not skip. Losing an allowlist entry moves the boundary TIGHTER —
+                // an unread allowlist is no egress, which is husk's default — so this cannot
+                // widen anything; the callers all treat the error that way (the proxy exits
+                // and the job runs netless, the submit path attaches a "this job has NO
+                // NETWORK" note). What it must not do is happen in silence (`P7`).
+                crate::settings::Layer::Refused(why) => return Err(why),
+                crate::settings::Layer::Text(text) => {
+                    for e in Allowlist::from_settings_json(&text) {
+                        if !raw.contains(&e) {
+                            raw.push(e);
+                        }
+                    }
+                }
+            }
+        }
+        Ok((Allowlist::parse(&raw)?, raw))
+    }
+
+    /// Do the two cages read this config DIFFERENTLY? Returns true when the login cage is
+    /// effectively open while the compute cage still enforces the list.
+    ///
+    /// ONE FILE, TWO DIALECTS. The vendor runtime treats an unlisted host as a question,
+    /// and in auto mode the answer is yes — so `strictAllowlist: true` is what makes
+    /// `allowedDomains` enforcement there, and DELETING it opens login egress. husk's own
+    /// proxy has no question to ask: `permits()` is default-deny, so the same edit leaves
+    /// compute enforcing the list unchanged.
+    ///
+    /// That is exactly what happened on Santis: the key was removed to let an agent reach
+    /// anything, the login cage obliged, and jobs kept getting 403s with nothing explaining
+    /// why the two halves disagreed. The intent IS expressible for both — `allowedDomains:
+    /// ["*"]` is the explicit everything entry — husk simply never said so.
+    ///
+    /// husk does NOT resolve this by making a missing key mean "open" on the compute side.
+    /// A key whose ABSENCE opens a boundary is the failure mode this project keeps paying
+    /// for (`P14`: absence must be the safe answer). It says so instead, and names the
+    /// spelling that means what the operator meant.
+    pub fn login_and_compute_disagree(
+        home: &std::path::Path,
+        project_dir: &std::path::Path,
+    ) -> bool {
+        let mut has_domains = false;
+        let mut strict = false;
+        for (from_home, rel) in crate::settings::SETTINGS_SOURCES {
+            let f = if from_home { home.join(rel) } else { project_dir.join(rel) };
+            // Bounded, for the same reason as `resolve` above — and this one mattered twice
+            // over, because it parses the layer into a `serde_json::Value`, which is far more
+            // expensive per byte than the typed parse. Skipping rather than refusing is the
+            // right disposition HERE and only here: the answer is a bool that decides whether
+            // to print a warning, so a skipped layer costs a warning at worst. It is also
+            // unreachable in production — `resolve` runs first at both call sites and has
+            // already refused — and is written out anyway rather than left to that ordering.
+            let crate::settings::Layer::Text(text) = crate::settings::settings_layer(&f) else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            let net = &v["sandbox"]["network"];
+            if net["allowedDomains"].as_array().is_some_and(|a| !a.is_empty()) {
+                has_domains = true;
+            }
+            if net["strictAllowlist"].as_bool() == Some(true) {
+                strict = true;
+            }
+        }
+        has_domains && !strict
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // ---- the two cages reading one config differently (Santis, 2026-08-28) --------------
+
+    fn cfg(dir: &std::path::Path, body: &str) {
+        std::fs::create_dir_all(dir.join(".claude")).unwrap();
+        std::fs::write(dir.join(".claude/settings.json"), body).unwrap();
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("husk-diverge-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn deleting_strict_allowlist_makes_the_two_cages_disagree() {
+        // THE REAL INCIDENT. strictAllowlist was removed to let an agent reach anything.
+        // Login obliged (unlisted -> ask -> auto-approve); compute kept enforcing the list,
+        // so jobs 403'd on hosts the session shell could reach, and neither half said why.
+        let d = scratch("nostrict");
+        cfg(&d, r#"{"sandbox":{"network":{"allowedDomains":["example.com:443"]}}}"#);
+        assert!(
+            super::Allowlist::login_and_compute_disagree(&d, &d),
+            "allowedDomains without strictAllowlist: login is open, compute is not — husk must \
+             say so, because the operator can see it from neither side"
+        );
+    }
+
+    #[test]
+    fn a_strict_config_and_an_openly_open_one_do_not_disagree() {
+        let d = scratch("strict");
+        cfg(&d, r#"{"sandbox":{"network":{"allowedDomains":["example.com:443"],
+                                          "strictAllowlist":true}}}"#);
+        assert!(!super::Allowlist::login_and_compute_disagree(&d, &d), "both cages enforce");
+
+        // `*` is the spelling that means "open" to BOTH, and it is explicit — which is the
+        // remedy the note points at. It must not itself be reported as a disagreement.
+        let d2 = scratch("star");
+        cfg(&d2, r#"{"sandbox":{"network":{"allowedDomains":["*"],"strictAllowlist":true}}}"#);
+        assert!(!super::Allowlist::login_and_compute_disagree(&d2, &d2), "explicitly open");
+    }
+
+    #[test]
+    fn no_allowlist_at_all_is_not_a_disagreement() {
+        // No egress configured: neither cage grants any, so there is nothing to warn about.
+        // A note here would fire on every job husk runs without networking, which is most.
+        let d = scratch("none");
+        cfg(&d, r#"{"sandbox":{"filesystem":{"denyRead":["/users"]}}}"#);
+        assert!(!super::Allowlist::login_and_compute_disagree(&d, &d));
+    }
+
+    /// `RE-1`, on the reader nobody was looking at.
+    ///
+    /// `husk-proxy` is the ONLY reader of these three files on the compute node: it resolves
+    /// the allowlist and then asks whether the two cages disagree, both from the job's own
+    /// workdir. Both were bare `read_to_string`. Measured at `608618e` with a FIFO at
+    /// `<workdir>/.claude/settings.local.json`, the proxy printed **nothing at all** and had
+    /// to be killed — no allowlist, no warning, no name of a file.
+    ///
+    /// **FALSE FRIENDS:** every other test in this module writes a real JSON file, so all of
+    /// them are green against a reader that blocks. `deleting_strict_allowlist_makes_the_two_cages_disagree`
+    /// even exercises the second reader, on the same path, and cannot see this.
+    ///
+    /// **MUTATION that turns this red:** put `std::fs::read_to_string(&f)` back in either
+    /// loop. The FIFO half then hangs and this FAILS at five seconds.
+    #[test]
+    fn a_settings_layer_that_cannot_be_read_stops_the_allowlist_rather_than_the_proxy() {
+        let d = scratch("fifo");
+        std::fs::create_dir_all(d.join(".claude")).unwrap();
+        let layer = d.join(".claude/settings.local.json");
+
+        // TOO LARGE first: it fails fast either way, so it carries the message assertions.
+        cfg(&d, r#"{"sandbox":{"network":{"allowedDomains":["example.com:443"]}}}"#);
+        std::fs::write(&layer, vec![b'x'; (husk_slurm_broker::MAX_SETTINGS_BYTES + 1) as usize])
+            .unwrap();
+        let e = super::Allowlist::resolve(&d, &d).expect_err("an oversized layer must be refused");
+        assert!(e.contains("settings.local.json"), "name the file (`P11`): {e}");
+        assert!(e.contains("husk reads at most"), "and say it is a bound: {e}");
+        std::fs::remove_file(&layer).unwrap();
+
+        let made = std::process::Command::new("mkfifo")
+            .arg(&layer)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probe = d.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                super::Allowlist::resolve(&probe, &probe).map(|(_, raw)| raw),
+                super::Allowlist::login_and_compute_disagree(&probe, &probe),
+            ));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok((r, _disagree)) => {
+                let e = r.expect_err("a FIFO must not read as an allowlist layer");
+                assert!(e.contains("settings.local.json"), "name the file: {e}");
+                assert!(e.contains("not a regular file"), "say what it is: {e}");
+            }
+            Err(_) => panic!(
+                "the network allowlist blocked for 5s on a FIFO. On the compute node this runs \
+                 inside `husk-proxy`, which is what a job's egress goes through — before this \
+                 bound it produced no output at all and never exited (`RE-1`)."
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    use super::*;
+
+    fn list(entries: &[&str]) -> Allowlist {
+        Allowlist::parse(&entries.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    #[test]
+    fn an_empty_allowlist_permits_nothing() {
+        // DEFAULT DENY. The direction every failure must fall in: no config, a typo in a
+        // key, a policy that failed to load - all leave a job with no egress.
+        let a = Allowlist::default();
+        assert!(!a.permits("api.anthropic.com", 443));
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn exact_and_wildcard_hosts_match_as_written() {
+        let a = list(&["api.inference.cscs.ch", "*.example.com"]);
+        assert!(a.permits("api.inference.cscs.ch", 443));
+        assert!(a.permits("API.INFERENCE.CSCS.CH", 443), "host matching is case-insensitive");
+        assert!(!a.permits("evil.api.inference.cscs.ch", 443), "exact means exact");
+        assert!(a.permits("a.example.com", 443));
+        assert!(a.permits("deep.nested.example.com", 443));
+        assert!(!a.permits("example.com", 443), "*.x is a STRICT subdomain match");
+        assert!(!a.permits("notexample.com", 443), "suffix matching must respect the dot");
+        assert!(!a.permits("example.com.evil.net", 443));
+    }
+
+    #[test]
+    fn a_port_suffix_restricts_the_entry_and_its_absence_does_not() {
+        let a = list(&["api.example.com:443", "any.example.com"]);
+        assert!(a.permits("api.example.com", 443));
+        assert!(!a.permits("api.example.com", 8080), "the port suffix is a restriction");
+        assert!(a.permits("any.example.com", 8080), "no suffix means any port");
+    }
+
+    #[test]
+    fn a_smuggled_port_suffix_does_not_split() {
+        // THE PARSER DIFFERENTIAL. If any trailing `:...` were treated as a port, this
+        // would parse as host `evil.com` and authorise it, while the text an operator
+        // read says `allowed.com`. The suffix must be strictly numeric, so the string
+        // stays whole and then fails host validation on the remaining `:`.
+        assert_eq!(split_port("evil.com:443.allowed.com"), ("evil.com:443.allowed.com", None));
+        assert!(Entry::parse("evil.com:443.allowed.com").is_err());
+        let a = list(&["allowed.com"]);
+        assert!(!a.permits("evil.com", 443));
+    }
+
+    #[test]
+    fn a_wildcard_never_matches_an_ip_literal() {
+        // Otherwise a name crafted to end with the base satisfies the suffix test while
+        // the connection goes to the bare address. Suffix matching a non-name is not
+        // meaningful, so it is refused rather than interpreted.
+        let a = list(&["*.example.com"]);
+        assert!(!a.permits("1.2.3.4", 443));
+        assert!(!a.permits("::ffff:1.2.3.4", 443));
+        assert!(!a.permits("1.2.3.4%eth0.example.com", 443), "zone ids are refused outright");
+    }
+
+    #[test]
+    fn vague_wildcards_are_refused_but_an_explicit_everything_is_not() {
+        // `*.com` matches most of the internet while READING like a control, which is
+        // worse than an honest deny-all - so it stays refused.
+        for bad in ["*.com", "*.", "*.x", "ex*.com", "*example.com"] {
+            assert!(Entry::parse(bad).is_err(), "must refuse {bad:?}");
+        }
+        assert!(Entry::parse("*.example.com").is_ok());
+
+        // `*` is different in kind, not degree: nobody writes it by accident, and a site
+        // that has deliberately chosen open egress should be able to say so. husk
+        // refusing to express a policy an operator chose would only push them to turn
+        // husk off, which is worse for them than an honest `*`.
+        let open = list(&["*"]);
+        assert!(open.permits("anything.example.org", 443));
+        assert!(open.permits("1.2.3.4", 8080));
+        assert!(open.is_open(), "the broker must be able to say that egress is wide open");
+
+        // ...and it is still bounded where it matters. AV8 does not become reachable just
+        // because someone opened the internet: the scheduler ports stay closed, and the
+        // MUNGE mask is untouched either way.
+        for p in [6817, 6818, 6819, 6820] {
+            assert!(!open.permits("slurmctld.example.com", p), "port {p} must stay closed under *");
+        }
+
+        // `*:443` is everything on ONE port - useful, and not the same as wide open.
+        let https_only = list(&["*:443"]);
+        assert!(https_only.permits("anything.example.org", 443));
+        assert!(!https_only.permits("anything.example.org", 22));
+        assert!(!https_only.is_open(), "a port-scoped * is not open egress");
+    }
+
+    #[test]
+    fn an_entry_is_a_host_not_a_url() {
+        for (bad, _) in [
+            ("https://example.com", "scheme"),
+            ("example.com/path", "path"),
+            ("user@example.com", "credentials"),
+        ] {
+            assert!(Entry::parse(bad).is_err(), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_scheduler_cannot_be_allowlisted() {
+        // Opening the network reactivates AV8: a job that reaches slurmctld can submit
+        // work that never passes the broker. This refuses the obvious operator mistake
+        // ("allow the controller so monitoring works") at configuration time with an
+        // explanation, rather than silently reopening the bypass.
+        //
+        // NOT the guarantee - a site can move these ports and an allowed host could
+        // proxy onward. The guarantee is the /run/munge mask: a job cannot authenticate
+        // to the scheduler even if it reaches it.
+        for p in [6817, 6818, 6819, 6820] {
+            assert_eq!(
+                Entry::parse(&format!("slurmctld.example.com:{p}")),
+                Err(EntryError::SchedulerPort(p))
+            );
+            // ...and an entry with no port suffix must not become a way in either.
+            let a = list(&["slurmctld.example.com"]);
+            assert!(!a.permits("slurmctld.example.com", p), "port {p} must stay closed");
+        }
+    }
+
+    #[test]
+    fn a_malformed_request_host_is_refused_before_it_is_matched() {
+        let a = list(&["example.com", "*.example.com"]);
+        for bad in ["", "ex ample.com", "example.com\0", "a%b.example.com"] {
+            assert!(!a.permits(bad, 443), "must refuse request host {bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_allowlist_is_read_from_the_network_section() {
+        let json = r#"{
+            "permissions": { "deny": ["Bash(curl *)"] },
+            "sandbox": {
+              "filesystem": { "allowRead": ["./"] },
+              "network": { "allowedDomains": ["api.inference.cscs.ch:443", "*.example.com"] }
+            }
+        }"#;
+        assert_eq!(
+            Allowlist::from_settings_json(json),
+            vec!["api.inference.cscs.ch:443".to_string(), "*.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn settings_without_a_network_section_yield_no_egress() {
+        // Fail-safe in the direction that matters: a file with no network key, an
+        // unreadable file, or invalid JSON all produce an EMPTY allowlist, and an empty
+        // allowlist permits nothing.
+        for json in [r#"{"sandbox":{"filesystem":{"allowRead":["./"]}}}"#, "{}", "not json"] {
+            assert!(Allowlist::from_settings_json(json).is_empty(), "{json}");
+        }
+        assert!(!Allowlist::parse(&[]).unwrap().permits("example.com", 443));
+    }
+
+    #[test]
+    fn the_shipped_default_allowlist_is_valid_and_says_what_it_means() {
+        // The shipped config is a policy every husk install inherits, so a typo in it is a
+        // policy bug. Compile it here rather than discovering it on a cluster.
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../user-config/settings.json");
+        let Ok(text) = std::fs::read_to_string(&shipped) else { return };
+        let raw = Allowlist::from_settings_json(&text);
+        let a = Allowlist::parse(&raw).expect("the shipped allowlist must compile");
+
+        // One entry: the MeteoSwiss Open Data documentation, over HTTPS.
+        //
+        // Chosen as a DEMONSTRATION, not a grant. It is a dedicated subdomain rather than
+        // the whole corporate site, and no job's work depends on reaching documentation -
+        // so an operator who deletes it breaks nothing, which is the right property for a
+        // default nobody asked for. It also makes a stable live target for the hardware
+        // self-test.
+        assert!(a.permits("opendatadocs.meteoswiss.ch", 443));
+        assert!(!a.is_open(), "the shipped default must NOT be open egress");
+        assert!(
+            !a.permits("opendatadocs.meteoswiss.ch", 80),
+            "the entry is pinned to HTTPS, and husk only tunnels CONNECT anyway"
+        );
+        assert!(
+            !a.permits("www.meteoswiss.admin.ch", 443),
+            "one subdomain, not the whole site"
+        );
+        assert!(!a.permits("example.com", 443));
+
+        // ...and the scheduler stays unreachable regardless of what the file says.
+        for p in [6817, 6818, 6819, 6820] {
+            assert!(!a.permits("opendatadocs.meteoswiss.ch", p));
+        }
+    }
+
+    #[test]
+    fn a_bad_entry_names_itself_and_its_reason() {
+        // An allowlist that silently drops an entry is one the operator believes is in
+        // force. Compilation fails loudly instead, naming the entry.
+        let err = Allowlist::parse(&["ok.example.com".into(), "*.com".into()]).unwrap_err();
+        assert!(err.contains("*.com"), "must name the offending entry: {err}");
+        assert!(err.contains("two labels"), "must explain: {err}");
+    }
+}

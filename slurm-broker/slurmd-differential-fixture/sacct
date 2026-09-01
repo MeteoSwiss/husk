@@ -1,0 +1,3 @@
+#!/bin/sh
+# FIXTURE. Every job the fake sbatch accepted ran to completion synchronously.
+echo "COMPLETED"

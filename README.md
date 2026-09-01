@@ -1,68 +1,79 @@
-# husk — Claude Code on HPC supercomputers
+# husk — sandboxing AI coding agents on HPC supercomputers
 
-Claude Code is an AI coding assistant that runs in your terminal. On a shared
-supercomputer login node it needs some extra care: the agent runs as your user
-account, so without restrictions it could read your SSH keys, reach internal
-cluster services, or submit SLURM jobs without asking. This repository provides
-**husk**, the tooling to run Claude safely in that environment.
+**husk confines an AI coding agent on a shared supercomputer, from the outside.** The agent
+runs inside a cage it cannot inspect, disable or negotiate with; every SLURM command it
+issues is validated by a trusted broker running beyond its reach; and its cooperation is
+never required for any of it.
+
+That is worth doing because the agent runs as *you*. On a login node an unconfined assistant
+holds your SSH keys and credentials, your compute allocation, the other home directories on
+the shared filesystem, and the cluster's internal services — not because it is malicious, but
+because it inherited your account. husk makes those unreachable rather than discouraged, and
+tells the agent what it just refused so it stops guessing and works around the boundary.
+
+It wraps **Claude Code** today; the confinement contract itself is agent-agnostic by design
+(`doc/sandbox-interface.md`).
 
 Developed and tested on CSCS supercomputers (Balfrin, Santis).
 
-## Install from a release (recommended)
-
-Install on the cluster from a **published release tarball** — not by cloning and
-building. A release carries the prebuilt, architecture-correct `seccomp-wrapper`
-binaries, so nothing is compiled on Balfrin or Santis. (Building from a clone is
-only for development.)
-
-Releases are published at:
-
-> https://github.com/MeteoSwiss/husk/releases
-
-A single tarball works on **both** Balfrin (x86_64) and Santis (aarch64) — it
-ships both binaries and the installer picks the right one for the machine.
-
-1. **Download** the latest release tarball and its checksum file (on any machine
-   with a browser or network — e.g. your laptop):
-   - `husk-<version>.tar.gz`
-   - `husk-<version>.SHA256SUMS`
-
-2. **Upload** both to the cluster with `scp` (Balfrin shown; repeat for Santis,
-   or copy once if your `$HOME` is shared between them):
-
-   ```bash
-   scp husk-<version>.tar.gz husk-<version>.SHA256SUMS balfrin:~/
-   ```
-
-   > If the login node itself has outbound HTTPS, you can skip the laptop and
-   > `wget` the two files directly from the releases page instead.
-
-3. **Verify and unpack** on the cluster:
-
-   ```bash
-   sha256sum -c husk-<version>.SHA256SUMS   # must print: OK
-   tar xzf husk-<version>.tar.gz
-   cd husk-<version>
-   ```
-
-4. **Install** — continue with [Getting started](#getting-started) below, running
-   `./install-husk.sh` from the unpacked release directory.
-
 ## Getting started
 
-> **Prerequisite:** Claude Code must already be installed and authenticated.
-> `husk` wraps your existing `claude` CLI — it does not install Claude
-> for you. See [Requirements](#requirements).
+On a Balfrin or Santis login node. Nothing is compiled, nothing needs root.
 
-Run the install script once from the unpacked release directory (or a
-development clone):
+**1. Claude Code, if you don't have it.** To check `command -v claude`.
 
 ```bash
-./install-husk.sh
+curl -fsSL https://claude.ai/install.sh | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+claude          # log in once, then exit
 ```
 
-> The script will show you exactly what it will add to `~/.claude/settings.json`
-> and ask for confirmation before making any changes.
+**2. Install husk.** One tarball works on both machines — it ships binaries for each and the
+installer picks the right ones.
+
+```bash
+curl -fLO https://github.com/MeteoSwiss/husk/releases/download/v0.5/husk-v0.5.tar.gz
+tar xzf husk-v0.5.tar.gz && cd husk-v0.5
+./install-husk.sh --slurm-partition <partition> --slurm-account <project>
+```
+
+The installer prints exactly what it will add to `~/.claude/settings.json` and asks before
+changing anything. The two flags are recorded in `~/.husk/config.json` on a first install —
+see [below](#slurm-record-the-partition-per-machine) if you need to change them later.
+
+**3. Use it.** Run `husk` where you would have run `claude`:
+
+```bash
+cd ~/my-project
+husk         # husk --resume also works
+```
+
+Repeat step 2 on each machine whose `$HOME` is not shared. Releases are listed at
+https://github.com/MeteoSwiss/husk/releases — verify the tarball with the published
+`SHA256SUMS` if you want to.
+
+<details>
+<summary>Installing somewhere other than Balfrin or Santis, or building from source</summary>
+
+husk needs `bubblewrap` (`bwrap`) system-wide, `wget`/`python3`/`tar`/`sha256sum` on `PATH`,
+and outbound HTTPS once to fetch Anthropic's `apply-seccomp`. It also needs `socat`; if that
+is missing the installer builds it, which then needs `gcc` and `make`. All of this is already
+in place on CSCS machines.
+
+Building from source is for developing husk, not for using it. It needs a Rust toolchain and
+must be done separately on each architecture — there is no cross-compilation:
+
+```bash
+git clone https://github.com/MeteoSwiss/husk && cd husk
+(cd seccomp-wrapper && ./build_and_test.sh)   # -> seccomp-wrapper-$(uname -m)
+(cd slurm-broker    && ./build-release.sh)    # -> husk-slurm-{broker,wrapper}-$(uname -m)
+./install-husk.sh --slurm-partition <partition> --slurm-account <project>
+```
+
+`make` alone is not a substitute for `build_and_test.sh`: it writes `seccomp-wrapper`, and the
+installer only ever reads `seccomp-wrapper-<arch>`.
+
+</details>
 
 ### SLURM: record the partition (per machine)
 
@@ -72,28 +83,44 @@ installing bare on a site without that partition leaves the broker forcing one
 that does not exist — submissions then fail at the scheduler with
 `invalid partition specified`.
 
-**Balfrin** — use `preemptible`. It is also the built-in default, so a bare
-install works here:
-
 ```bash
-./install-husk.sh --slurm-partition preemptible
+./install-husk.sh
 ```
 
-**Santis** — has **no** `preemptible` partition, so it must be set explicitly.
-`debug` and `shared` both work (`debug` for short test jobs, `shared` when nodes
-are free):
+The partition and account live in **`~/.husk/config.json`**, which is the interface:
+edit the file, no reinstall. The installer only ever *seeds* it on a first install
+and never clobbers an existing one — accounts and partitions change far more often
+than the installation does.
 
-```bash
-./install-husk.sh --slurm-partition debug
+```json
+{ "partitions": ["preemptible"], "accounts": ["<your project>"] }
 ```
 
-On any other site, list what exists with `sinfo -s` and pick accordingly.
+**Balfrin** — `preemptible` (also the built-in default). **Santis** — has **no**
+`preemptible` partition; use `debug` (short test jobs) or `shared` (when nodes are
+free). On any other site, list what exists with `sinfo -s` and pick accordingly. A
+per-system override is `~/.husk/config.<system>.json`, which wins outright — `$HOME`
+is shared between some machines and their partitions differ.
 
 Prefer a low-priority or preemptible queue where the site has one, so an
 unattended agent's jobs can be killed and do not consume your allocation's
 priority. The partition is **not** auto-detected: which queue an unattended
 agent submits to is an operator decision, not something to infer from cluster
-state. To change it later, re-run the installer with the new value.
+state.
+
+**To change it later, edit `~/.husk/config.json`.** Re-running the installer with a
+new value does *not* change it: a config file that names partitions wins over the
+install-time flags by design, and the installer never clobbers one that exists. It says
+so when you try — *"…but you passed `--slurm-account`/`--slurm-partition`, and the config
+file OVERRIDES them"* — and then prints what is in effect. A flag that does nothing must
+not do it quietly.
+
+> **One edge, worth knowing because the warning is wrong there.** The config wins only
+> where its list is **non-empty**. On a config that reads `{"partitions": [], "accounts":
+> []}` the broker falls back to `HUSK_SLURM_PARTITION`, which the installer *does*
+> rewrite on every run — so `--slurm-partition` takes effect while the installer is still
+> printing that the file overrides it. Put the value in the file and the ambiguity goes
+> away.
 
 If `~/.local/bin` is not yet on your PATH, add this to `~/.bashrc` or
 `~/.bash_profile`:
@@ -123,7 +150,7 @@ template into your project and commit it:
 
 ```bash
 mkdir -p .claude
-cp /path/to/agentskills-internal/project-config/settings.json .claude/settings.json
+cp <unpacked-release>/project-config/settings.json .claude/settings.json
 ```
 
 See [Per-project setup](#per-project-setup) for details.
@@ -161,7 +188,7 @@ restrictions, copy the template into your project:
 
 ```bash
 mkdir -p .claude
-cp /path/to/agentskills-internal/project-config/settings.json .claude/settings.json
+cp <unpacked-release>/project-config/settings.json .claude/settings.json
 ```
 
 Commit `.claude/settings.json` so the restrictions apply to everyone on the
@@ -194,15 +221,17 @@ Settings are split into two files:
 
 ## Requirements
 
-- **Claude Code itself** — the `claude` CLI, installed and authenticated.
-  `husk` wraps your existing Claude Code install; it does not install or
-  update Claude for you. Install it (e.g. `npm install -g
-  @anthropic-ai/claude-code`, or the native installer) and sign in first; see
-  the [Claude Code docs](https://code.claude.com/docs).
-- x86\_64 or aarch64 Linux, kernel ≥ 4.14
-- bubblewrap installed system-wide (present on all CSCS supercomputers; check
-  with your administrators on other HPC systems)
-- `gcc`, `make`, `wget`, `python3` (standard on HPC login nodes)
+All of these are already in place on Balfrin and Santis — this list is for other systems.
+
+- **The `claude` CLI**, installed and authenticated. husk wraps it; it does not install or
+  update it. See [Getting started](#getting-started) for the one-liner, or the
+  [Claude Code docs](https://code.claude.com/docs).
+- x86\_64 or aarch64 Linux, kernel ≥ 4.14.
+- **bubblewrap** (`bwrap`) installed system-wide. husk cannot sandbox without it.
+- `wget`, `python3`, `tar`, `sha256sum` on `PATH`, and outbound HTTPS once, to fetch
+  Anthropic's `apply-seccomp`.
+- **`socat`.** If it is missing the installer builds it from source, which then needs `gcc`
+  and `make`. Check with `command -v socat`.
 
 ## Running SLURM jobs (the broker)
 
@@ -236,8 +265,8 @@ talk to.
 ### What the agent can do
 
 - **Submit batch jobs** — `sbatch --partition=<site> job.sh`. The partition **must**
-  be the site's configured one — `preemptible` by default, set per machine at install
-  with `--slurm-partition` (Balfrin uses `preemptible`; Santis has no such partition,
+  be the site's configured one — `preemptible` by default, set per machine in
+  `~/.husk/config.json` (Balfrin uses `preemptible`; Santis has no such partition,
   so e.g. `debug`). Any other is rejected with a message telling the agent how to
   resubmit (so design jobs to checkpoint and tolerate preemption). Risky options
   (`--output`/`--error`/`--chdir`/`--export`/`--wrap`) are forced to safe values, and
@@ -255,26 +284,45 @@ belt-and-suspenders, still keep the job script and its imports read-only to the
 agent (an absolute path outside the project) and pass the agent's choices as
 **validated data**, not as a code path.
 
-> **Scope in this release:** single node, no MPI. Multi-process / multi-node MPI
-> (`srun`), a network allowlist for compute jobs (they currently run with the
-> network unshared), interactive `srun`/`salloc`, and read-only
-> `scontrol show`/`sacctmgr list` are on the roadmap — see
-> [`ROADMAP.md`](ROADMAP.md) and [`slurm-broker/BROKER.md`](slurm-broker/BROKER.md).
+> **Scope in this release (v0.5):** single-node batch jobs, brokered `srun`, and
+> **single-node multi-rank MPI including GPU jobs** — ICON runs on Balfrin across 4 GPUs
+> inside the cage with CMA enabled, and a production KENDA assimilation experiment has run
+> green through husk. Compute jobs get an allowlisted, `CONNECT`-only egress proxy where an
+> allowlist is configured, instead of no network at all.
+>
+> **Not in v0.5:** multi-*node* MPI, which husk **refuses** — `--nodes` other than 1 is
+> rejected with a message saying so, rather than silently downgraded to one node. Shipping it
+> as a named weaker profile is a decision on the roadmap, not code that exists (see
+> [`ROADMAP.md`](ROADMAP.md) Track D). Also not in v0.5: interactive `srun`/`salloc`; and
+> read-only `scontrol show`/`sacctmgr list`. See [`ROADMAP.md`](ROADMAP.md) and
+> [`slurm-broker/BROKER.md`](slurm-broker/BROKER.md).
 
 ## Known limitations
 
-- **Network access:** Full network isolation (restricting Claude to only reach
-  Anthropic's servers) is not yet implemented. `curl`, `wget`, `ssh`, and
-  friends are blocked in the project config template as a compensating control.
+- **Network access:** the shipped user settings carry an **enforced** domain allowlist
+  (`strictAllowlist: true`) rather than a prompt hint — but only where that flag is
+  actually deployed. **Check yours:** without `strictAllowlist`, an allowlist is a prompt
+  hint and unlisted hosts auto-approve in auto mode, and at least one CSCS machine has
+  been found running exactly that (measured during the v0.5 review). Brokered
+  compute jobs reach the network only through husk's own `CONNECT`-only proxy, and get no
+  network at all where no allowlist is configured.
+  **The shipped `sandbox.network.allowedDomains` holds one entry,
+  `opendatadocs.meteoswiss.ch:443` — that is an example, not a recommendation.** Replace it
+  with the hosts your work needs; an empty list means no network at all. Entries are `host`,
+  `host:port` or `*.two.labels`, and SLURM's own ports are always refused.
+  What is *not* implemented is confining
+  the agent to Anthropic's servers specifically. `curl`, `wget`, `ssh` and friends stay
+  blocked in the project config template as a second, independent control.
 - **SSH to compute nodes:** Blocked by default. Remove `Bash(ssh *)` from your
   project's deny list if you regularly need Claude to assist on compute nodes.
-- **SLURM:** on a cluster `husk` auto-brokers; the broker
-  supports **single-node batch jobs** (`sbatch`, re-sandboxed on the compute
-  node) and **read-only queries** (`squeue`/`sinfo`/`sacct`/…) — see
-  [Running SLURM jobs (the broker)](#running-slurm-jobs-the-broker). Not yet:
-  multi-process / multi-node **MPI** (`srun`), a **network allowlist** for
-  compute jobs (they run with the network unshared), interactive `srun`/`salloc`,
-  and read-only `scontrol show`/`sacctmgr list` (see [`ROADMAP.md`](ROADMAP.md)).
+- **SLURM:** on a cluster `husk` auto-brokers. v0.5 supports **single-node batch jobs**
+  (`sbatch`, re-sandboxed on the compute node), **brokered `srun` with single-node
+  multi-rank MPI and GPUs**, the **compute-job network allowlist**, and **read-only
+  queries** (`squeue`/`sinfo`/`sacct`/…) — see
+  [Running SLURM jobs (the broker)](#running-slurm-jobs-the-broker). All of it has run on
+  both CSCS machines. Not yet: multi-**node** MPI,
+  interactive `srun`/`salloc`, and read-only `scontrol show`/`sacctmgr list` (see
+  [`ROADMAP.md`](ROADMAP.md)).
   The compute-node cage is a *subset* of the login cage — notably its credential
   auto-scan uses a built-in pattern set rather than your `Read()` deny globs.
 - **Large projects on Lustre:** on very large trees (many build directories) on

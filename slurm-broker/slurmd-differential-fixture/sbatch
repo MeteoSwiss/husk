@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# A FAKE sbatch. It is not SLURM and it must never be mistaken for it.
+#
+# WHAT IT IS FOR. `slurmd-differential.sh` can only be exercised on a cluster, and nobody
+# who writes it has one. So this stands in for slurmd well enough to run the harness end to
+# end offline: it accepts the options the harness passes, renders `%` specifiers, creates
+# the files, runs the body with the environment slurmd would set, and hands back a job id.
+# That proves the PLUMBING — the corpus generation, the argv recording, the per-case
+# directory scan, the artefact schema, and the grader that reads it.
+#
+# WHAT IT IS NOT. It is not evidence about any cluster. Its substitution model is a copy of
+# what the operator measured by hand on Santis 2026-08-31 (`RA §6`, `§7`, `§8`); it agrees
+# with those three measurements BY CONSTRUCTION, so a green run here says the harness works
+# and says nothing whatever about slurmd. `--version` says so in as many words, the harness
+# copies that string into the artefact's `META sbatch_version`, and the grader prints a
+# FIXTURE banner and refuses to call any of it a measurement.
+#
+# HUSKDIFF_FIXTURE_MODEL selects which world to simulate:
+#   measured  (default) what the operator actually saw: %A -> the job id, %a -> 4294967294
+#   husk                a counterfactual world where slurmd does what husk's table says:
+#                       %A and %a render EMPTY on a non-array job
+#   stepid              the measured world plus ONE open question resolved the other way:
+#                       %s renders as `0` while SLURM_STEP_ID stays unset. Not invented —
+#                       `the_specifier_table_agrees_with_the_recorded_measurements` records
+#                       %s's pairing as "whether SLURM_STEP_ID is itself set there is
+#                       UNMEASURED", and this is what husk's `:-batch` default being wrong
+#                       would look like. It is the row the real cluster run exists to settle
+# The offline test runs both, because a grader that can only report a divergence is not
+# obviously distinguishable from one that reports a divergence unconditionally (`B8`).
+set -uo pipefail
+
+STATE="${HUSKDIFF_FIXTURE_STATE:-$HOME/.husk-differential-fixture}"
+MODEL="${HUSKDIFF_FIXTURE_MODEL:-measured}"
+NODENAME="${HUSKDIFF_FIXTURE_NODE:-nid00fake}"
+
+case "${1:-}" in
+  --version) echo "husk-differential fake-sbatch (FIXTURE - NOT SLURM) model=$MODEL"; exit 0 ;;
+esac
+
+ACCOUNT=""; PARTITION=""; OUTPAT=""; ERRPAT=""; ARRAY=""; JOBNAME=""; CHDIR=""; WRAP=""
+SCRIPT=""
+for a in "$@"; do
+  case "$a" in
+    --account=*)   ACCOUNT="${a#*=}" ;;
+    --partition=*) PARTITION="${a#*=}" ;;
+    --output=*)    OUTPAT="${a#*=}" ;;
+    -o=*)          OUTPAT="${a#*=}" ;;
+    --error=*)     ERRPAT="${a#*=}" ;;
+    --array=*)     ARRAY="${a#*=}" ;;
+    --job-name=*)  JOBNAME="${a#*=}" ;;
+    --chdir=*)     CHDIR="${a#*=}" ;;
+    --wrap=*)      WRAP="${a#*=}" ;;
+    --time=*|--nodes=*|--ntasks=*|--parsable|--hold) : ;;
+    -*)
+      # A real getopt binary complains about an option nobody has, and the harness's
+      # canary depends on exactly this line. Anything that does not print it is not an
+      # option parser, which is the whole point of the check.
+      echo "sbatch: unrecognized option '$a'" >&2
+      exit 1 ;;
+    *) SCRIPT="$a" ;;
+  esac
+done
+
+[ -n "$ACCOUNT" ]   || { echo "sbatch: error: Invalid account or account/partition combination specified" >&2; exit 1; }
+[ -n "$PARTITION" ] || { echo "sbatch: error: invalid partition specified" >&2; exit 1; }
+
+# `#SBATCH` directives from the script header. CLI wins, as in real sbatch.
+if [ -n "$SCRIPT" ]; then
+  [ -r "$SCRIPT" ] || { echo "sbatch: error: Unable to open file $SCRIPT" >&2; exit 1; }
+  while IFS= read -r line; do
+    case "$line" in
+      '#SBATCH '*)
+        opt="${line#\#SBATCH }"
+        case "$opt" in
+          --output=*) [ -z "$OUTPAT" ] && OUTPAT="${opt#*=}" ;;
+          --error=*)  [ -z "$ERRPAT" ] && ERRPAT="${opt#*=}" ;;
+          --job-name=*) [ -z "$JOBNAME" ] && JOBNAME="${opt#*=}" ;;
+        esac ;;
+      '#'*|'') : ;;
+      *) break ;;
+    esac
+  done < "$SCRIPT"
+fi
+
+if [ -z "$JOBNAME" ]; then
+  if [ -n "$WRAP" ]; then JOBNAME="wrap"; else JOBNAME="$(basename "${SCRIPT:-sbatch}")"; fi
+fi
+
+mkdir -p "$STATE"
+COUNTER="$STATE/counter"
+[ -f "$COUNTER" ] || echo 837600 > "$COUNTER"
+next_id() {
+  local n; n=$(cat "$COUNTER"); n=$((n + 1)); echo "$n" > "$COUNTER"; echo "$n"
+}
+
+# The substitution model. One place, and the only place in this repo outside the round-3
+# record that claims to know what slurmd renders.
+render() {
+  local pat="$1" jobid="$2" arrayjob="$3" arraytask="$4" isarray="$5"
+  local out="" i=0 c n
+  while [ "$i" -lt "${#pat}" ]; do
+    c="${pat:$i:1}"
+    if [ "$c" != '%' ]; then out="$out$c"; i=$((i + 1)); continue; fi
+    n="${pat:$((i + 1)):1}"
+    case "$n" in
+      '')  out="$out%"; i=$((i + 1)) ;;                       # dangling % at end
+      '%') out="$out%"; i=$((i + 2)) ;;                       # the escape
+      j)   out="$out$jobid"; i=$((i + 2)) ;;
+      J)   out="$out$jobid"; i=$((i + 2)) ;;                  # measured: the BARE job id
+      A)   if [ "$isarray" = 1 ]; then out="$out$arrayjob"
+           elif [ "$MODEL" = husk ]; then out="$out"
+           else out="$out$jobid"; fi; i=$((i + 2)) ;;
+      a)   if [ "$isarray" = 1 ]; then out="$out$arraytask"
+           elif [ "$MODEL" = husk ]; then out="$out"
+           else out="${out}4294967294"; fi; i=$((i + 2)) ;;
+      N)   out="$out$NODENAME"; i=$((i + 2)) ;;
+      n)   out="${out}0"; i=$((i + 2)) ;;
+      t)   out="${out}0"; i=$((i + 2)) ;;
+      s)   if [ "$MODEL" = stepid ]; then out="${out}0"; else out="${out}batch"; fi
+           i=$((i + 2)) ;;
+      u)   out="$out${USER:-nobody}"; i=$((i + 2)) ;;
+      x)   out="$out$JOBNAME"; i=$((i + 2)) ;;
+      *)   out="$out%$n"; i=$((i + 2)) ;;                     # unknown: left literal
+    esac
+  done
+  printf '%s' "$out"
+}
+
+run_one() {
+  local jobid="$1" arrayjob="$2" arraytask="$3" isarray="$4"
+  local o e wd
+  wd="${CHDIR:-$PWD}"                       # measured: --chdir is taken LITERALLY
+  mkdir -p "$wd"                            # measured: slurmd creates a missing workdir
+  if [ -n "$OUTPAT" ]; then
+    o="$(render "$OUTPAT" "$jobid" "$arrayjob" "$arraytask" "$isarray")"
+  else
+    o="$wd/slurm-$jobid.out"
+  fi
+  case "$o" in /*) : ;; *) o="$wd/$o" ;; esac
+  if [ -n "$ERRPAT" ]; then
+    e="$(render "$ERRPAT" "$jobid" "$arrayjob" "$arraytask" "$isarray")"
+    case "$e" in /*) : ;; *) e="$wd/$e" ;; esac
+  else
+    e="$o"
+  fi
+  mkdir -p "$(dirname "$o")" "$(dirname "$e")"
+
+  local -a envv
+  envv=( "SLURM_JOB_ID=$jobid" "SLURMD_NODENAME=$NODENAME" "SLURM_NODEID=0"
+         "SLURM_LOCALID=0" "SLURM_JOB_NAME=$JOBNAME" )
+  # SLURM_STEP_ID is deliberately NOT set: `the_specifier_table_agrees_with_the_recorded_
+  # measurements` records "whether SLURM_STEP_ID is itself set on the batch step is
+  # UNMEASURED", so the fixture must not invent an answer. husk's `:-batch` default then
+  # supplies `batch`, which is what slurmd rendered.
+  if [ "$isarray" = 1 ]; then
+    envv+=( "SLURM_ARRAY_JOB_ID=$arrayjob" "SLURM_ARRAY_TASK_ID=$arraytask" )
+  fi
+  if [ -n "$WRAP" ]; then
+    ( cd "$wd" && env "${envv[@]}" sh -c "$WRAP" ) > "$o" 2> "$e"
+  else
+    ( cd "$wd" && env "${envv[@]}" bash "$SCRIPT" ) > "$o" 2> "$e"
+  fi
+}
+
+if [ -n "$ARRAY" ]; then
+  ARRAYJOB="$(next_id)"
+  lo="${ARRAY%%-*}"; hi="${ARRAY##*-}"
+  case "$lo" in ''|*[!0-9]*) lo=0 ;; esac
+  case "$hi" in ''|*[!0-9]*) hi=$lo ;; esac
+  t=$lo
+  while [ "$t" -le "$hi" ]; do
+    run_one "$(next_id)" "$ARRAYJOB" "$t" 1
+    t=$((t + 1))
+  done
+  echo "$ARRAYJOB"
+else
+  JID="$(next_id)"
+  run_one "$JID" "" "" 0
+  echo "$JID"
+fi
