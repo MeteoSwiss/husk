@@ -4204,6 +4204,20 @@ mod tests {
         let decoy = dir.join("seccomp-wrapper");
         std::fs::write(&decoy, SECWRAP_DECOY).unwrap();
         std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The guard arms its srun path whenever a real `srun` is on PATH — true on every
+        // cluster login node, false on a laptop — and then demands the step broker it
+        // started is still alive a second later, refusing the job if it is not (P7; the
+        // check that ended the 2026-08-06 ghost hunt). Left to itself this test arms that
+        // path with THIS BINARY as the broker, which libtest exits on at once, so on a
+        // cluster the honest job died at that check having never reached the fd question
+        // this test exists to ask. Give the guard what `run_guard_prepared` gives it: a
+        // broker that stays up and an `srun` to bind, so the verdict no longer depends on
+        // whether the machine at hand happens to run SLURM.
+        *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(LIVE_BROKER.to_string());
+        let fake_srun = dir.join("srun");
+        std::fs::write(&fake_srun, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&fake_srun, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let root = inside.to_string_lossy().to_string();
         let script = wrap_script(
@@ -4267,6 +4281,9 @@ mod tests {
         assert!(!std::fs::read_to_string(&hijacked).unwrap().contains("MARKER_BODY_RAN"));
 
         let _ = std::fs::remove_file(&stub);
+        // Cleared like `run_guard_prepared` clears its own, so a later test never sees
+        // this one's broker.
+        *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
