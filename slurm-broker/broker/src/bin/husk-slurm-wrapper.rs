@@ -47,8 +47,8 @@ use std::ptr;
 // The one internal, dependency-free shared const (keeps this binary's zero-crate
 // audit surface intact — see the module header).
 use husk_slurm_broker::{
-    read_settings_layer, session_log_path, session_spool_dir, SettingsLayer, BROKERED_MUTATING,
-    BROKER_READY_FD_ENV, MAX_SETTINGS_BYTES, READONLY_SLURM,
+    confiner_dirs, install_prefix, read_settings_layer, session_log_path, session_spool_dir,
+    SettingsLayer, BROKERED_MUTATING, BROKER_READY_FD_ENV, MAX_SETTINGS_BYTES, READONLY_SLURM,
 };
 
 // ---- the only FFI: two namespace syscalls std doesn't expose ----------------
@@ -631,9 +631,94 @@ mod witness {
             ))
         }
     }
+
+    /// Witness: the code that builds the agent's cage is OUTSIDE the directory the agent can
+    /// write. `SettingsIntact` is the cage's config; this is its code — F17 ("the agent must
+    /// not author its cage") one level down, and `husk-verify.sh` §4b's question asked BEFORE
+    /// the launch instead of measured after it.
+    ///
+    /// `allowWrite: []` keeps the home read-only, but the launch directory itself is always
+    /// writable, so `cd ~ && husk` on a default install handed the agent `~/.local/bin`: it
+    /// could replace `husk`, `seccomp-wrapper` or the broker, and the next launch would run its
+    /// bytes as the operator, outside every cage. `install-husk.sh --prefix` makes that easier
+    /// to reach, not new — any ancestor of the prefix does the same.
+    ///
+    /// What this newly refuses, and who can trigger it (`P16`): launching from a directory
+    /// that contains, or is inside, `<prefix>/bin` or `<prefix>/lib/husk` — `$HOME` on a
+    /// default install is the common one. Only the operator chooses the launch directory, the
+    /// message says what to do, and a project directory never trips it. Minted before any
+    /// resource is acquired, like `SettingsIntact`, and demanded by BOTH exec paths, so the
+    /// agent is unreachable without it. A question it cannot answer is a refusal, not a pass.
+    pub(crate) struct ConfinerOutOfReach(());
+
+    impl ConfinerOutOfReach {
+        pub(crate) fn establish() -> io::Result<ConfinerOutOfReach> {
+            let found = std::env::current_exe()
+                .and_then(|exe| std::env::current_dir().map(|cwd| (exe, cwd)))
+                .and_then(|(exe, cwd)| confiner_within_reach(&exe, &cwd));
+            match found {
+                Ok(None) => Ok(ConfinerOutOfReach(())),
+                Ok(Some((root, dir))) => {
+                    eprint!("{}", confiner_message(&root, &dir));
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "husk's own code is inside the directory the agent can write",
+                    ))
+                }
+                // `other`, never `e.kind()`: `main` stays silent on PermissionDenied (it means
+                // "already printed"), and an EACCES from canonicalize would then refuse with
+                // no reason given at all (`P7`).
+                Err(e) => Err(io::Error::other(format!(
+                    "cannot tell whether husk's own code is inside the directory the agent \
+                     would be able to write ({e}), so refusing rather than guessing"
+                ))),
+            }
+        }
+    }
 }
 
-use witness::{BrokerReady, SandboxReady, SettingsIntact};
+use witness::{BrokerReady, ConfinerOutOfReach, SandboxReady, SettingsIntact};
+
+/// Is any of husk's own directories within the agent's reach from this launch?
+///
+/// `Some((write_root, dir))` when a confiner directory (`confiner_dirs`: `<prefix>/bin` and
+/// `<prefix>/lib/husk`) IS the write root, is INSIDE it, or CONTAINS it. The last arm is not
+/// pedantry: `cd ~/.local/bin && husk` makes the confiner's own directory the writable one,
+/// and a test of "is the prefix under the write root" alone answers no. Every side is
+/// canonicalised, so a symlinked project directory or prefix cannot hide the overlap — the
+/// question is about the objects, not their spellings (`P15`). A confiner directory that does
+/// not exist yet is compared as spelled: it would be created where it is spelled.
+///
+/// The write root is the directory husk was launched from — the one Claude Code's sandbox
+/// binds writable — captured here, before the agent exists (invariant 1, `P2`).
+fn confiner_within_reach(exe: &Path, write_root: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {
+    let exe = fs::canonicalize(exe)?;
+    let root = fs::canonicalize(write_root)?;
+    let prefix = install_prefix(&exe).ok_or_else(|| {
+        io::Error::other(format!("cannot derive the install prefix from {}", exe.display()))
+    })?;
+    for dir in confiner_dirs(prefix) {
+        let dir = fs::canonicalize(&dir).unwrap_or(dir);
+        if dir.starts_with(&root) || root.starts_with(&dir) {
+            return Ok(Some((root, dir)));
+        }
+    }
+    Ok(None)
+}
+
+/// The refusal, in one place, naming both objects and the one thing to do (`P11`, `P13`).
+fn confiner_message(root: &Path, dir: &Path) -> String {
+    format!(
+        "husk: refusing to launch from {root}\n\
+         husk:   That is the directory the agent can WRITE, and husk's own code is there:\n\
+         husk:     {dir}\n\
+         husk:   An agent that can write there can rewrite husk itself, and the next launch\n\
+         husk:   would run its code as you, outside every sandbox.\n\
+         husk:   Launch husk from a project directory instead:  cd <your project> && husk\n",
+        root = root.display(),
+        dir = dir.display()
+    )
+}
 
 /// The broker's own words, for relaying to the terminal.
 ///
@@ -788,6 +873,7 @@ fn exec_agent(
     _ready: SandboxReady,
     _broker: BrokerReady,
     _intact: SettingsIntact,
+    _out_of_reach: ConfinerOutOfReach,
     agent: &[String],
     spool: &Path,
 ) -> io::Result<Infallible> {
@@ -808,7 +894,11 @@ fn exec_agent(
 /// `HUSK_SLURM_SPOOL` — zero trace of any SLURM interaction. The agent runs in
 /// the normal sandbox, and with no broker there is no sanctioned bridge to a
 /// scheduler, so it cannot submit jobs even if an `sbatch` is hidden here.
-fn exec_plain(_intact: SettingsIntact, agent: &[String]) -> io::Result<Infallible> {
+fn exec_plain(
+    _intact: SettingsIntact,
+    _out_of_reach: ConfinerOutOfReach,
+    agent: &[String],
+) -> io::Result<Infallible> {
     let mut cmd = Command::new(&agent[0]);
     cmd.args(&agent[1..]);
     let err = cmd.exec();
@@ -1237,13 +1327,14 @@ fn run() -> io::Result<Infallible> {
     let cfg = Config::parse()?;
     // Before the spool, the broker and the namespaces: a refusal has nothing to unwind.
     let intact = SettingsIntact::establish()?;
+    let out_of_reach = ConfinerOutOfReach::establish()?;
     match plan(&cfg)? {
         Plan::Plain => {
             eprintln!(
                 "husk-slurm-wrapper: no SLURM (sbatch) on PATH — launching \
                  husk without job brokering."
             );
-            exec_plain(intact, &cfg.agent)
+            exec_plain(intact, out_of_reach, &cfg.agent)
         }
         Plan::Broker { stub, broker, sbatch } => {
             // Validate the pieces exist + are executable before touching namespaces.
@@ -1309,7 +1400,7 @@ fn run() -> io::Result<Infallible> {
                 session_log.display(),
                 cfg.agent.join(" ")
             );
-            exec_agent(ready, serving, intact, &cfg.agent, &cfg.spool)
+            exec_agent(ready, serving, intact, out_of_reach, &cfg.agent, &cfg.spool)
         }
     }
 }
@@ -1594,6 +1685,80 @@ mod tests {
     }
 
     /// A scratch HOME + cwd pair; both are real directories so the reads are real.
+    /// `Q9`. A launch directory from which the agent could write husk's own code is refused,
+    /// from every direction an overlap can come; a project directory never is. Pinned at the
+    /// decision (`confiner_within_reach`), with real directories and real symlinks, because
+    /// the defect was a property of paths on disk, not of strings.
+    #[test]
+    fn a_launch_directory_that_reaches_husks_own_code_is_refused() {
+        use std::path::Path;
+        let base = std::env::temp_dir().join(format!("husk-reach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let prefix = home.join(".local");
+        for d in ["bin", "lib/husk", "share/proj"] {
+            std::fs::create_dir_all(prefix.join(d)).unwrap();
+        }
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let exe = prefix.join("bin/husk-slurm-wrapper");
+        std::fs::write(&exe, "").unwrap();
+        let canon = |p: &Path| std::fs::canonicalize(p).unwrap();
+        let reach = |exe: &Path, root: &Path| super::confiner_within_reach(exe, root).unwrap();
+
+        // Refused: the home (`cd ~ && husk` on a default install), every ancestor of the
+        // prefix, the prefix, and each confiner directory or anything holding one.
+        for root in [&base, &home, &prefix, &prefix.join("bin"), &prefix.join("lib"),
+                     &prefix.join("lib/husk")] {
+            assert!(reach(exe.as_path(), root.as_path()).is_some(), "launching from {} must be refused", root.display());
+        }
+        let (r, d) = reach(exe.as_path(), home.as_path()).expect("the home holds ~/.local/bin");
+        assert_eq!((r, d), (canon(home.as_path()), canon(prefix.join("bin").as_path())), "both objects, canonical");
+
+        // Allowed: a project, and a directory INSIDE the prefix that holds no husk code.
+        assert_eq!(reach(exe.as_path(), project.as_path()), None, "a project directory must launch");
+        assert_eq!(reach(exe.as_path(), prefix.join("share/proj").as_path()), None, "share/ is not husk's code");
+
+        // A symlink can neither hide an overlap nor invent one (`P15`).
+        let looks_like_a_project = base.join("looks-like-a-project");
+        std::os::unix::fs::symlink(&home, &looks_like_a_project).unwrap();
+        assert!(reach(exe.as_path(), looks_like_a_project.as_path()).is_some(), "the home, spelled as a link");
+        std::os::unix::fs::symlink(&prefix, project.join("tools")).unwrap();
+        assert_eq!(
+            reach(project.join("tools/bin/husk-slurm-wrapper").as_path(), project.as_path()),
+            None,
+            "a link in the project TO the install is not the install: writes through it land \
+             outside the writable root"
+        );
+        let elsewhere = base.join("elsewhere");
+        let linked_prefix = elsewhere.join("p");
+        std::fs::create_dir_all(linked_prefix.join("lib/husk")).unwrap();
+        std::fs::create_dir_all(project.join("bin-inside")).unwrap();
+        std::os::unix::fs::symlink(project.join("bin-inside"), linked_prefix.join("bin")).unwrap();
+        let linked_exe = linked_prefix.join("bin/husk-slurm-wrapper");
+        std::fs::write(&linked_exe, "").unwrap();
+        assert!(
+            reach(linked_exe.as_path(), project.as_path()).is_some(),
+            "a prefix whose bin/ RESOLVES into the project is inside it"
+        );
+
+        // A question it cannot answer is a refusal, never a pass.
+        assert!(super::confiner_within_reach(&exe, &base.join("gone")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_confiner_refusal_names_both_paths_and_the_one_thing_to_do() {
+        let m = super::confiner_message(
+            std::path::Path::new("/users/me"),
+            std::path::Path::new("/users/me/.local/bin"),
+        );
+        assert!(m.contains("refusing to launch from /users/me\n"), "{m}");
+        assert!(m.contains("/users/me/.local/bin"), "the code it would expose: {m}");
+        assert!(m.contains("cd <your project> && husk"), "the remedy: {m}");
+        assert!(m.lines().all(|l| l.starts_with("husk:")), "attributed, every line: {m}");
+    }
+
     fn scratch(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let base = std::env::temp_dir().join(format!("husk-preflight-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&base);

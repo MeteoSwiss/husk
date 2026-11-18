@@ -46,6 +46,8 @@
 #     settings lives in the old prefix and is written only once.)
 #   - Must be visible on the compute nodes (not under /tmp, /var/tmp, /dev/shm or /run),
 #     outside this husk tree, and made of letters, digits and . _ / + - only.
+#   - husk refuses to launch from the prefix, a directory above it (your home, for ~/.local),
+#     or inside its bin/ or lib/husk: the launch directory is the one the agent can write.
 #   - Outside ~/.local, <prefix>/bin and <prefix>/lib/husk (not the whole prefix) are added
 #     to the sandbox's allowRead so the cage can run the apply-seccomp and socat installed
 #     there — read-only, never writable. Everything else in <prefix>/bin becomes readable in

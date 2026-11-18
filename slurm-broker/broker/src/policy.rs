@@ -843,12 +843,9 @@ fn husk_paths() -> (String, String, String) {
     (broker, stub, socat)
 }
 
-/// The install prefix a husk binary runs from: `<prefix>/bin/<binary>` -> `<prefix>`. The ONE
-/// derivation of it (`P8`) — `husk_paths` and `installed_seccomp_wrapper` both start here, so
-/// the guard, the step broker and the layout install-husk.sh creates cannot drift apart.
-fn install_prefix(exe: &std::path::Path) -> Option<&std::path::Path> {
-    exe.parent().and_then(|bin| bin.parent())
-}
+// The install prefix comes from `husk_slurm_broker::install_prefix`, the one derivation the
+// wrapper shares (`P8`): `husk_paths` and `installed_seccomp_wrapper` both start there.
+use husk_slurm_broker::install_prefix;
 
 /// `<prefix>/bin/seccomp-wrapper`: the syscall filter INSTALLED BESIDE THIS BINARY, which both
 /// the job cage (the guard, rendered here on the login node) and every rank cage (the step

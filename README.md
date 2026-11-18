@@ -112,9 +112,10 @@ echo 'export PATH="/path/to/husk/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
   `srun` rank all enter the sandbox through the `seccomp-wrapper` in `<prefix>/bin`, by
   absolute path. (A broker run from outside an install — `selftest.sh` from a checkout —
   falls back to the one on PATH, and the job log says so.)
-- **Do not launch `husk` from the prefix or from a directory above it.** The directory you
-  launch from is the one the agent can write, and the prefix holds the code that builds its
-  cage.
+- **husk refuses to launch from the prefix, from a directory above it, or from inside its
+  `bin/` or `lib/husk/`.** The directory you launch from is the one the agent can write, and
+  those hold the code that builds its cage. On a default install that includes your home:
+  `cd ~ && husk` is refused — launch from a project directory.
 - **The sandbox policy follows the prefix.** Outside `~/.local`, the installer adds
   `<prefix>/bin` and `<prefix>/lib/husk` — the two directories husk installs into, not the
   whole prefix — to the sandbox's `allowRead` (read-only: the cage runs `socat` and
