@@ -106,9 +106,12 @@ echo 'export PATH="/path/to/husk/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
   the unpacked husk tree, or if it contains anything but letters, digits and `. _ / + -`.
   Any other directory is accepted; `./slurm-broker/selftest.sh --full` is what proves a job
   can run from it.
-- **`<prefix>/bin` must be on `PATH` in the shell you launch `husk` from.** Compute jobs
-  inherit that `PATH` and find `seccomp-wrapper` through it. The installer prints the exact
-  line, and warns if `husk` on your `PATH` is a different install.
+- **`<prefix>/bin` must be on `PATH`**, so that `husk` runs this install. The installer
+  prints the exact line, and warns if `husk` on your `PATH` is a different install. Past
+  that, PATH no longer decides anything: the launcher, the compute job's cage and every
+  `srun` rank all enter the sandbox through the `seccomp-wrapper` in `<prefix>/bin`, by
+  absolute path. (A broker run from outside an install — `selftest.sh` from a checkout —
+  falls back to the one on PATH, and the job log says so.)
 - **Do not launch `husk` from the prefix or from a directory above it.** The directory you
   launch from is the one the agent can write, and the prefix holds the code that builds its
   cage.

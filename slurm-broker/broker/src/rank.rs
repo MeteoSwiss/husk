@@ -353,11 +353,14 @@ pub struct Egress<'a> {
 /// branches is how the cleanup set drifted from the files it was supposed to remove.
 const CLOSE_NS_FDS: &str = "exec 8<&- 9<&-";
 
-fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
+fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>, seccomp_wrapper: &str) -> String {
     let sec = profile.seccomp_profile();
+    // The wrapper travels as a shell variable assigned once, like `$_husk_inner` below, so the
+    // cage line reads the same whatever path it holds — one level of quoting, not two.
+    let sw = sh_quote(seccomp_wrapper);
     let cage = match net {
         None => format!(
-            "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
+            "\"$_husk_secwrap\" --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
              $_m \
              --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" --"
         ),
@@ -365,7 +368,7 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
         // job cage uses. Inheriting was never possible: bwrap mount namespaces do not
         // propagate, so a rank saw the job cage's placeholder rather than its contents.
         Some(e) => format!(
-            "seccomp-wrapper --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
+            "\"$_husk_secwrap\" --profile={sec} bwrap --userns 9 --pidns 8 {bwrap} \
              $_m \
              --bind \"$_d\" /dev/shm --bind-try \"$_s\" \"$_s\" \
              --ro-bind-try {src} {CAGED_SOCAT} --ro-bind-try {sock} {sock} --",
@@ -397,12 +400,14 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
     // immediately replaces itself is not a regression to a job that asked for nothing.
     match net {
         None => format!(
-            "_husk_inner='{CLOSE_NS_FDS}\n\
+            "_husk_secwrap={sw}\n\
+             _husk_inner='{CLOSE_NS_FDS}\n\
              exec \"$@\"'\n\
              exec {cage} /bin/sh -c \"$_husk_inner\" husk-rank \"$@\"\n"
         ),
         Some(e) => format!(
-            "export _HUSK_NET_SOCK={sock}\n\
+            "_husk_secwrap={sw}\n\
+             export _HUSK_NET_SOCK={sock}\n\
              export _HUSK_SOCAT={caged}\n\
              _husk_inner='{CLOSE_NS_FDS}\n\
              if [ -x \"$_HUSK_SOCAT\" ]; then\n\
@@ -424,13 +429,18 @@ fn exec_line(profile: Profile, bwrap: &str, net: Option<Egress<'_>>) -> String {
 /// Build the argv that follows srun's options: `sh -c <script> husk-rank <command...>`.
 ///
 /// `spool_dir` is Slurm's `SlurmdSpoolDir` as resolved by the step-broker (trusted);
-/// `rank_args` are the static bwrap arguments from `FsPolicy::rank_bwrap_args`.
+/// `rank_args` are the static bwrap arguments from `FsPolicy::rank_bwrap_args`;
+/// `seccomp_wrapper` is what the rank enters its cage through — the step broker's own
+/// `<prefix>/bin/seccomp-wrapper` (`step::rank_seccomp_wrapper`), or the bare name, which
+/// means PATH, when none is installed beside it. A parameter, not a lookup in here, so the
+/// caller that checked it is the caller that chose it.
 pub fn wrap_command(
     profile: Profile,
     rank_args: &[String],
     spool_dir: &str,
     holder_pid: u32,
     net: Option<Egress<'_>>,
+    seccomp_wrapper: &str,
     command: &[String],
 ) -> Vec<String> {
     let bwrap = rank_args
@@ -567,7 +577,7 @@ pub fn wrap_command(
         pidns = sh_quote(&crate::cage::pidns_path(holder_pid)),
         spool = sh_quote(spool_dir),
         mask_paths = crate::settings::CREDENTIAL_SOCKET_DIRS.join(" "),
-        exec_line = exec_line(profile, &bwrap, net),
+        exec_line = exec_line(profile, &bwrap, net, seccomp_wrapper),
     );
 
     let mut argv = vec![
@@ -590,6 +600,21 @@ mod tests {
         a.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `wrap_command` with the wrapper given as the BARE NAME, i.e. looked up on PATH — what
+    /// every test here did before the step broker passed its own installed path, and what
+    /// their PATH stubs rely on. The name says it, so no test reads as proving the installed
+    /// path; `the_rank_enters_its_cage_through_the_wrapper_it_is_given_not_paths` does that.
+    fn wrap_on_path(
+        profile: Profile,
+        rank_args: &[String],
+        spool_dir: &str,
+        holder_pid: u32,
+        net: Option<Egress<'_>>,
+        command: &[String],
+    ) -> Vec<String> {
+        super::wrap_command(profile, rank_args, spool_dir, holder_pid, net, "seccomp-wrapper", command)
+    }
+
     /// A pid whose `/proc/<pid>/ns/user` really exists, so the script's fail-closed
     /// holder check passes and the rest of the script gets to run. Our own pid is the
     /// natural stand-in for a live cage holder.
@@ -599,7 +624,7 @@ mod tests {
 
     fn built(command: &[&str]) -> Vec<String> {
         let rank = FsPolicy::unchecked_for_test().rank_bwrap_args("/work");
-        wrap_command(Profile::SingleNode, &rank, "/var/spool/slurmd", live_holder(), None, &v(command))
+        wrap_on_path(Profile::SingleNode, &rank, "/var/spool/slurmd", live_holder(), None, &v(command))
     }
 
     fn envmap(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
@@ -931,10 +956,10 @@ mod tests {
             c
         };
         let argv =
-            wrap_command(Profile::SingleNode, &cage, "/var/spool/slurmd", 4242, None, &v(&["./a.out"]));
+            wrap_on_path(Profile::SingleNode, &cage, "/var/spool/slurmd", 4242, None, &v(&["./a.out"]));
         let script = &argv[2];
         assert!(script.contains("'--setenv' 'MY_VAR' '/tmp/x'"), "{script}");
-        let before_bwrap = script.split("exec seccomp-wrapper").next().unwrap();
+        let before_bwrap = script.split("exec \"$_husk_secwrap\"").next().unwrap();
         assert!(
             !before_bwrap.contains("MY_VAR"),
             "nothing may set a forwarded value before the cage: {before_bwrap}"
@@ -1007,7 +1032,7 @@ mod tests {
     fn execs_the_cage_and_cannot_be_opted_out_of() {
         let argv = built(&["./a.out"]);
         let script = &argv[2];
-        assert!(script.contains("exec seccomp-wrapper --profile=single-node bwrap"), "{script}");
+        assert!(script.contains("exec \"$_husk_secwrap\" --profile=single-node bwrap"), "{script}");
         assert!(script.contains("--unshare-net"), "a rank keeps IP isolation: {script}");
         assert!(script.contains("--dev-bind-try"), "the fabric is bound: {script}");
     }
@@ -1043,7 +1068,7 @@ mod tests {
     #[test]
     fn broker_supplied_values_are_shell_quoted() {
         let rank = FsPolicy::unchecked_for_test().rank_bwrap_args("/work");
-        let argv = wrap_command(Profile::SingleNode, &rank, "/odd path/spool", 4242, None, &v(&["./a"]));
+        let argv = wrap_on_path(Profile::SingleNode, &rank, "/odd path/spool", 4242, None, &v(&["./a"]));
         assert!(argv[2].contains("'/odd path/spool'"), "{}", argv[2]);
     }
 
@@ -1053,7 +1078,7 @@ mod tests {
         // AND must precede the policy arguments, because bwrap otherwise creates its own
         // user namespace and the ranks end up siblings again - which is exactly the
         // configuration that fails with EPERM.
-        let argv = wrap_command(
+        let argv = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
@@ -1092,7 +1117,7 @@ mod tests {
         // a cage that cannot CMA its peers, which surfaces as an obscure MPI abort rather
         // than as the containment change it actually is. pid 1 is the wrong namespace but
         // readable; a pid that does not exist must stop the rank outright.
-        let argv = wrap_command(
+        let argv = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
@@ -1147,7 +1172,7 @@ mod tests {
         //
         // Closed in the inner shell, which is the only place it CAN be done: not before
         // `exec bwrap` (bwrap needs them) and not by bwrap (it has no flag to drop them).
-        let argv = wrap_command(
+        let argv = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
@@ -1171,7 +1196,7 @@ mod tests {
         // line duplicated across two branches is exactly how husk's cleanup set once drifted
         // from the files it was meant to remove.
         let plain = built(&["./a.out"])[2].clone();
-        let networked = wrap_command(
+        let networked = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
@@ -1196,7 +1221,7 @@ mod tests {
         // Each rank has its OWN network namespace, so the job cage's relay is unreachable
         // from here - the per-rank relay is a per-namespace adapter, not a second policy.
         // The single proxy outside the cage still decides everything.
-        let argv = wrap_command(
+        let argv = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
@@ -1232,7 +1257,7 @@ mod tests {
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let hostile = "./solver; touch /tmp/husk-pwned-$$";
-        let argv = wrap_command(
+        let argv = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",
@@ -1263,6 +1288,57 @@ mod tests {
             !std::path::Path::new(&format!("/tmp/husk-pwned-{}", std::process::id())).exists(),
             "the hostile command must not have executed"
         );
+    }
+
+    #[test]
+    fn the_rank_enters_its_cage_through_the_wrapper_it_is_given_not_paths() {
+        // The step broker passes its OWN installed `<prefix>/bin/seccomp-wrapper`. Before,
+        // every rank looked the name up on the PATH srun carried from the login shell, and
+        // with a second install earlier on it the rank cage was built by a wrapper this
+        // broker was never installed with (`P15`). EXECUTED: a decoy with the bare name sits
+        // first on PATH and refuses with 97; only the absolute one prints arguments.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("husk-rankwrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("path")).unwrap();
+        std::fs::create_dir_all(dir.join("prefix/bin")).unwrap();
+        let decoy = dir.join("path").join("seccomp-wrapper");
+        std::fs::write(&decoy, "#!/bin/sh\necho DECOY_FROM_PATH\nexit 97\n").unwrap();
+        let installed = dir.join("prefix/bin/seccomp-wrapper");
+        std::fs::write(&installed, "#!/bin/sh\nfor a in \"$@\"; do echo \"ARG:$a\"; done\n").unwrap();
+        for f in [&decoy, &installed] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let argv = super::wrap_command(
+            Profile::SingleNode,
+            &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
+            "/var/spool/slurmd",
+            live_holder(),
+            None,
+            &installed.to_string_lossy(),
+            &v(&["./a.out"]),
+        );
+        assert!(
+            argv[2].contains(&format!("_husk_secwrap={}\n", sh_quote(&installed.to_string_lossy()))),
+            "the path must be assigned once, quoted: {}",
+            argv[2]
+        );
+        let job_id = format!("w{}", std::process::id());
+        let out = std::process::Command::new("/bin/sh")
+            .args(&argv[1..])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.join("path").display()))
+            .env("SLURM_JOB_ID", &job_id)
+            .env("SLURM_STEP_ID", "0")
+            .output()
+            .expect("run the rank script");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir(format!("/dev/shm/husk-{job_id}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("DECOY_FROM_PATH"), "the rank used PATH's wrapper:\n{stdout}");
+        assert!(out.status.success(), "script failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("ARG:--profile=single-node"), "the given wrapper must run:\n{stdout}");
+        assert!(stdout.contains("ARG:bwrap"), "…and be handed the cage:\n{stdout}");
     }
 
     #[test]
@@ -1365,7 +1441,7 @@ mod tests {
         // The generated script iterates over exactly those literals — nothing job-derived is
         // spliced into the `for _c in ...` list, and the rank's own command rides in argv
         // AFTER the script rather than inside its body.
-        let argv = wrap_command(
+        let argv = wrap_on_path(
             Profile::SingleNode,
             &FsPolicy::unchecked_for_test().rank_bwrap_args("/work"),
             "/var/spool/slurmd",

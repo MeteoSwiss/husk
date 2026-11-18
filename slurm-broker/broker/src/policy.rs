@@ -825,7 +825,7 @@ fn husk_paths() -> (String, String, String) {
     let broker = tests::broker_path_override().unwrap_or_else(|| exe.to_string_lossy().to_string());
     #[cfg(not(test))]
     let broker = exe.to_string_lossy().to_string();
-    let prefix = exe.parent().and_then(|bin| bin.parent());
+    let prefix = install_prefix(&exe);
     let stub = prefix
         .map(|p| p.join("lib").join("husk").join("srun-stub.py"))
         .unwrap_or_default()
@@ -841,6 +841,36 @@ fn husk_paths() -> (String, String, String) {
         .to_string_lossy()
         .to_string();
     (broker, stub, socat)
+}
+
+/// The install prefix a husk binary runs from: `<prefix>/bin/<binary>` -> `<prefix>`. The ONE
+/// derivation of it (`P8`) — `husk_paths` and `installed_seccomp_wrapper` both start here, so
+/// the guard, the step broker and the layout install-husk.sh creates cannot drift apart.
+fn install_prefix(exe: &std::path::Path) -> Option<&std::path::Path> {
+    exe.parent().and_then(|bin| bin.parent())
+}
+
+/// `<prefix>/bin/seccomp-wrapper`: the syscall filter INSTALLED BESIDE THIS BINARY, which both
+/// the job cage (the guard, rendered here on the login node) and every rank cage (the step
+/// broker, on the compute node — the same installed file) are entered through.
+///
+/// It used to be looked up by NAME, through the PATH that `--export=ALL` carries from the
+/// login shell. With a second install earlier on that PATH — an old ~/.local one beside an
+/// `install-husk.sh --prefix` one — the cage was built by a wrapper this broker was never
+/// installed with, which is the deployment skew the installer's capability check exists to
+/// catch, reached around it (`P15`: check the name resolves to the object you meant).
+///
+/// Not test-overridable, for the reason `husk_paths` gives: a harness that needs a fake one
+/// writes it HERE, at the derived path, so it proves the layout the installer creates.
+/// Both users check it is executable at the moment of use (`P3`) and fall back to PATH,
+/// announced, when it is not — see the guard and `step::rank_seccomp_wrapper`.
+pub(crate) fn installed_seccomp_wrapper() -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    install_prefix(&exe)
+        .map(|p| p.join("bin").join("seccomp-wrapper"))
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Why a submission's partition was refused, naming every partition it MAY use.
@@ -1516,6 +1546,7 @@ fn wrap_script(
     let broker_q = settings::sh_quote(&broker_path);
     let stub_q = settings::sh_quote(&stub_path);
     let socat_q = settings::sh_quote(&socat_path);
+    let secwrap_q = settings::sh_quote(&installed_seccomp_wrapper());
     // The SESSION workdir, not `$PWD`. The two used to be identical because --chdir was
     // forced to req.cwd; now a run script may start the job in a subdirectory, and using
     // `$PWD` would silently NARROW the rank cage's writable region to that subdirectory.
@@ -2248,6 +2279,16 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
     echo \"husk: job is merged into the job's own stderr instead of kept outside it.\" >&2\n\
   fi\n\
   export HUSK_JOB_LOG=\"$_husk_log\"\n\
+  # The seccomp-wrapper installed BESIDE THIS BROKER, by absolute path: not whichever one\n\
+  # PATH finds first, which with two installs is not the one this broker came with (P15).\n\
+  # A broker run from outside an install (selftest from a checkout) has none beside it,\n\
+  # so PATH stays the fallback - announced in the job log, never silent (P7).\n\
+  _husk_secwrap={secwrap_q}\n\
+  if [ ! -x \"$_husk_secwrap\" ]; then\n\
+    echo \"husk: no seccomp-wrapper beside this broker at $_husk_secwrap; entering the\" >>\"$_husk_log\"\n\
+    echo \"husk: cage through the one on PATH: $(command -v seccomp-wrapper || echo none)\" >>\"$_husk_log\"\n\
+    _husk_secwrap=seccomp-wrapper\n\
+  fi\n\
 {fd_guard}{emitted_check}\
 {net_start}  _husk_step_pid=\n\
   _husk_stub={stub_q}\n\
@@ -2316,7 +2357,7 @@ started $(date -u +%Y%m%d-%H%M%SZ 2>/dev/null) in {workdir_q}\" \\\n\
   trap '_husk_signalled=SIGTERM' TERM\n\
   trap '_husk_signalled=SIGINT' INT\n\
 {reclaim_pre}\
-  seccomp-wrapper --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
+  \"$_husk_secwrap\" --profile={sec} bwrap {bwrap} ${{_husk_extra[@]+\"${{_husk_extra[@]}}\"}} -- /bin/bash \"$0\" \"$@\"\n\
   _husk_rc=$?\n\
 {reclaim_post}\
   # The step-broker holds the credentials the job must not have, so it dies WITH the job.\n\
@@ -3371,6 +3412,11 @@ mod tests {
     /// A step broker that comes up and stays up — what the guard expects.
     const LIVE_BROKER: &str = "#!/bin/sh\nexec sleep 10\n";
 
+    /// What answers if the guard looks `seccomp-wrapper` up on PATH instead of using the one
+    /// installed beside the broker. Loud and distinctive, so the failure names its cause.
+    const SECWRAP_DECOY: &str =
+        "#!/bin/sh\necho 'husk-test: the DECOY seccomp-wrapper on PATH ran' >&2\nexit 97\n";
+
     pub(super) fn broker_path_override() -> Option<String> {
         BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -3426,9 +3472,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        let stub = dir.join("seccomp-wrapper");
-        std::fs::write(&stub, stub_body).unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The guard enters the cage through the seccomp-wrapper INSTALLED BESIDE THE BROKER
+        // (`installed_seccomp_wrapper`), so the stand-in goes THERE — at the derived path,
+        // inside the lock, removed before the lock is released: the srun stub's treatment,
+        // for the srun stub's reason. A DECOY with the bare name goes on PATH. If the guard
+        // ever resolves the name through PATH again, the decoy answers and exits 97, and
+        // every test that runs through this harness goes red at once.
+        let secwrap = std::path::PathBuf::from(installed_seccomp_wrapper());
+        if let Some(parent) = secwrap.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&secwrap, stub_body).unwrap();
+        std::fs::set_permissions(&secwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let decoy = dir.join("seccomp-wrapper");
+        std::fs::write(&decoy, SECWRAP_DECOY).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
         // The guard only binds the srun stub if a real srun exists on this node. Provide
         // one so the bind path is exercised rather than silently skipped.
         let fake_srun = dir.join("srun");
@@ -3472,6 +3530,9 @@ mod tests {
             .unwrap();
         // Cleared before the lock is released, so a later test never sees another's broker.
         *BROKER_OVERRIDE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // …nor another's seccomp-wrapper. Removed rather than overwritten next time, so a
+        // write never meets a file something is still executing (ETXTBSY).
+        let _ = std::fs::remove_file(&secwrap);
         let _ = std::fs::remove_dir_all(&dir);
         (
             out.status.code().unwrap_or(-1),
@@ -4135,10 +4196,17 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         // Stands in for seccomp-wrapper, i.e. for everything downstream of the check. If
-        // this marker reaches the output file, the guard let the job proceed.
-        let stub = dir.join("seccomp-wrapper");
+        // this marker reaches the output file, the guard let the job proceed. At the DERIVED
+        // path the guard uses, under the lock that owns that path (see `run_guard_prepared`);
+        // the decoy on PATH would refuse with 97 if the guard looked the name up instead.
+        let _serialise = STUB_PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stub = std::path::PathBuf::from(installed_seccomp_wrapper());
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
         std::fs::write(&stub, "#!/bin/bash\necho MARKER_BODY_RAN\n").unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let decoy = dir.join("seccomp-wrapper");
+        std::fs::write(&decoy, SECWRAP_DECOY).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o755)).unwrap();
 
         let root = inside.to_string_lossy().to_string();
         let script = wrap_script(
@@ -4201,6 +4269,7 @@ mod tests {
         // `--open-mode=append` means whatever was in it is still there.
         assert!(!std::fs::read_to_string(&hijacked).unwrap().contains("MARKER_BODY_RAN"));
 
+        let _ = std::fs::remove_file(&stub);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4488,9 +4557,14 @@ mod tests {
             "/work/project/slurm-%j.err",
         );
         let (broker, stub, socat) = husk_paths();
-        // Longest first: the three share a prefix, and replacing a shorter one first would
+        // Longest first: the four share a prefix, and replacing a shorter one first would
         // corrupt the others.
-        let mut subs = [(broker, "<HUSK_BROKER>"), (stub, "<HUSK_STUB>"), (socat, "<HUSK_SOCAT>")];
+        let mut subs = [
+            (broker, "<HUSK_BROKER>"),
+            (stub, "<HUSK_STUB>"),
+            (socat, "<HUSK_SOCAT>"),
+            (installed_seccomp_wrapper(), "<HUSK_SECWRAP>"),
+        ];
         subs.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
         let mut out = script;
         for (path, placeholder) in subs {
@@ -4688,6 +4762,7 @@ mod tests {
             "/var/spool/slurmd",
             std::process::id(),
             None,
+            "seccomp-wrapper",
             &["true".to_string()],
         );
         let rank = rank_argv[2].clone();
@@ -5419,7 +5494,7 @@ mod tests {
         let pre = guard
             .split("# --- husk: remember which mask targets do not exist yet")
             .nth(1)
-            .and_then(|t| t.split("seccomp-wrapper").next())
+            .and_then(|t| t.split("\"$_husk_secwrap\" --profile=").next())
             .expect("the guard must carry the record block");
         let post = guard
             .split("# --- husk: reclaim the mount points husk itself created")
@@ -5517,11 +5592,95 @@ mod tests {
     fn the_golden_guard_is_the_real_script_with_only_paths_normalised() {
         let g = normalized_guard(true);
         assert!(g.contains("<HUSK_BROKER>"), "the broker path must be normalised: {g}");
-        assert!(g.contains("seccomp-wrapper --profile=single-node bwrap"), "{g}");
+        assert!(g.contains("_husk_secwrap='<HUSK_SECWRAP>'"), "the wrapper path too: {g}");
+        assert!(g.contains("\n\"$_husk_secwrap\" --profile=single-node bwrap"), "{g}");
         assert!(g.contains("--unshare-net"), "the cage args must survive verbatim: {g}");
         assert!(g.contains("--unshare-pid"), "the job cage must carry its pid namespace: {g}");
         // Nothing machine-specific may leak into a committed file.
         assert!(!g.contains(env!("CARGO_MANIFEST_DIR")), "a build path leaked into the golden file");
+    }
+
+    /// The job cage is entered through the seccomp-wrapper INSTALLED BESIDE THE BROKER, and
+    /// the guard says so in the job log whenever it has to fall back to PATH instead.
+    ///
+    /// EXECUTED, not read: what matters is which file `"$_husk_secwrap"` names when the cage
+    /// line runs. The block is the guard's own, verbatim, with its one machine-specific value
+    /// (the derived path) pointed at a file this test owns, so nothing process-global is
+    /// touched; the harness tests above prove the derived path itself, with a decoy on PATH.
+    #[test]
+    fn the_guard_uses_the_wrapper_installed_beside_the_broker_and_announces_any_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let script = wrap_script(
+            BODY_PATH,
+            &[],
+            &[],
+            profile::Profile::SingleNode,
+            "/work",
+            false,
+            &["/work".to_string()],
+            "", "",
+        );
+        let start = script.find("\n_husk_secwrap=").expect("the guard must resolve the wrapper") + 1;
+        let len = script[start..].find("\nfi\n").expect("…in one if-block") + "\nfi\n".len();
+        let block = &script[start..start + len];
+        let derived = format!("_husk_secwrap={}", settings::sh_quote(&installed_seccomp_wrapper()));
+        assert!(
+            block.starts_with(&format!("{derived}\n")),
+            "the value must be the derived <prefix>/bin/seccomp-wrapper, quoted: {block}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("husk-secwrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let beside = dir.join("prefix-bin-seccomp-wrapper");
+        let on_path = dir.join("bin").join("seccomp-wrapper");
+        for f in [&beside, &on_path] {
+            std::fs::write(f, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let log = dir.join("job.log");
+        let run = |installed: &std::path::Path| -> (String, String) {
+            let _ = std::fs::remove_file(&log);
+            let body = block.replacen(
+                &derived,
+                &format!("_husk_secwrap={}", settings::sh_quote(&installed.to_string_lossy())),
+                1,
+            );
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!(
+                    "_husk_log={}\n{body}\nprintf '%s' \"$_husk_secwrap\"\n",
+                    settings::sh_quote(&log.to_string_lossy())
+                ))
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.join("bin").display()))
+                .output()
+                .unwrap();
+            (
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                std::fs::read_to_string(&log).unwrap_or_default(),
+            )
+        };
+
+        // 1. Installed beside the broker: that file, and not one word in the log.
+        let (chosen, said) = run(&beside);
+        assert_eq!(chosen, beside.to_string_lossy().to_string(), "the installed one must be used");
+        assert!(said.is_empty(), "the ordinary case must be silent: {said}");
+
+        // 2. Not there — a broker run from a checkout, as selftest.sh does by default: PATH,
+        //    today's behaviour, AND the log names both where it looked and what PATH gave.
+        let absent = dir.join("absent");
+        let (chosen, said) = run(&absent);
+        assert_eq!(chosen, "seccomp-wrapper", "the fallback is the PATH lookup");
+        assert!(said.contains("no seccomp-wrapper beside this broker"), "{said}");
+        assert!(said.contains(&absent.to_string_lossy().to_string()), "where it looked: {said}");
+        assert!(said.contains(&on_path.to_string_lossy().to_string()), "what PATH gave: {said}");
+
+        // 3. Present but not executable is not installed: the same fallback, announced.
+        std::fs::set_permissions(&beside, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (chosen, said) = run(&beside);
+        assert_eq!(chosen, "seccomp-wrapper");
+        assert!(said.contains("no seccomp-wrapper beside this broker"), "{said}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `RAB3-B3`. The pin for the lock in `normalized_guard`, AT THE LEVEL OF THE DEFECT:
@@ -6094,7 +6253,7 @@ mod tests {
         // about bwrap in its comments long before it runs it. No leading spaces - the
         // `\n\` continuations in the Rust literal strip the indentation, so the emitted
         // guard is flush left.
-        let cage_at = on.find("\nseccomp-wrapper --profile=").expect("cage must be entered");
+        let cage_at = on.find("\n\"$_husk_secwrap\" --profile=").expect("cage must be entered");
         assert!(proxy_at < cage_at, "the proxy must start before the cage is entered");
         // ...and the relay runs INSIDE, after the re-exec guard has finished.
         let relay_at = on.find("TCP-LISTEN:3128").expect("relay must be started");
@@ -6166,7 +6325,9 @@ mod tests {
         // preamble and first USED inside `net_start`, which is interpolated above the
         // step-pair block. Get the order wrong and both the proxy and the step-broker
         // redirect into the empty string.
-        for var in ["_husk_spool", "_husk_broker", "_husk_stub", "_husk_log"] {
+        // `_husk_secwrap` is the cage entry point: unset, the cage line would run `""` and the
+        // job would die with the same bare `command not found`, before any containment.
+        for var in ["_husk_spool", "_husk_broker", "_husk_stub", "_husk_log", "_husk_secwrap"] {
             let def = on
                 .find(&format!("{var}="))
                 .unwrap_or_else(|| panic!("{var} is never assigned:\n{on}"));
@@ -6285,9 +6446,11 @@ mod tests {
             &["/work".to_string()],
             "", "",
         );
+        // The cage-entry line itself, not the first mention of the wrapper: the guard names
+        // it in a comment and a fallback message before it runs it.
         let line = script
             .lines()
-            .find(|l| l.contains("seccomp-wrapper"))
+            .find(|l| l.starts_with("\"$_husk_secwrap\" --profile="))
             .expect("guard line");
         // The cage profile must reach the syscall layer too, not just the mount layer.
         assert!(

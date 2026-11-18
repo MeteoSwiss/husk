@@ -516,9 +516,9 @@ asked for.
 
 `make install` is a development convenience, not how husk is installed. `install-husk.sh`
 installs the arch-tagged `seccomp-wrapper-<arch>` that `build_and_test.sh` produces, and it
-takes `--prefix DIR` itself (see the top-level README, *Install location*). The launcher runs
-the `seccomp-wrapper` in its own `bin/` by absolute path, so a copy you `make install`ed
-elsewhere is not the one a `husk` session uses.
+takes `--prefix DIR` itself (see the top-level README, *Install location*). The launcher, the
+compute job guard and every `srun` rank run the `seccomp-wrapper` in husk's own `bin/` by
+absolute path, so a copy you `make install`ed elsewhere is not the one a `husk` session uses.
 
 ## Usage
 

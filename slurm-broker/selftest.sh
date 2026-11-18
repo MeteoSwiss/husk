@@ -1040,13 +1040,13 @@ run_live_probe() {
   # Read the reason BEFORE cancelling, or the answer is always CANCELLED.
   local qr=""; [ "$queued" != 0 ] && qr="$(queue_reason "$jid")"
   # Ask SLURM why, so a failure is self-diagnosing instead of a guess. Exit 127 from
-  # the batch step means the guard's `seccomp-wrapper bwrap ...` was not found on the
-  # compute node — i.e. husk is not installed there, or <prefix>/bin is not on the PATH
-  # that --export=ALL carried over.
+  # the batch step means the guard's cage entry (`"$_husk_secwrap" bwrap ...`) was not found
+  # on the compute node: no <prefix>/bin/seccomp-wrapper beside the broker there, AND none on
+  # the PATH --export=ALL carried over (the guard's fallback, announced in the job log).
   local acct hint=""
   acct="$(sacct -j "$jid" -X -n -P -o State,ExitCode 2>/dev/null | head -1)"
   case "$acct" in
-    *"|127:"*) hint=" [$acct — 127 = command not found: is seccomp-wrapper installed and on PATH on the compute node? $husk_prefix/bin must be on the PATH husk is launched with; run install-husk.sh]" ;;
+    *"|127:"*) hint=" [$acct — 127 = command not found: is $husk_prefix/bin/seccomp-wrapper visible on the compute node? A broker run from outside an install falls back to seccomp-wrapper on PATH; see the job log]" ;;
     ?*)        hint=" [$acct]" ;;
   esac
 

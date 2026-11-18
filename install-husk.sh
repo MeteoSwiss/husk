@@ -53,8 +53,8 @@
 #
 # After running, add to ~/.bashrc or ~/.bash_profile if not already present:
 #   export PATH="<prefix>/bin:$PATH"       (by default: "$HOME/.local/bin:$PATH")
-# Compute jobs find seccomp-wrapper through this PATH too, so it must be in the shell you
-# launch husk from, not only in an interactive one.
+# Nothing else depends on PATH: the launcher, the compute job cage and every srun rank run
+# the seccomp-wrapper in <prefix>/bin by absolute path.
 #
 # Then start Claude Code with:
 #   husk
@@ -1340,8 +1340,8 @@ husk_layer_summary
 echo ""
 # SAY WHICH `husk` THE NAME REACHES, not only where one was put (`P15`). With a --prefix the
 # old advice — "add ~/.local/bin" — would name the wrong directory, and a `husk` earlier on PATH
-# would run instead of this one. PATH matters past the login node too: compute jobs inherit it
-# (--export=ALL) and find seccomp-wrapper through it.
+# would run instead of this one. (The cages no longer depend on PATH: the launcher, the job
+# guard and every rank use the seccomp-wrapper in <prefix>/bin by absolute path.)
 _path_line="  export PATH=\"$PREFIX/bin:\$PATH\""
 [[ "$PREFIX" == "${HOME}/.local" ]] && _path_line='  export PATH="$HOME/.local/bin:$PATH"'
 _on_path="$(command -v husk 2>/dev/null || true)"

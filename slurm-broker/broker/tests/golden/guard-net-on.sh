@@ -181,6 +181,16 @@ echo "husk: $HOME/.husk/log is not writable from this node, so husk's log for th
 echo "husk: job is merged into the job's own stderr instead of kept outside it." >&2
 fi
 export HUSK_JOB_LOG="$_husk_log"
+# The seccomp-wrapper installed BESIDE THIS BROKER, by absolute path: not whichever one
+# PATH finds first, which with two installs is not the one this broker came with (P15).
+# A broker run from outside an install (selftest from a checkout) has none beside it,
+# so PATH stays the fallback - announced in the job log, never silent (P7).
+_husk_secwrap='<HUSK_SECWRAP>'
+if [ ! -x "$_husk_secwrap" ]; then
+echo "husk: no seccomp-wrapper beside this broker at $_husk_secwrap; entering the" >>"$_husk_log"
+echo "husk: cage through the one on PATH: $(command -v seccomp-wrapper || echo none)" >>"$_husk_log"
+_husk_secwrap=seccomp-wrapper
+fi
   # --- husk: stdout/stderr must resolve INSIDE the writable set (A1) ---
   # `/proc/$$/fd`, never `/proc/self/fd`: this runs inside `$(...)`, and a command
   # substitution is a FORKED subshell whose OWN stdout is the substitution pipe. `self`
@@ -528,7 +538,7 @@ for _m in "${_husk_masks[@]}"; do
   _d=$(dirname "$_m" 2>/dev/null) || _d=
   [ -z "$_d" ] || [ -e "$_d" ] || _husk_madedir+=("$_d")
 done
-seccomp-wrapper --profile=single-node bwrap '--die-with-parent' '--ro-bind' '/' '/' '--dev' '/dev' '--proc' '/proc' '--tmpfs' '/tmp' '--tmpfs' '/dev/shm' '--unshare-pid' '--dev-bind-try' '/dev/nvidiactl' '/dev/nvidiactl' '--dev-bind-try' '/dev/nvidia-uvm' '/dev/nvidia-uvm' '--dev-bind-try' '/dev/nvidia-uvm-tools' '/dev/nvidia-uvm-tools' '--dev-bind-try' '/dev/nvidia-caps' '/dev/nvidia-caps' '--dev-bind-try' '/dev/gdrdrv' '/dev/gdrdrv' '--dev-bind-try' '/dev/nvidia0' '/dev/nvidia0' '--dev-bind-try' '/dev/nvidia1' '/dev/nvidia1' '--dev-bind-try' '/dev/nvidia2' '/dev/nvidia2' '--dev-bind-try' '/dev/nvidia3' '/dev/nvidia3' '--dev-bind-try' '/dev/nvidia4' '/dev/nvidia4' '--dev-bind-try' '/dev/nvidia5' '/dev/nvidia5' '--dev-bind-try' '/dev/nvidia6' '/dev/nvidia6' '--dev-bind-try' '/dev/nvidia7' '/dev/nvidia7' '--dev-bind-try' '/dev/nvidia-nvswitchctl' '/dev/nvidia-nvswitchctl' '--dev-bind-try' '/dev/nvidia-nvswitch0' '/dev/nvidia-nvswitch0' '--dev-bind-try' '/dev/nvidia-nvswitch1' '/dev/nvidia-nvswitch1' '--dev-bind-try' '/dev/nvidia-nvswitch2' '/dev/nvidia-nvswitch2' '--dev-bind-try' '/dev/nvidia-nvswitch3' '/dev/nvidia-nvswitch3' '--dev-bind-try' '/dev/kfd' '/dev/kfd' '--tmpfs' '/users' '--bind' '/work/project' '/work/project' '--tmpfs' '/work/project/.claude' '--tmpfs' '/work/project/.vscode' '--tmpfs' '/work/project/.idea' '--tmpfs' '/work/project/.git' '--tmpfs' '/work/project/.hg' '--ro-bind-try' '/work/project/.mcp.json' '/work/project/.mcp.json' '--ro-bind-try' '/dev/null' '/work/project/.Rprofile' '--ro-bind-try' '/dev/null' '/work/project/.Renviron' '--unshare-net' ${_husk_extra[@]+"${_husk_extra[@]}"} -- /bin/bash "$0" "$@"
+"$_husk_secwrap" --profile=single-node bwrap '--die-with-parent' '--ro-bind' '/' '/' '--dev' '/dev' '--proc' '/proc' '--tmpfs' '/tmp' '--tmpfs' '/dev/shm' '--unshare-pid' '--dev-bind-try' '/dev/nvidiactl' '/dev/nvidiactl' '--dev-bind-try' '/dev/nvidia-uvm' '/dev/nvidia-uvm' '--dev-bind-try' '/dev/nvidia-uvm-tools' '/dev/nvidia-uvm-tools' '--dev-bind-try' '/dev/nvidia-caps' '/dev/nvidia-caps' '--dev-bind-try' '/dev/gdrdrv' '/dev/gdrdrv' '--dev-bind-try' '/dev/nvidia0' '/dev/nvidia0' '--dev-bind-try' '/dev/nvidia1' '/dev/nvidia1' '--dev-bind-try' '/dev/nvidia2' '/dev/nvidia2' '--dev-bind-try' '/dev/nvidia3' '/dev/nvidia3' '--dev-bind-try' '/dev/nvidia4' '/dev/nvidia4' '--dev-bind-try' '/dev/nvidia5' '/dev/nvidia5' '--dev-bind-try' '/dev/nvidia6' '/dev/nvidia6' '--dev-bind-try' '/dev/nvidia7' '/dev/nvidia7' '--dev-bind-try' '/dev/nvidia-nvswitchctl' '/dev/nvidia-nvswitchctl' '--dev-bind-try' '/dev/nvidia-nvswitch0' '/dev/nvidia-nvswitch0' '--dev-bind-try' '/dev/nvidia-nvswitch1' '/dev/nvidia-nvswitch1' '--dev-bind-try' '/dev/nvidia-nvswitch2' '/dev/nvidia-nvswitch2' '--dev-bind-try' '/dev/nvidia-nvswitch3' '/dev/nvidia-nvswitch3' '--dev-bind-try' '/dev/kfd' '/dev/kfd' '--tmpfs' '/users' '--bind' '/work/project' '/work/project' '--tmpfs' '/work/project/.claude' '--tmpfs' '/work/project/.vscode' '--tmpfs' '/work/project/.idea' '--tmpfs' '/work/project/.git' '--tmpfs' '/work/project/.hg' '--ro-bind-try' '/work/project/.mcp.json' '/work/project/.mcp.json' '--ro-bind-try' '/dev/null' '/work/project/.Rprofile' '--ro-bind-try' '/dev/null' '/work/project/.Renviron' '--unshare-net' ${_husk_extra[@]+"${_husk_extra[@]}"} -- /bin/bash "$0" "$@"
 _husk_rc=$?
   # --- husk: reclaim the mount points husk itself created (A4-S3) ---
   # Only paths recorded as ABSENT above, and only while still empty: a file

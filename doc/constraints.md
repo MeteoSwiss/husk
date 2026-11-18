@@ -205,6 +205,15 @@ unprivileged `NO_NEW_PRIVS` process has an empty permitted capability set.
 Narrows the surface; does not eliminate it. A CVE in `read()` or `openat()` is not
 caught here.
 
+**Resolved by absolute path, not by name** (`P15`). The launcher runs the `seccomp-wrapper` in
+its own `bin/` and refuses if it is missing; the compute job guard and every `srun` rank use
+`<prefix>/bin/seccomp-wrapper` derived from the broker's own location
+(`policy::installed_seccomp_wrapper`), and fall back to PATH — announced in the job log —
+only when the broker was not run from an install. Asserted by the guard harness's PATH decoy,
+`the_guard_uses_the_wrapper_installed_beside_the_broker_and_announces_any_fallback`,
+`the_rank_enters_its_cage_through_the_wrapper_it_is_given_not_paths`, and
+`install-husk.test.sh` §22.
+
 ### C1.2 — `apply-seccomp` (vendored)
 defends H1, H6 · **depth**
 
