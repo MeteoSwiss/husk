@@ -380,6 +380,40 @@ t="$(choose "$H6" "$TREE" 1 "$TMP/shared/proj/husk" "$NL")"
 check_lacks "a sticky world-writable parent cannot have entries replaced" "$t" "other users can write"
 chmod 755 "$TMP/shared"
 
+echo "-- 16c. REVIEW FINDING: a following flag is never a flag's value --"
+# `--prefix --uninstall` used to eat `--uninstall` as the directory, so the uninstall never
+# ran, and `--slurm-partition --gpu-part` would have recorded a partition no cluster has.
+# The REAL parse loop, evaluated against argv — not a copy (`P8`) — so the guard cannot
+# drift from the flags it guards. Removing the guard is the acceptance criterion (`P9`):
+# point SRC at a copy with the `husk_flag_value` calls reverted and this section goes red.
+PARSE_SRC="$(sed -n '/^_args=()$/,/^set -- /p' "$SRC")"
+[[ -n "$PARSE_SRC" ]] || { echo "FAIL: the argument loop was not found in $SRC"; exit 1; }
+[[ -n "$(extract husk_flag_value)" ]] || { echo "FAIL: husk_flag_value() not found in $SRC"; exit 1; }
+parse() { "$BASH_BIN" -c 'set -euo pipefail; PREFIX_ARG= PREFIX_ARG_GIVEN=0 SLURM_PARTITION_ARG= SLURM_ACCOUNT_ARG=; '"$PARSE_SRC"'
+    printf "prefix=%s|given=%s|part=%s|acct=%s|rest=%s\n" \
+      "$PREFIX_ARG" "$PREFIX_ARG_GIVEN" "$SLURM_PARTITION_ARG" "$SLURM_ACCOUNT_ARG" "$*"' _ "$@"; }
+t="$(parse --prefix --uninstall)"
+check_eq "--prefix does not eat the command that follows it" \
+          "prefix=|given=1|part=|acct=|rest=--uninstall" "$t"
+t="$(parse --prefix "$TMP/opt/a" --uninstall)"
+check_eq "…and a real value still parses, later args intact" \
+          "prefix=$TMP/opt/a|given=1|part=|acct=|rest=--uninstall" "$t"
+t="$(parse --slurm-partition --uninstall)"
+check_eq "--slurm-partition does not eat --uninstall either" \
+          "prefix=|given=0|part=|acct=|rest=--uninstall" "$t"
+t="$(parse --slurm-partition gpu-part,pp-part --slurm-account proj --uninstall)"
+check_eq "…the seed flags keep their real values" \
+          "prefix=|given=0|part=gpu-part,pp-part|acct=proj|rest=--uninstall" "$t"
+t="$(parse --prefix=-x --uninstall)"
+check_eq "the = form still passes a value that begins with -" \
+          "prefix=-x|given=1|part=|acct=|rest=--uninstall" "$t"
+t="$(parse --prefix)"
+check_eq "a missing value is still given-but-empty, refused later" \
+          "prefix=|given=1|part=|acct=|rest=" "$t"
+t="$(parse --prefix '' --uninstall)"
+check_eq "an explicit empty value still lands as given-but-empty" \
+          "prefix=|given=1|part=|acct=|rest=--uninstall" "$t"
+
 echo "-- 17. the record makes the prefix a property of the machine --"
 HOME="$H" "$BASH_BIN" -c ". '$HELPER'; $(extract husk_write_prefix_record); husk_write_prefix_record '$TMP/opt/a'"
 check_eq    "the record holds the prefix, one line"      "$TMP/opt/a" "$(cat "$REC")"

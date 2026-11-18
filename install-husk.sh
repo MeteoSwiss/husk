@@ -46,6 +46,7 @@
 #     settings lives in the old prefix and is written only once.)
 #   - Must be visible on the compute nodes (not under /tmp, /var/tmp, /dev/shm or /run),
 #     outside this husk tree, and made of letters, digits and . _ / + - only.
+#     A value that begins with `-` must use the `--prefix=DIR` form, or it reads as a flag.
 #   - husk refuses to launch from the prefix, a directory above it (your home, for ~/.local),
 #     or inside its bin/ or lib/husk: the launch directory is the one the agent can write.
 #   - Outside ~/.local, <prefix>/bin and <prefix>/lib/husk (not the whole prefix) are added
@@ -85,17 +86,37 @@ SLURM_ACCOUNT_ARG=""
 PREFIX_ARG=""
 PREFIX_ARG_GIVEN=0
 _args=()
+
+# The value after a two-argument flag, or nothing. An argument that begins with `-` is a
+# flag, not a value: `--prefix --uninstall` used to eat `--uninstall` as the directory and
+# the uninstall never ran, and `--slurm-partition --gpu-part` would have recorded a
+# partition no cluster has. What a flag consumes must be what the operator meant (`P15`).
+# A MISSING argument is not a value either — the caller checks $# before asking, because an
+# explicitly EMPTY value IS a value (given-but-empty, refused later as "needs a directory"),
+# and only the caller can tell it from an argument that was never there. The `=` forms
+# (`--prefix=-x`) remain the way to pass a value that begins with `-`.
+husk_flag_value() {   # <the next argument> -> sets HUSK_FLAG_VALUE, or nothing if it is a flag
+  HUSK_FLAG_VALUE=""
+  case "$1" in
+    -*) return 1 ;;
+    *)  HUSK_FLAG_VALUE="$1"; return 0 ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --prefix)            PREFIX_ARG="${2:-}"; PREFIX_ARG_GIVEN=1; shift 2 2>/dev/null || shift ;;
+    --prefix)            PREFIX_ARG=""; PREFIX_ARG_GIVEN=1
+                         if [ "$#" -ge 2 ] && husk_flag_value "$2"; then PREFIX_ARG="$2"; shift 2; else shift; fi ;;
     --prefix=*)          PREFIX_ARG="${1#*=}"; PREFIX_ARG_GIVEN=1; shift ;;
-    --slurm-partition)   SLURM_PARTITION_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --slurm-partition)   SLURM_PARTITION_ARG=""
+                         if [ "$#" -ge 2 ] && husk_flag_value "$2"; then SLURM_PARTITION_ARG="$2"; shift 2; else shift; fi ;;
     --slurm-partition=*) SLURM_PARTITION_ARG="${1#*=}"; shift ;;
     # SEED-ONLY, both of them. They write ~/.husk/config.json on a FIRST install and the
     # legacy fallback files; after that the config file is authoritative and these flags are
     # reported as not-applied rather than silently ignored. Kept rather than removed so a
     # scripted first install still works in one command.
-    --slurm-account)     SLURM_ACCOUNT_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --slurm-account)     SLURM_ACCOUNT_ARG=""
+                         if [ "$#" -ge 2 ] && husk_flag_value "$2"; then SLURM_ACCOUNT_ARG="$2"; shift 2; else shift; fi ;;
     --slurm-account=*)   SLURM_ACCOUNT_ARG="${1#*=}"; shift ;;
     *)                   _args+=("$1"); shift ;;
   esac
