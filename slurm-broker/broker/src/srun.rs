@@ -11,7 +11,7 @@
 //! 1. **The command is not allowlisted — it is WRAPPED.** srun's trailing positional is
 //!    the user's program, and vetting arbitrary program names would be theatre. Instead
 //!    every task is launched as
-//!    `srun <validated opts> -- seccomp-wrapper --profile=... bwrap <rank cage> -- <cmd>`,
+//!    `srun <validated opts> -- <prefix>/bin/seccomp-wrapper --profile=... bwrap <rank cage> -- <cmd>`,
 //!    so whatever runs is caged. The wrap is forced by the broker and cannot be opted
 //!    out of by the stub.
 //! 2. **Some options must be REJECTED, not dropped.** An option that runs code outside

@@ -31,7 +31,7 @@ fi
 
 die() { echo "error: $*" >&2; exit 1; }
 command -v husk >/dev/null 2>&1 \
-  || die "husk not on PATH (install it / add ~/.local/bin to PATH first)."
+  || die "husk not on PATH (install it / add <prefix>/bin — ~/.local/bin by default — to PATH first)."
 
 SUFFIX="$$_${RANDOM}"
 TOKEN="SPOOLPROBE_${SUFFIX}"

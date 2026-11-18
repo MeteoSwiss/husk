@@ -5,7 +5,8 @@
 # remaining dependencies and configures ~/.claude/settings.json so the sandbox
 # is active for all projects under this user account.
 #
-# What this installs (all into ~/.local):
+# What this installs (all under one prefix — ~/.local unless --prefix says otherwise —
+# into <prefix>/bin and <prefix>/lib/husk):
 #   socat            — bridges the sandboxed process to the host-side HTTP and
 #                      SOCKS5 proxies; bwrap removes the network namespace so all
 #                      outbound traffic must route through socat; built from source
@@ -32,12 +33,31 @@
 #   - bubblewrap (bwrap) available system-wide (present on CSCS).
 #
 # Usage:
-#   ./install-husk.sh              install / update
-#   ./install-husk.sh --uninstall  remove everything this installed and
-#                                         revert ~/.claude/settings.json
+#   ./install-husk.sh                install / update
+#   ./install-husk.sh --prefix DIR   install into DIR/bin and DIR/lib/husk instead of ~/.local
+#   ./install-husk.sh --uninstall    remove everything this installed and
+#                                    revert ~/.claude/settings.json
+#
+# The install prefix:
+#   - Recorded in ~/.husk/install-prefix. An upgrade without --prefix reuses it, and
+#     --uninstall follows it, so the flag is needed once.
+#   - A --prefix different from the recorded one is refused: run --uninstall first, then
+#     install with the new --prefix. (The uninstall manifest that restores your pre-husk
+#     settings lives in the old prefix and is written only once.)
+#   - Must be visible on the compute nodes (not under /tmp, /var/tmp, /dev/shm or /run),
+#     outside this husk tree, and made of letters, digits and . _ / + - only.
+#     A value that begins with `-` must use the `--prefix=DIR` form, or it reads as a flag.
+#   - husk refuses to launch from the prefix, a directory above it (your home, for ~/.local),
+#     or inside its bin/ or lib/husk: the launch directory is the one the agent can write.
+#   - Outside ~/.local, <prefix>/bin and <prefix>/lib/husk (not the whole prefix) are added
+#     to the sandbox's allowRead so the cage can run the apply-seccomp and socat installed
+#     there — read-only, never writable. Everything else in <prefix>/bin becomes readable in
+#     the cage too, so a directory of its own is the better choice.
 #
 # After running, add to ~/.bashrc or ~/.bash_profile if not already present:
-#   export PATH="$HOME/.local/bin:$PATH"
+#   export PATH="<prefix>/bin:$PATH"       (by default: "$HOME/.local/bin:$PATH")
+# Nothing else depends on PATH: the launcher, the compute job cage and every srun rank run
+# the seccomp-wrapper in <prefix>/bin by absolute path.
 #
 # Then start Claude Code with:
 #   husk
@@ -60,16 +80,43 @@ SCRIPT_DIR_EARLY="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Extracted first so the positional --help/--uninstall checks below still see $1.
 SLURM_PARTITION_ARG=""
 SLURM_ACCOUNT_ARG=""
+# --prefix DIR: where everything is installed (see "The install prefix" below). GIVEN is kept
+# apart from the value so `--prefix ""` is refused as a mistake instead of reading as "not
+# given" and quietly installing into the default.
+PREFIX_ARG=""
+PREFIX_ARG_GIVEN=0
 _args=()
+
+# The value after a two-argument flag, or nothing. An argument that begins with `-` is a
+# flag, not a value: `--prefix --uninstall` used to eat `--uninstall` as the directory and
+# the uninstall never ran, and `--slurm-partition --gpu-part` would have recorded a
+# partition no cluster has. What a flag consumes must be what the operator meant (`P15`).
+# A MISSING argument is not a value either — the caller checks $# before asking, because an
+# explicitly EMPTY value IS a value (given-but-empty, refused later as "needs a directory"),
+# and only the caller can tell it from an argument that was never there. The `=` forms
+# (`--prefix=-x`) remain the way to pass a value that begins with `-`.
+husk_flag_value() {   # <the next argument> -> sets HUSK_FLAG_VALUE, or nothing if it is a flag
+  HUSK_FLAG_VALUE=""
+  case "$1" in
+    -*) return 1 ;;
+    *)  HUSK_FLAG_VALUE="$1"; return 0 ;;
+  esac
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --slurm-partition)   SLURM_PARTITION_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --prefix)            PREFIX_ARG=""; PREFIX_ARG_GIVEN=1
+                         if [ "$#" -ge 2 ] && husk_flag_value "$2"; then PREFIX_ARG="$2"; shift 2; else shift; fi ;;
+    --prefix=*)          PREFIX_ARG="${1#*=}"; PREFIX_ARG_GIVEN=1; shift ;;
+    --slurm-partition)   SLURM_PARTITION_ARG=""
+                         if [ "$#" -ge 2 ] && husk_flag_value "$2"; then SLURM_PARTITION_ARG="$2"; shift 2; else shift; fi ;;
     --slurm-partition=*) SLURM_PARTITION_ARG="${1#*=}"; shift ;;
     # SEED-ONLY, both of them. They write ~/.husk/config.json on a FIRST install and the
     # legacy fallback files; after that the config file is authoritative and these flags are
     # reported as not-applied rather than silently ignored. Kept rather than removed so a
     # scripted first install still works in one command.
-    --slurm-account)     SLURM_ACCOUNT_ARG="${2:-}"; shift 2 2>/dev/null || shift ;;
+    --slurm-account)     SLURM_ACCOUNT_ARG=""
+                         if [ "$#" -ge 2 ] && husk_flag_value "$2"; then SLURM_ACCOUNT_ARG="$2"; shift 2; else shift; fi ;;
     --slurm-account=*)   SLURM_ACCOUNT_ARG="${1#*=}"; shift ;;
     *)                   _args+=("$1"); shift ;;
   esac
@@ -108,14 +155,262 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
+# ── The install prefix ────────────────────────────────────────────────────────
+#
+# Everything this script installs goes under ONE prefix: <prefix>/bin and <prefix>/lib/husk.
+# Only the root moves; the layout under it is fixed, because the installed pieces find each
+# other by it — the launcher from its own path, the broker from `current_exe()` (`husk_paths`
+# in policy.rs: <prefix>/bin/husk-slurm-broker -> <prefix>/lib/husk/srun-stub.py).
+#
+# `--prefix DIR`, and ~/.local without it, so an install that does not ask is the install it
+# always was. There is no environment-variable form: a variable left set in a shell that
+# quietly relocates an install is a control nobody sees (`P7`, `P13`).
+#
+# The prefix is RECORDED (slurm-broker/husk-prefix.sh is the one statement of the record),
+# which makes it a property of the machine rather than of one command line:
+#   - an upgrade with no --prefix reuses it, and says so;
+#   - --uninstall follows it;
+#   - a --prefix that differs from it is REFUSED until the old install is removed. The
+#     uninstall manifest holding the operator's pre-husk settings lives in the old prefix and
+#     is written once; a fresh install elsewhere would record husk's OWN settings as the
+#     pre-install state and --uninstall could never give the operator's back.
+# What the refusals newly refuse, and who can trigger them (`P16`): an explicit --prefix that
+# moves, or that names a directory husk could install into but not run from. Only the
+# operator passes --prefix, every refusal prints its remedy, and the default is never refused.
+
+command -v python3 >/dev/null 2>&1 \
+  || { echo "error: 'python3' is required but not found on PATH"; exit 1; }
+
+. "$SCRIPT_DIR_EARLY/slurm-broker/husk-prefix.sh"
+
+# Roots a compute node cannot see. A prefix under one installs, starts on the login node, and
+# then fails every brokered job: the job guard runs the stub and socat from the broker's own
+# location. An array, not an environment input — and canonicalised where it is compared.
+HUSK_NODE_LOCAL_ROOTS=(/tmp /var/tmp /dev/shm /run)
+
+# The canonical absolute form of a path that need not exist yet: `~` expanded (zsh passes
+# `--prefix=~/x` through unexpanded), relative resolved against the cwd, symlinks in the
+# existing part followed. python3 rather than `realpath -m`, which is GNU-only, and the test
+# suites run on a laptop too.
+husk_canon() {
+  python3 -c 'import os, sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$1"
+}
+
+husk_path_within() {   # <path> <root> — both canonical: is path the root, or under it?
+  [[ "$1" == "$2" || "$1" == "$2"/* ]]
+}
+
+# Does an install made BEFORE the record existed sit at <prefix>? Only the default can hold
+# one. Each name is one only husk puts there.
+husk_installed_at() {   # <prefix>
+  [[ -e "$1/lib/husk/uninstall-manifest.json" || -e "$1/bin/husk-slurm-wrapper" \
+     || -e "$1/bin/seccomp-wrapper" ]]
+}
+
+# The prefix the CURRENT ~/.claude/settings.json was installed for, or nothing: husk writes
+# `sandbox.seccomp.applyPath` = <prefix>/lib/husk/apply-seccomp, and --uninstall takes it out
+# again. It is the second witness, for a machine whose record is gone — evidence about the
+# object (the policy in force) rather than about the control that should have described it
+# (`P15`). Without it, a lost record plus a --prefix elsewhere would write a second manifest
+# that records husk's own settings as the operator's.
+husk_settings_prefix() {
+  python3 - "${HOME}/.claude/settings.json" <<'PYSP' 2>/dev/null || true
+import json, sys
+try:
+    ap = json.load(open(sys.argv[1]))["sandbox"]["seccomp"]["applyPath"]
+except Exception:
+    raise SystemExit(0)
+tail = "/lib/husk/apply-seccomp"
+if isinstance(ap, str) and ap.startswith("/") and ap.endswith(tail) and "\n" not in ap:
+    print(ap[:-len(tail)])
+PYSP
+}
+
+# Refuse a prefix husk could install into but could not RUN from. Prints the refusal and
+# returns 1. The default never comes through here (`P16`).
+husk_prefix_validate() {   # <canonical prefix> <canonical source tree> <node-local root>...
+  local p="$1" src="$2" root bad
+  shift 2
+  # CONSTRUCT WHAT IS ALLOWED (`P4`). The prefix is written into PATH, into
+  # sandbox.filesystem.allowRead and into a permissions.deny pattern: `:` splits PATH, a glob
+  # character changes what a pattern matches, whitespace splits the launcher's words. A list
+  # of bad characters would be a list of the ones somebody thought of.
+  # The trailing `x` is load-bearing: `$(…)` strips trailing newlines, so without it a prefix
+  # whose only disallowed character is a newline leaves an EMPTY remainder and is accepted.
+  bad="$(printf '%s' "$p" | LC_ALL=C tr -d 'A-Za-z0-9._/+-'; printf x)"
+  bad="${bad%x}"
+  if [[ -n "$bad" ]]; then
+    echo "  [error] --prefix '$p' contains characters husk will not install under: '$bad'"
+    echo "          Allowed: letters, digits and . _ / + -  — the prefix is written into PATH,"
+    echo "          into the sandbox's allowRead list and into a permissions.deny pattern, where"
+    echo "          ':' splits PATH, a glob character changes what a pattern matches and a space"
+    echo "          splits words. Choose a plainer directory."
+    return 1
+  fi
+  for root in "$@"; do
+    root="$(husk_canon "$root")"
+    if husk_path_within "$p" "$root"; then
+      echo "  [error] --prefix $p is under $root, which is local to each node."
+      echo "          husk would install and start here, and then every brokered job would"
+      echo "          fail: compute nodes cannot see this directory, and the job guard runs the"
+      echo "          srun stub and socat from it. Choose a directory on a shared filesystem —"
+      echo "          your home, or a project or store path."
+      return 1
+    fi
+  done
+  if husk_path_within "$p" "$src"; then
+    echo "  [error] --prefix $p is inside the husk tree this installer runs from ($src)."
+    echo "          Deleting or re-unpacking that tree would delete the install, and it is a"
+    echo "          likely directory to launch husk from — which would make the agent's"
+    echo "          writable directory the one its own cage is built from. Choose a directory"
+    echo "          outside it."
+    return 1
+  fi
+  return 0
+}
+
+# The directories at or above <prefix> that someone OTHER than the operator can write — group-
+# or world-writable, without the sticky bit — one per line. Anyone who can write one can
+# replace or rename the binaries husk then runs AS THE OPERATOR, outside every cage. ~/.local
+# never had this exposure; a --prefix in a shared project store usually does, which is why it
+# is a WARNING and not a refusal: group-writable project directories are normal on HPC, and
+# refusing them would deny the setup a team most often wants (`P16`). Saying it is what is owed.
+husk_prefix_others_can_write() {   # <canonical prefix>
+  python3 - "$1" <<'PYWW' 2>/dev/null || true
+import os, stat, sys
+d = sys.argv[1]
+while True:
+    try:
+        m = os.stat(d).st_mode
+        if m & 0o022 and not m & stat.S_ISVTX:
+            print(d)
+    except OSError:
+        pass
+    parent = os.path.dirname(d)
+    if parent == d:
+        break
+    d = parent
+PYWW
+}
+
+# Decide where THIS INSTALL goes. Sets PREFIX and PREFIX_FROM, or prints a refusal and returns 1.
+husk_prefix_choose() {   # <1 if --prefix was given> <its value>
+  local given="$1" arg="$2" rc=0 default recorded="" witnessed want have
+  default="${HOME}/.local"
+  husk_find_prefix || rc=$?
+  if (( rc == 2 )); then
+    echo "  [error] $(husk_prefix_record) exists but its first line is not an absolute path,"
+    echo "          so this installer cannot tell where the install it would upgrade lives."
+    echo "          Put the prefix husk is installed under on its first line — or delete the"
+    echo "          file if husk is not installed — and run this again."
+    return 1
+  fi
+  [[ "$husk_prefix_from" == "$(husk_prefix_record)" ]] && recorded="$husk_prefix"
+  witnessed=""
+  [[ -n "$recorded" ]] || witnessed="$(husk_settings_prefix)"
+
+  if [[ "$given" == 1 ]]; then
+    if [[ -z "$arg" ]]; then
+      echo "  [error] --prefix needs a directory: --prefix DIR"
+      return 1
+    fi
+    want="$(husk_canon "$arg")"; PREFIX_FROM="--prefix"
+  elif [[ -n "$recorded" ]]; then
+    want="$recorded"; PREFIX_FROM="recorded in $(husk_prefix_record)"
+  elif [[ -n "$witnessed" ]]; then
+    want="$witnessed"
+    PREFIX_FROM="no record; sandbox.seccomp.applyPath in ~/.claude/settings.json names it"
+  else
+    want="$default"; PREFIX_FROM="the default"
+  fi
+
+  # Validate BEFORE the move check, so a bad --prefix is fixed before anyone uninstalls for it.
+  if [[ "$(husk_canon "$want")" == "$(husk_canon "$default")" ]]; then
+    want="$default"     # byte-for-byte the path every install before --prefix used
+  else
+    want="$(husk_canon "$want")"
+    husk_prefix_validate "$want" "$(husk_canon "$SCRIPT_DIR_EARLY")" \
+      "${HUSK_NODE_LOCAL_ROOTS[@]}" || return 1
+    local shared
+    shared="$(husk_prefix_others_can_write "$want")"
+    if [[ -n "$shared" ]]; then
+      echo "  [warn] other users can write here, so they could replace the binaries husk runs"
+      echo "         as you, outside the sandbox:"
+      printf '           %s\n' $shared
+      echo "         Fine if you trust everyone with that access; otherwise choose a prefix"
+      echo "         only you can write (chmod g-w,o-w, or a directory of your own)."
+    fi
+  fi
+
+  # The install already on this machine, if there is one: the record, else the policy in
+  # force, else an install from before the record at the default.
+  have="${recorded:-$witnessed}"
+  if [[ -z "$have" ]] && husk_installed_at "$default"; then have="$default"; fi
+  if [[ -n "$have" && "$(husk_canon "$have")" != "$(husk_canon "$want")" ]]; then
+    echo "  [error] husk is already installed under $have, and this run asks for $want."
+    echo "          Moving an install needs the old one removed first. Its uninstall manifest"
+    echo "          holds the settings you had before husk and is written only once, so a"
+    echo "          fresh install elsewhere would record husk's own settings as yours, and"
+    echo "          --uninstall could never give yours back. From this directory:"
+    echo "            $0 --uninstall"
+    echo "          then run this installer again with --prefix $want"
+    return 1
+  fi
+  PREFIX="$want"
+  return 0
+}
+
+# Decide what --uninstall removes. It FOLLOWS THE RECORD; --prefix is only for a machine whose
+# record is gone or broken. Sets PREFIX and PREFIX_FROM, or refuses.
+husk_prefix_for_uninstall() {   # <1 if --prefix was given> <its value>
+  local given="$1" arg="$2" rc=0 default
+  default="${HOME}/.local"
+  husk_find_prefix || rc=$?
+  if [[ "$given" == 1 && -z "$arg" ]]; then
+    echo "  [error] --prefix needs a directory: --prefix DIR"
+    return 1
+  fi
+  if [[ "$husk_prefix_from" == "$(husk_prefix_record)" ]]; then
+    if [[ "$given" == 1 && "$(husk_canon "$arg")" != "$(husk_canon "$husk_prefix")" ]]; then
+      echo "  [error] husk is recorded as installed under $husk_prefix (in $(husk_prefix_record)),"
+      echo "          and --uninstall removes that install. Run it without --prefix."
+      return 1
+    fi
+    PREFIX="$husk_prefix"; PREFIX_FROM="recorded in $(husk_prefix_record)"
+  elif (( rc == 2 )) && [[ "$given" != 1 ]]; then
+    echo "  [error] $(husk_prefix_record) exists but its first line is not an absolute path,"
+    echo "          so this cannot tell which install to remove. Name it:"
+    echo "            $0 --uninstall --prefix DIR"
+    return 1
+  elif [[ "$given" == 1 ]]; then
+    PREFIX="$(husk_canon "$arg")"; PREFIX_FROM="--prefix"
+  elif [[ -n "$(husk_settings_prefix)" ]]; then
+    PREFIX="$(husk_settings_prefix)"
+    PREFIX_FROM="no record; sandbox.seccomp.applyPath in ~/.claude/settings.json names it"
+  else
+    PREFIX="$default"; PREFIX_FROM="the default — no $(husk_prefix_record)"
+  fi
+  [[ "$(husk_canon "$PREFIX")" == "$(husk_canon "$default")" ]] && PREFIX="$default"
+  return 0
+}
+
+husk_write_prefix_record() {   # <prefix> — atomically, so a reader never sees half a line
+  local rec tmp
+  rec="$(husk_prefix_record)"
+  tmp="$rec.tmp.$$"
+  mkdir -p "$(dirname "$rec")"
+  { printf '%s\n' "$1" > "$tmp" && mv -f "$tmp" "$rec"; } || { rm -f "$tmp"; return 1; }
+}
+
 # ── Uninstall mode (./install-husk.sh --uninstall) ────────────────────
 if [[ "${1:-}" == "--uninstall" ]]; then
-  PREFIX="${HOME}/.local"
+  husk_prefix_for_uninstall "$PREFIX_ARG_GIVEN" "$PREFIX_ARG" || exit 1
   CLAUDE_SETTINGS="${HOME}/.claude/settings.json"
   MANIFEST="$PREFIX/lib/husk/uninstall-manifest.json"
+  PREFIX_RECORD="$(husk_prefix_record)"
 
   echo ""
-  echo "This will remove husk from your home directory:"
+  echo "This will remove husk, installed under $PREFIX ($PREFIX_FROM):"
   echo "  - delete  $PREFIX/bin/{husk,seccomp-wrapper,seccomp-wrapper.sha256}"
   echo "            $PREFIX/bin/{husk-slurm-wrapper,husk-slurm-broker} (if installed)"
   echo "            $PREFIX/bin/husk-slurm (legacy, if left by an older install)"
@@ -135,6 +430,8 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   echo "    remove it yourself if nothing else uses it"
   echo "  - session logs in $HOME/.husk/log are LEFT in place — they are the record"
   echo "    of what husk brokered, so an uninstall does not erase them"
+  echo "  - delete  $PREFIX_RECORD (where husk is installed) LAST, so an uninstall"
+  echo "    that stops part-way still knows where the rest of the install is"
   echo ""
   echo "Press Enter to continue or Ctrl+C to cancel."
   read -r
@@ -169,6 +466,9 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     && printf '  [ok]   removed %s\n' "$PREFIX/lib/husk" || true
   rmdir "${HOME}/.claude/skills/husk" 2>/dev/null \
     && printf '  [ok]   removed %s\n' "${HOME}/.claude/skills/husk" || true
+  if [[ -e "$PREFIX_RECORD" ]]; then
+    rm -f "$PREFIX_RECORD"; printf '  [ok]   removed %s\n' "$PREFIX_RECORD"
+  fi
 
   echo ""
   echo "husk removed. Your ~/.bashrc PATH line (if you added one) and socat"
@@ -177,6 +477,13 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 fi
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Decided BEFORE asking for confirmation, so a refusal costs the operator no keystroke and
+# the prompt below can name where everything goes.
+husk_prefix_choose "$PREFIX_ARG_GIVEN" "$PREFIX_ARG" || exit 1
+
+echo ""
+echo "Install prefix: $PREFIX  ($PREFIX_FROM)"
+echo "  binaries in $PREFIX/bin, support files in $PREFIX/lib/husk"
 echo ""
 echo "This script will merge settings into ~/.claude/settings.json."
 echo "Existing settings outside these blocks are preserved."
@@ -192,6 +499,16 @@ echo "Full settings (user-config/settings.json):"
 echo "────────────────────────────────────────────────────────"
 cat "$SCRIPT_DIR_EARLY/user-config/settings.json"
 echo "────────────────────────────────────────────────────────"
+# The file above names ~/.local. For any other prefix the merge rewrites what names it, and
+# the operator is about to confirm a policy, so ASK THE MERGE what it will change rather than
+# restating it here (`P8`, `P13`).
+_adj="$(python3 "$SCRIPT_DIR_EARLY/scripts/merge-claude-settings.py" --prefix-adjustments \
+          "$SCRIPT_DIR_EARLY/user-config/settings.json" "$PREFIX")" || exit 1
+if [[ -n "$_adj" ]]; then
+  echo "Adjusted for the prefix $PREFIX:"
+  printf '%s\n' "$_adj"
+fi
+unset _adj
 echo ""
 echo "Note: Claude Code records every session to"
 echo "  ~/.claude/projects/<project>/<session-id>.jsonl"
@@ -211,7 +528,7 @@ done
 unset _cmd
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PREFIX="${HOME}/.local"
+# PREFIX was decided by husk_prefix_choose, before the confirmation prompt.
 MANIFEST="$PREFIX/lib/husk/uninstall-manifest.json"
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -253,7 +570,7 @@ ok()   { printf '  [ok]   %s\n' "$*"; }
 skip() { printf '  [skip] %s\n' "$*"; }
 warn() { printf '  [warn] %s\n' "$*"; }
 
-# Returns 0 if $1 binary exists in standard system paths (not ~/.local)
+# Returns 0 if $1 binary exists in standard system paths (not the install prefix)
 system_has_bin() {
   local name="$1"
   local dir
@@ -331,6 +648,15 @@ if [[ -x "$SCRIPT_DIR/slurm-broker/husk-slurm-broker-${HOST_ARCH}" ]]; then
   require_staged_broker_matches_checkout \
     "$SCRIPT_DIR/slurm-broker/husk-slurm-broker-${HOST_ARCH}"
 fi
+
+# ── The install record ────────────────────────────────────────────────────────
+# Written BEFORE anything lands in the prefix (`P6`: the resource gets its owner first), so an
+# install that stops part-way still tells --uninstall where its pieces went. Rewritten on every
+# install, the default one included, so from here on every machine has one.
+log "install prefix"
+mkdir -p "$PREFIX/bin" "$PREFIX/lib/husk"
+husk_write_prefix_record "$PREFIX"
+ok "$PREFIX ($PREFIX_FROM) — recorded in $(husk_prefix_record)"
 
 # ── bwrap (runtime prerequisite) ──────────────────────────────────────────────
 #
@@ -558,13 +884,13 @@ for p in "$here/../lib/husk/sbatch-stub.py" "$here/sbatch-stub.py"; do
 done
 
 # Site partition (operator-recorded at install; agent-UNWRITABLE, which is the property
-# that matters — see the note at the partition write, `H-1`: ~/.local is carved back out
-# of denyRead by allowRead, so the cage can READ this and cannot change it). An explicit
-# HUSK_SLURM_PARTITION env var wins; otherwise use the recorded value. The broker
+# that matters — see the note at the partition write, `H-1`: <prefix>/lib/husk is carved
+# back out of denyRead by allowRead, so the cage can READ this and cannot change it). An
+# explicit HUSK_SLURM_PARTITION env var wins; otherwise use the recorded value. The broker
 # forces this partition onto every job.
 # The project account(s), where the site requires one (Santis rejects every submission
-# without it). Same trusted path as the partition: recorded at install, under ~/.local,
-# not writable from the cage.
+# without it). Same trusted path as the partition: recorded at install, under the install
+# prefix, not writable from the cage.
 #
 # A comma-separated LIST, and the broker resolves a job's request against it — the same
 # bound-the-set-and-let-the-job-pick shape as --slurm-partition. One value keeps the old
@@ -692,6 +1018,22 @@ if [ -z "$wrapper" ]; then
   exit 1
 fi
 
+# THE seccomp-wrapper INSTALLED BESIDE THIS LAUNCHER, by absolute path — not whichever one
+# PATH finds first. Every other piece above is found as a sibling; this one was looked up by
+# name, so with a second install earlier on PATH (an old ~/.local one beside a --prefix one)
+# the launcher ran a wrapper it was never installed with (`P15`: check the name resolves to
+# the object you meant). Missing is a refusal, for the same reason the wrapper's is.
+secwrap="$here/seccomp-wrapper"
+if [ ! -x "$secwrap" ]; then
+  echo "husk: refusing to launch — the seccomp-wrapper binary is missing." >&2
+  echo "" >&2
+  echo "  expected at: $secwrap" >&2
+  echo "" >&2
+  echo "It installs husk's syscall deny-list before the agent starts. Re-install:" >&2
+  echo "    (cd seccomp-wrapper && ./build_and_test.sh) && ./install-husk.sh" >&2
+  exit 1
+fi
+
 # Hand off to the fail-closed wrapper. Agent is `seccomp-wrapper claude` (NOT husk,
 # so there is no launcher recursion). The wrapper brokers iff it detects SLURM; with
 # SLURM present and no --broker it refuses, which is the right answer — an unbrokered
@@ -699,7 +1041,7 @@ fi
 args=("$wrapper")
 if [ -n "$stub" ]; then args+=(--stub "$stub"); fi
 if [ -n "$broker" ]; then args+=(--broker "$broker"); fi
-exec "${args[@]}" -- seccomp-wrapper claude "$@"
+exec "${args[@]}" -- "$secwrap" claude "$@"
 LAUNCHER
 chmod +x "$CLAUDE_SAFE_DEST"
 ok "husk launcher → $CLAUDE_SAFE_DEST"
@@ -759,10 +1101,11 @@ if [[ -x "$SLURM_BROKER_SRC" && -x "$SLURM_WRAPPER_SRC" ]]; then
   # Record the site partition (if given) so husk exports it as
   # HUSK_SLURM_PARTITION. Trusted because it is written OUT of the cage by this installer
   # and read by the broker, NOT because the agent cannot see it: the shipped
-  # `allowRead: ["./", "~/.local"]` carves ~/.local back out of `denyRead: ["/users"]`, so
-  # everything under this prefix — this file, and the uninstall manifest beside it — is
-  # READABLE from inside the sandbox and only unwritable (`H-1`). The comment here said
-  # "agent-inaccessible" until 2026-09-01 and it was never true on CSCS.
+  # `allowRead: ["./", "~/.local"]` carves ~/.local back out of `denyRead: ["/users"]` (and
+  # for any other prefix the merge adds <prefix>/bin and <prefix>/lib/husk to allowRead), so
+  # everything under lib/husk — this file, and the uninstall manifest beside it — is READABLE
+  # from inside the sandbox and only unwritable (`H-1`). The comment here said "agent-inaccessible"
+  # until 2026-09-01 and it was never true on CSCS.
   # Absent → the broker uses its built-in default (preemptible).
   # $SLURM_PARTITION was resolved by husk_slurm_seed at the top of this script, NOT here:
   # the config seeder below reads the same value from outside this branch (`B7-5`).
@@ -953,7 +1296,7 @@ mkdir -p "${HOME}/.claude"
 
 python3 "$SCRIPT_DIR/scripts/merge-claude-settings.py" \
   "$CLAUDE_SETTINGS" "$APPLY_SECCOMP_DEST" "$SCRIPT_DIR/user-config/settings.json" \
-  "$MANIFEST"
+  "$MANIFEST" "$PREFIX"
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 
@@ -1018,8 +1361,24 @@ husk_layer_summary() {
 echo ""
 husk_layer_summary
 echo ""
-echo "If you have not already done so, add this to ~/.bashrc or ~/.bash_profile:"
-echo '  export PATH="$HOME/.local/bin:$PATH"'
+# SAY WHICH `husk` THE NAME REACHES, not only where one was put (`P15`). With a --prefix the
+# old advice — "add ~/.local/bin" — would name the wrong directory, and a `husk` earlier on PATH
+# would run instead of this one. (The cages no longer depend on PATH: the launcher, the job
+# guard and every rank use the seccomp-wrapper in <prefix>/bin by absolute path.)
+_path_line="  export PATH=\"$PREFIX/bin:\$PATH\""
+[[ "$PREFIX" == "${HOME}/.local" ]] && _path_line='  export PATH="$HOME/.local/bin:$PATH"'
+_on_path="$(command -v husk 2>/dev/null || true)"
+if [[ -n "$_on_path" && "$(husk_canon "$_on_path")" == "$(husk_canon "$PREFIX/bin/husk")" ]]; then
+  echo "$PREFIX/bin is on your PATH — 'husk' runs the launcher just installed."
+elif [[ -n "$_on_path" ]]; then
+  warn "'husk' on your PATH is $_on_path — NOT the launcher just installed ($PREFIX/bin/husk)."
+  warn "  Put $PREFIX/bin ahead of it in ~/.bashrc or ~/.bash_profile, or remove the other one:"
+  echo "$_path_line"
+else
+  echo "If you have not already done so, add this to ~/.bashrc or ~/.bash_profile:"
+  echo "$_path_line"
+fi
+unset _path_line _on_path
 echo ""
 if command -v claude >/dev/null 2>&1; then
   echo "Then start Claude Code with:"

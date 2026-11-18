@@ -435,8 +435,9 @@ done
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4b. Confiner integrity. settings.json is the cage's CONFIG; these binaries are the
-#    cage's CODE. They live in ~/.local/bin — INSIDE the ~/.local carve-out we open for
-#    the egress relay — so the agent can read them, and if it could also WRITE one it
+#    cage's CODE. They live in <prefix>/bin — INSIDE the read carve-out we open for the
+#    egress relay (~/.local, or <prefix>/bin itself) — so the agent can read them, and if it
+#    could also WRITE one it
 #    would rewrite its own confiner: the next `husk` launch executes attacker bytes as
 #    the operator, outside every cage. That is F17 ("the agent must not author its
 #    cage") one level down from the config.
@@ -445,24 +446,44 @@ done
 #    tool), so we attempt the write. Same non-destructive zero-byte append as above.
 # ─────────────────────────────────────────────────────────────────────────────
 sect "confiner integrity (can the agent rewrite the code that cages it?)"
+# WHERE the confiner is installed. Not ~/.local by assumption: `install-husk.sh --prefix`
+# puts it anywhere. Not $PATH and not an environment variable either — the agent sets both,
+# and could point this probe at a directory of its own choosing and collect a PASS about the
+# wrong object (`P15`). The installer's record (~/.husk/install-prefix) is masked in here.
+# What IS readable and agent-unwritable is settings.json, and `sandbox.seccomp.applyPath`
+# names <prefix>/lib/husk/apply-seccomp — the binary the runtime EXECUTES for every command.
+# Taking intent from config is allowed by the rule at the top of this file; the verdict below
+# is still the observed write disposition. No applyPath (an arch without apply-seccomp) means
+# the default, and the line says so.
+_pfx=""; _pfx_from=""
+if [ -r "$HOME/.claude/settings.json" ]; then
+    _ap="$(sed -n 's/.*"applyPath"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$HOME/.claude/settings.json" | head -n1)"
+    case "$_ap" in
+        /*/lib/husk/apply-seccomp) _pfx="${_ap%/lib/husk/apply-seccomp}"
+                                   _pfx_from="sandbox.seccomp.applyPath in ~/.claude/settings.json" ;;
+    esac
+    unset _ap
+fi
+[ -n "$_pfx" ] || { _pfx="$HOME/.local"; _pfx_from="the default — no usable sandbox.seccomp.applyPath"; }
+info "install prefix: $_pfx (from $_pfx_from)"
 _checked=0
 for _bin in husk seccomp-wrapper husk-slurm-broker husk-slurm-wrapper socat; do
-    _p="$HOME/.local/bin/$_bin"
+    _p="$_pfx/bin/$_bin"
     [ -e "$_p" ] || continue
     _checked=$((_checked+1))
     _wdv="$(write_disposition "$_p")"
     case "$_wdv" in
-        WRITABLE) fail "~/.local/bin/$_bin is WRITABLE — the agent can rewrite its own confiner" ;;
-        EROFS)    pass "~/.local/bin/$_bin refuses writes: EROFS, a read-only bind" ;;
-        EACCES)   warn "~/.local/bin/$_bin refuses writes by MODE (EACCES) only — a mode bit the agent owns is not what stops it rewriting its own confiner" ;;
-        EPERM)    warn "~/.local/bin/$_bin refuses writes with EPERM — not a read-only bind; inspect by hand" ;;
+        WRITABLE) fail "$_pfx/bin/$_bin is WRITABLE — the agent can rewrite its own confiner" ;;
+        EROFS)    pass "$_pfx/bin/$_bin refuses writes: EROFS, a read-only bind" ;;
+        EACCES)   warn "$_pfx/bin/$_bin refuses writes by MODE (EACCES) only — a mode bit the agent owns is not what stops it rewriting its own confiner" ;;
+        EPERM)    warn "$_pfx/bin/$_bin refuses writes with EPERM — not a read-only bind; inspect by hand" ;;
         OTHER:*)
             # ETXTBSY is not an unknown answer, it is the WRONG QUESTION. A binary that is
             # currently executing — the broker serving this session, the socat relay behind
             # the egress proxy — cannot be opened for write at all, and the kernel says so
             # BEFORE consulting the mount. So the file cannot answer; the directory holding it
             # can, and it is not executing. `allowWrite: []` makes the whole filesystem
-            # read-only outside the workdir, so ~/.local/bin is covered by one bind rather
+            # read-only outside the workdir, so <prefix>/bin is covered by one bind rather
             # than five per-file ones (settings.rs:4436) — probing the directory is direct
             # evidence about the same mount, not an inference from a sibling.
             #
@@ -472,25 +493,25 @@ for _bin in husk seccomp-wrapper husk-slurm-broker husk-slurm-wrapper socat; do
             # was one probe away (`P11`).
             case "${_wdv#OTHER:}" in
                 *"Text file busy"*|*ETXTBSY*)
-                    _dirv="$(create_disposition "$HOME/.local/bin")"
+                    _dirv="$(create_disposition "$_pfx/bin")"
                     case "$_dirv" in
                         EROFS)
-                            pass "~/.local/bin/$_bin is running (ETXTBSY), so it cannot be probed directly — but a NEW name in ~/.local/bin is refused with EROFS, and one read-only bind covers the directory" ;;
+                            pass "$_pfx/bin/$_bin is running (ETXTBSY), so it cannot be probed directly — but a NEW name in $_pfx/bin is refused with EROFS, and one read-only bind covers the directory" ;;
                         WRITABLE)
-                            fail "~/.local/bin/$_bin is running (ETXTBSY) and its DIRECTORY is writable — the agent cannot rewrite the running binary but can replace it for the next launch" ;;
+                            fail "$_pfx/bin/$_bin is running (ETXTBSY) and its DIRECTORY is writable — the agent cannot rewrite the running binary but can replace it for the next launch" ;;
                         *)
-                            skip "~/.local/bin/$_bin is running (ETXTBSY) and ~/.local/bin answered '${_dirv}' — neither the file nor its directory could be established" ;;
+                            skip "$_pfx/bin/$_bin is running (ETXTBSY) and $_pfx/bin answered '${_dirv}' — neither the file nor its directory could be established" ;;
                     esac
                     unset _dirv ;;
-                *) skip "~/.local/bin/$_bin refused an append for an unexpected reason: ${_wdv#OTHER:}" ;;
+                *) skip "$_pfx/bin/$_bin refused an append for an unexpected reason: ${_wdv#OTHER:}" ;;
             esac ;;
     esac
 done
 if [ "$_checked" = 0 ]; then
     if [ "$CAGE" = compute ]; then
-        absent "no husk binaries under ~/.local/bin — the compute cage tmpfs's ~/.local, so confiner integrity is a LOGIN-cage question and was not asked here"
+        absent "no husk binaries under $_pfx/bin — the compute cage masks the home and has no settings.json to name the prefix, so confiner integrity is a LOGIN-cage question and was not asked here"
     else
-        skip "no husk binaries found under ~/.local/bin — cannot verify confiner integrity"
+        skip "no husk binaries found under $_pfx/bin ($_pfx_from) — cannot verify confiner integrity"
     fi
 fi
 

@@ -3,8 +3,14 @@
 # and reverse that merge on uninstall.
 #
 # Usage:
-#   install:    merge-claude-settings.py <settings_path> <apply_seccomp_path> <user_config_path> <manifest_path>
+#   install:    merge-claude-settings.py <settings_path> <apply_seccomp_path> <user_config_path> <manifest_path> <prefix>
 #   uninstall:  merge-claude-settings.py --uninstall <settings_path> <manifest_path>
+#   preview:    merge-claude-settings.py --prefix-adjustments <user_config_path> <prefix>
+#
+# <prefix> is the install prefix. The shipped file is written for ~/.local; for any other
+# prefix the two entries that name it are rewritten — see `prefix_adjust`. --prefix-adjustments
+# prints what that would change and writes nothing, so the installer's confirmation prompt
+# shows the policy the operator is actually agreeing to.
 #
 # THE MANAGED KEYS ARE THE SHIPPED FILE'S TOP-LEVEL KEYS — all of them, and nothing else.
 # Install OVERWRITES each of them wholesale. To make that reversible without disturbing a
@@ -31,10 +37,11 @@
 #     default can never be mistaken for the operator's, and it is the only thing that lets
 #     uninstall tell the two apart.
 #   - Nothing in the manifest may be a copy of husk's ACTIVE POLICY. The manifest lives under
-#     ~/.local, which the shipped `allowRead` carves back out of `denyRead`, so the caged agent
-#     can read it (`H-1`). See `key_digest`.
+#     the install prefix, which `allowRead` carves back out of `denyRead` (the shipped
+#     "~/.local", or <prefix>/lib/husk — `prefix_adjust`), so the caged agent can read it
+#     (`H-1`). See `key_digest`.
 
-import hashlib, json, sys, os, time
+import copy, hashlib, json, sys, os, time
 
 # The declaration. `install()` refuses to run unless the shipped user-config/settings.json
 # has EXACTLY these top-level keys, in both directions — they fail differently and both were
@@ -252,6 +259,96 @@ def change_notes(label, old, new):
     return out
 
 
+# The prefix the shipped user-config/settings.json is written for, and its one entry that NAMES
+# the prefix rather than merely sitting under it. `prefix_adjust` rewrites both for any other
+# prefix; `require_prefix_entries` refuses if the shipped file stops containing them.
+SHIPPED_PREFIX = "~/.local"
+SHIPPED_PREFIX_DENY = "Edit(~/.local/lib/husk/**)"
+
+
+def _canon(path):
+    return os.path.realpath(os.path.expanduser(path))
+
+
+def _within(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def prefix_adjust(policy, prefix):
+    """Rewrite what names the install prefix in `policy`, IN PLACE; return one line per change.
+
+    The shipped policy is written for ~/.local, and two of its entries are about the prefix:
+
+      * `sandbox.filesystem.allowRead` carves "~/.local" back out of `denyRead: ["/users"]`.
+        That is what lets the login cage EXECUTE apply-seccomp (`sandbox.seccomp.applyPath`)
+        and the socat relay, both installed in the prefix. A prefix outside ~/.local is masked
+        with the rest of the home unless it is listed as well, and then the cage cannot start
+        its own commands. So what is added is the TWO DIRECTORIES husk installs into —
+        <prefix>/bin and <prefix>/lib/husk, canonical and absolute — and NOT the prefix. The
+        prefix is the operator's choice of root and can be anything: `--prefix ~` is an
+        ordinary one, and carving out the prefix would then carve out the whole home
+        (~/.ssh, ~/.husk, every credential the denyRead floor exists to mask); `--prefix /`
+        would unmask every home on the machine. What the cage needs is a fixed pair of
+        subdirectories, so that is the whole grant (`P4`: construct what is allowed).
+        "~/.local" stays: Claude Code's own runtime lives in ~/.local/share/claude.
+      * `permissions.deny` holds `Edit(~/.local/lib/husk/**)`, the backstop on the files the
+        broker trusts because the operator wrote them. For another prefix it would guard an
+        empty directory, so it is rewritten to name the real one; `//` makes a permission
+        rule absolute.
+
+    Neither grants write. allowRead is read-only and the cage's writable set is the project
+    directory alone; `husk-verify.sh` measures that, this only asks for it (`P15`). The broker
+    reads the same allowRead for the COMPUTE cage: entries inside a home are refused there
+    like "~/.local" is (the home floor), and ones outside a home are bound read-only into jobs
+    — what the login cage can already read, so the compute cage stays a subset of it.
+
+    The default prefix comes back untouched, so a default install is byte-identical to the
+    shipped file, as every install before --prefix existed was.
+    """
+    p = _canon(prefix)
+    home_local = _canon(SHIPPED_PREFIX)
+    if p == home_local:
+        return []
+    changes = []
+    fs = policy["sandbox"]["filesystem"]
+    if not _within(p, home_local):
+        allow = fs.setdefault("allowRead", [])
+        for sub, why in (("bin", "socat"), ("lib/husk", "apply-seccomp")):
+            d = os.path.join(p, sub)
+            if d not in allow:
+                allow.append(d)
+                changes.append("  sandbox.filesystem.allowRead  + %s   (read-only: the cage "
+                               "runs %s from it)" % (d, why))
+    deny = policy["permissions"]["deny"]
+    rule = "Edit(/%s/lib/husk/**)" % p
+    deny[deny.index(SHIPPED_PREFIX_DENY)] = rule
+    changes.append("  permissions.deny              %s  ->  %s" % (SHIPPED_PREFIX_DENY, rule))
+    return changes
+
+
+def require_prefix_entries(user_config, user_config_path, prefix):
+    """Fail closed if a non-default prefix cannot be applied to the shipped file (`P8`).
+
+    `prefix_adjust` rewrites a literal. If the shipped file stops containing it, rewriting
+    nothing would install a policy whose Edit backstop names the default prefix while husk is
+    somewhere else — quietly. Only husk's own source can trip this, and it trips before
+    anything is written (`P6`).
+    """
+    if _canon(prefix) == _canon(SHIPPED_PREFIX):
+        return
+    deny = (user_config.get("permissions") or {}).get("deny") or []
+    fs = (user_config.get("sandbox") or {}).get("filesystem")
+    if SHIPPED_PREFIX_DENY in deny and isinstance(fs, dict):
+        return
+    print("  [error] %s does not contain the entry husk rewrites for a non-default prefix:"
+          % user_config_path)
+    print("            permissions.deny: %s   (and a sandbox.filesystem block)"
+          % SHIPPED_PREFIX_DENY)
+    print("          scripts/merge-claude-settings.py and the shipped settings file have drifted.")
+    print("          Nothing was written. Install into ~/.local, or fix the two files together.")
+    sys.exit(1)
+
+
 def require_shipped_matches_managed(user_config, user_config_path):
     """Fail closed if the shipped policy file and MANAGED_KEYS have drifted (`C1-3`, `P8`).
 
@@ -363,16 +460,19 @@ def uninstall(settings_path, manifest_path):
     print("  [ok]   %s reverted" % settings_path)
 
 
-def install(settings_path, apply_seccomp, user_config_path, manifest_path):
+def install(settings_path, apply_seccomp, user_config_path, manifest_path, prefix):
     with open(user_config_path) as f:
         user_config = json.load(f)
     require_shipped_matches_managed(user_config, user_config_path)
+    require_prefix_entries(user_config, user_config_path, prefix)
 
-    incoming = dict(user_config)
-    sandbox = dict(user_config["sandbox"])
+    # A deep copy: `prefix_adjust` edits nested lists, and the shipped dict must stay what was read.
+    incoming = copy.deepcopy(user_config)
+    sandbox = incoming["sandbox"]
     if apply_seccomp and os.path.exists(apply_seccomp):
         sandbox["seccomp"] = {"applyPath": apply_seccomp}
-    incoming["sandbox"] = sandbox
+    for line in prefix_adjust(incoming, prefix):
+        print("  [ok]   for the prefix: %s" % line.strip())
 
     existing = {}
     if os.path.exists(settings_path):
@@ -524,6 +624,18 @@ if __name__ == "__main__":
         # three literals kept in step by hand (`P8`). Read-only, writes nothing, exits 0.
         print(" / ".join(MANAGED_KEYS))
         sys.exit(0)
+    if len(sys.argv) >= 2 and sys.argv[1] == "--prefix-adjustments":
+        # For install-husk.sh's confirmation prompt: what the merge WILL change for this prefix,
+        # asked of the code that changes it (`P8`). Writes nothing; prints nothing for ~/.local.
+        if len(sys.argv) != 4:
+            print("usage: merge-claude-settings.py --prefix-adjustments <user_config_path> <prefix>")
+            sys.exit(2)
+        with open(sys.argv[2]) as _f:
+            _cfg = json.load(_f)
+        require_prefix_entries(_cfg, sys.argv[2], sys.argv[3])
+        for _line in prefix_adjust(copy.deepcopy(_cfg), sys.argv[3]):
+            print(_line)
+        sys.exit(0)
     if len(sys.argv) >= 2 and sys.argv[1] in ("-h", "--help"):
         # Print this file's header comment block (single source of truth).
         with open(__file__) as _f:
@@ -535,7 +647,13 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) >= 2 and sys.argv[1] == "--uninstall":
             uninstall(sys.argv[2], sys.argv[3])
+        elif len(sys.argv) == 6:
+            install(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
         else:
-            install(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
+            # The prefix is REQUIRED, not defaulted. A caller that forgot it would get a policy
+            # for ~/.local while husk sits somewhere else, and nothing would say so (`P7`).
+            print("usage: merge-claude-settings.py <settings_path> <apply_seccomp_path> "
+                  "<user_config_path> <manifest_path> <prefix>")
+            sys.exit(2)
     except OSError as e:
         _refuse_on_write_error(e)

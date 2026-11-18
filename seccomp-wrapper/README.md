@@ -502,6 +502,24 @@ make install
 make check
 ```
 
+Two Makefile variables move those paths, and they are separate on purpose — where the
+wrapper is installed and where a hand-built libseccomp lives are different questions:
+
+```bash
+make LIBSECCOMP_PREFIX=/path/to/libseccomp     # headers and libseccomp.a from here
+make install PREFIX=/path/to/husk              # -> /path/to/husk/bin/seccomp-wrapper
+```
+
+Both are read from the command line only, never from the environment, because build tools
+commonly export `PREFIX` and an inherited one would install the wrapper somewhere nobody
+asked for.
+
+`make install` is a development convenience, not how husk is installed. `install-husk.sh`
+installs the arch-tagged `seccomp-wrapper-<arch>` that `build_and_test.sh` produces, and it
+takes `--prefix DIR` itself (see the top-level README, *Install location*). The launcher, the
+compute job guard and every `srun` rank run the `seccomp-wrapper` in husk's own `bin/` by
+absolute path, so a copy you `make install`ed elsewhere is not the one a `husk` session uses.
+
 ## Usage
 
 ```bash

@@ -19,6 +19,22 @@ pub mod build_identity;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+/// The install prefix a husk binary runs from: `<prefix>/bin/<binary>` -> `<prefix>`, the
+/// layout `install-husk.sh` creates (`--prefix DIR`, `~/.local` without it). The ONE
+/// derivation of it (`P8`): the broker finds the srun stub, socat and seccomp-wrapper from it,
+/// and the wrapper finds the directories it must keep out of the agent's writable root.
+pub fn install_prefix(exe: &Path) -> Option<&Path> {
+    exe.parent().and_then(|bin| bin.parent())
+}
+
+/// The directories under an install prefix that hold husk's own code and the operator's
+/// trusted records — the launcher, seccomp-wrapper, the broker pair and socat in `bin`; the
+/// stubs, apply-seccomp, the uninstall manifest and the recorded partition and account in
+/// `lib/husk`. What the agent must never be able to write.
+pub fn confiner_dirs(prefix: &Path) -> [PathBuf; 2] {
+    [prefix.join("bin"), prefix.join("lib").join("husk")]
+}
+
 /// Tier-1 read-only SLURM commands the broker runs on the agent's behalf. Shared
 /// by the broker's `policy` (the authoritative gate) and the wrapper's shadow
 /// list so the two cannot drift. Tier-2 (verb-gated scontrol/sacctmgr/sdiag) is

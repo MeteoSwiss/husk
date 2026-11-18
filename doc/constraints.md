@@ -174,6 +174,26 @@ Absent broker binaries → plain cage, never an unbrokered SLURM path. The insta
 errors rather than silently omitting `seccomp-wrapper`. `SandboxReady` is a witness
 type mintable only by a verified bind, so "we checked" is carried by the type.
 
+### C0.4 — the cage's own code is out of the agent's reach
+defends H7 · **load-bearing** · `P2`, `P15`, `P16`, `P17` · asserted by
+`a_launch_directory_that_reaches_husks_own_code_is_refused` (wrapper), and by effect in
+`husk-verify.sh` §4b
+
+The launch directory is always writable from the login cage, so launching from one that
+contains — or is inside — `<prefix>/bin` or `<prefix>/lib/husk` would let the agent replace
+`husk`, `seccomp-wrapper` or the broker and run as the operator at the next launch.
+`cd ~ && husk` on a default install is that case. `husk-slurm-wrapper` refuses it before any
+resource is acquired; `ConfinerOutOfReach` is the witness, and both exec paths demand it.
+Both sides are canonicalised, so a symlink neither hides an overlap nor invents one; a
+question it cannot answer refuses. **Newly refuses** (`P16`): launches from the home on a
+default install, and from any ancestor of a `--prefix`. Only the operator chooses the launch
+directory; the message names both paths and says to launch from a project directory.
+**Residual:** directories made writable by other means (`permissions.additionalDirectories`,
+an `allowWrite` entry) are not compared. Neither is a binary run outside an install —
+`cargo run` from a checkout derives a prefix whose `bin/` and `lib/husk` do not exist, so the
+checkout's `target/` is not seen as husk's code. Development-only (the operator running it is
+editing husk); `husk-verify.sh` §4b measures the live cage's write disposition regardless.
+
 ---
 
 ## Surface 1 — syscall filtering
@@ -204,6 +224,15 @@ unprivileged `NO_NEW_PRIVS` process has an empty permitted capability set.
 
 Narrows the surface; does not eliminate it. A CVE in `read()` or `openat()` is not
 caught here.
+
+**Resolved by absolute path, not by name** (`P15`). The launcher runs the `seccomp-wrapper` in
+its own `bin/` and refuses if it is missing; the compute job guard and every `srun` rank use
+`<prefix>/bin/seccomp-wrapper` derived from the broker's own location
+(`policy::installed_seccomp_wrapper`), and fall back to PATH — announced in the job log —
+only when the broker was not run from an install. Asserted by the guard harness's PATH decoy,
+`the_guard_uses_the_wrapper_installed_beside_the_broker_and_announces_any_fallback`,
+`the_rank_enters_its_cage_through_the_wrapper_it_is_given_not_paths`, and
+`install-husk.test.sh` §22.
 
 ### C1.2 — `apply-seccomp` (vendored)
 defends H1, H6 · **depth**
@@ -389,12 +418,15 @@ argument, husk is wrong.
 defends H3 · **load-bearing** *given a correctly chosen partition*
 
 Every brokered job is forced onto one partition (`HUSK_SLURM_PARTITION`, recorded at
-install under `~/.local`). It is trusted because the installer writes it **out of the cage**
-and the broker reads it there — **not** because the agent cannot see it. This said
-"agent-inaccessible" until 2026-09-01 and that was never true on CSCS: the shipped
-`allowRead: ["./", "~/.local"]` carves `~/.local` back out of `denyRead: ["/users"]`, so this
-file — and the uninstall manifest beside it, which is how `H-1` was found — is **readable**
-from inside the sandbox and only unwritable. `install-husk.sh` carried the same wrong claim in
+install under the install prefix — `~/.local`, or `install-husk.sh --prefix DIR`). It is
+trusted because the installer writes it **out of the cage** and the broker reads it there —
+**not** because the agent cannot see it. This said "agent-inaccessible" until 2026-09-01 and
+that was never true on CSCS: the shipped `allowRead: ["./", "~/.local"]` carves `~/.local`
+back out of `denyRead: ["/users"]` (for any other prefix the merge adds `<prefix>/bin` and
+`<prefix>/lib/husk` to `allowRead`, so the cage can run `socat` and `apply-seccomp` from them —
+never the prefix itself, which `--prefix ~` would turn into the whole home), so this file — and the
+uninstall manifest beside it, which is how `H-1` was found — is **readable** from inside the
+sandbox and only unwritable. `install-husk.sh` carried the same wrong claim in
 three places; all three were corrected in `8c4109c`, and this was the fourth.
 
 A **preemptible** partition makes the property structural: the job is interrupted by any job

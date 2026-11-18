@@ -78,6 +78,9 @@
 # remediation (`P11`). Both are caught by the same two assertions below: count the refusals,
 # and require the control to come back `honoured`.
 set -uo pipefail
+# Where husk is installed: the installer's record, read by the one helper that states it.
+. "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/husk-prefix.sh"
+husk_find_prefix || true   # an unusable record still yields the default, and says so in _from
 
 PART=""
 while [ $# -gt 0 ]; do
@@ -94,7 +97,7 @@ done
 command -v sbatch >/dev/null 2>&1 || { echo "no sbatch on PATH — run this on a login node" >&2; exit 2; }
 if [ -z "$PART" ]; then
   PART="${HUSK_SLURM_PARTITION:-}"
-  for cfg in "$HOME/.local/lib/husk/slurm-partition"; do
+  for cfg in "$husk_prefix/lib/husk/slurm-partition"; do
     [ -z "$PART" ] && [ -r "$cfg" ] && PART="$(head -n1 "$cfg" | tr -d '[:space:]')"
   done
 fi

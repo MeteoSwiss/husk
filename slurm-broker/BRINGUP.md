@@ -99,7 +99,7 @@ with the Bash tool:
 ```
 echo x >> ~/.claude/settings.json ; echo rc=$?
 echo x >> .claude/settings.local.json ; echo rc=$?
-echo x >> ~/.local/lib/husk/slurm-partition ; echo rc=$?
+echo x >> <prefix>/lib/husk/slurm-partition ; echo rc=$?   # <prefix>: cat ~/.husk/install-prefix (~/.local by default)
 touch ./husk-write-probe ; echo rc=$?     # workspace write MUST still succeed
 ```
 **Pass (you check from outside the sandbox, not from the agent's output):** the three
@@ -179,7 +179,8 @@ sbatch --partition=<site partition> srun-probe.sh
    output by the cage banner. Both the step-broker (the request as parsed, the srun it
    built, any rejection) and the egress proxy append here;
 3. `spool: <UNSET>` in the output means the guard did not bootstrap the pair at all —
-   check that `srun-stub.py` is installed (`$PREFIX/lib/husk/`) and that the broker and
+   check that `srun-stub.py` is installed (`<prefix>/lib/husk/`, the prefix recorded in
+   `~/.husk/install-prefix`) and that the broker and
    wrapper were deployed together.
 
 The job log outlives the job; the step spool does not. The spool is created in the

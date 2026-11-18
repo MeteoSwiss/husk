@@ -241,6 +241,39 @@ fn egress_relay_is_runnable(socat: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The seccomp-wrapper a rank enters its cage through: the one installed beside THIS broker
+/// (`policy::installed_seccomp_wrapper`), checked here, when the step is built (`P3`) — the
+/// same question the guard asks of the job cage, asked by the process that is about to rely
+/// on the answer.
+///
+/// Not there — a broker run from a checkout rather than an install, as `selftest.sh` does by
+/// default — means the bare name, i.e. PATH, which is what every rank used before. That
+/// fallback is announced on every step that takes it (the step broker's stderr is the job
+/// log), never silent (`P7`), and it is never weaker than before this existed.
+fn rank_seccomp_wrapper() -> String {
+    choose_seccomp_wrapper(&crate::policy::installed_seccomp_wrapper())
+}
+
+/// The decision itself, apart from where `installed` came from, so a test can drive it with
+/// paths it owns instead of the process-global derived one.
+fn choose_seccomp_wrapper(installed: &str) -> String {
+    if is_executable_file(installed) {
+        return installed.to_string();
+    }
+    eprintln!(
+        "step-broker: no seccomp-wrapper beside this broker at {installed:?}; this step's \
+         ranks enter their cage through the one on PATH. A broker run from its installed \
+         prefix always uses the wrapper installed with it."
+    );
+    "seccomp-wrapper".to_string()
+}
+
+fn is_executable_file(p: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    !p.is_empty()
+        && fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
 struct Running {
     id: String,
     child: Child,
@@ -633,6 +666,7 @@ impl StepBroker {
                 sock: &e.sock,
                 socat: &e.socat,
             }),
+            &rank_seccomp_wrapper(),
             &step.command,
         ));
 
@@ -885,6 +919,32 @@ fn resolve_slurmd_spool() -> String {
 #[cfg(test)]
 mod tests {
     use crate::settings;
+
+    #[test]
+    fn a_rank_uses_the_wrapper_installed_beside_the_broker_and_falls_back_only_to_path() {
+        // The step broker's half of what the guard does for the job cage: the installed
+        // `<prefix>/bin/seccomp-wrapper` when it is a runnable file HERE, at the moment the
+        // step is built; otherwise the bare name — PATH, the pre-existing behaviour — and
+        // never some third thing. `rank.rs` proves the chosen one is what the rank execs.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("husk-stepwrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("adir")).unwrap();
+        let wrapper = dir.join("seccomp-wrapper");
+        std::fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let w = wrapper.to_string_lossy().to_string();
+
+        assert_eq!(super::choose_seccomp_wrapper(&w), w, "an installed, runnable one is used");
+        let absent = dir.join("absent").to_string_lossy().to_string();
+        assert_eq!(super::choose_seccomp_wrapper(&absent), "seccomp-wrapper", "absent -> PATH");
+        assert_eq!(super::choose_seccomp_wrapper(""), "seccomp-wrapper", "underivable -> PATH");
+        let a_dir = dir.join("adir").to_string_lossy().to_string();
+        assert_eq!(super::choose_seccomp_wrapper(&a_dir), "seccomp-wrapper", "a directory is not one");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(super::choose_seccomp_wrapper(&w), "seccomp-wrapper", "not executable -> PATH");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// `RDF-D-2`: THE ONE TEST THAT IS NOT THE TABLE READING ITSELF.
     ///

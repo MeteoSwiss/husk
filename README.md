@@ -40,6 +40,8 @@ tar xzf husk-v0.5.tar.gz && cd husk-v0.5
 The installer prints exactly what it will add to `~/.claude/settings.json` and asks before
 changing anything. The two flags are recorded in `~/.husk/config.json` on a first install —
 see [below](#slurm-record-the-partition-per-machine) if you need to change them later.
+Everything is installed under `~/.local`; to put it somewhere else, add `--prefix DIR`
+([Install location](#install-location---prefix)).
 
 **3. Use it.** Run `husk` where you would have run `claude`:
 
@@ -67,13 +69,69 @@ must be done separately on each architecture — there is no cross-compilation:
 git clone https://github.com/MeteoSwiss/husk && cd husk
 (cd seccomp-wrapper && ./build_and_test.sh)   # -> seccomp-wrapper-$(uname -m)
 (cd slurm-broker    && ./build-release.sh)    # -> husk-slurm-{broker,wrapper}-$(uname -m)
-./install-husk.sh --slurm-partition <partition> --slurm-account <project>
+./install-husk.sh --slurm-partition <partition> --slurm-account <project>   # [--prefix DIR]
 ```
+
+The build scripts write their binaries into the source tree and install nothing, so the
+destination is chosen once, by the installer's `--prefix` — not at build time.
 
 `make` alone is not a substitute for `build_and_test.sh`: it writes `seccomp-wrapper`, and the
 installer only ever reads `seccomp-wrapper-<arch>`.
 
 </details>
+
+### Install location (`--prefix`)
+
+By default everything husk installs goes into `~/.local/bin` and `~/.local/lib/husk`: the
+`husk` launcher, `seccomp-wrapper`, the SLURM broker and wrapper, the `sbatch`/`srun` stubs,
+and the two dependencies the installer fetches for you — Anthropic's `apply-seccomp`, and
+`socat` when the system has none. To put all of it somewhere else, name the directory once:
+
+```bash
+./install-husk.sh --prefix /path/to/husk --slurm-partition <partition> --slurm-account <project>
+echo 'export PATH="/path/to/husk/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+```
+
+- **The flag is needed once.** The prefix is recorded in `~/.husk/install-prefix`. A later
+  `./install-husk.sh` (an upgrade) reuses it, and `./install-husk.sh --uninstall` removes
+  that install — neither needs `--prefix` again.
+- **Moving an install is uninstall, then install.** While husk is installed, a different
+  `--prefix` is refused: the uninstall manifest that restores your pre-husk
+  `~/.claude/settings.json` lives in the old prefix and is written only once.
+  ```bash
+  ./install-husk.sh --uninstall && ./install-husk.sh --prefix /new/place ...
+  ```
+- **The directory must be usable from a compute node.** It is refused under `/tmp`,
+  `/var/tmp`, `/dev/shm` or `/run` (node-local, so every brokered job would fail), inside
+  the unpacked husk tree, or if it contains anything but letters, digits and `. _ / + -`.
+  Any other directory is accepted; `./slurm-broker/selftest.sh --full` is what proves a job
+  can run from it.
+- **`<prefix>/bin` must be on `PATH`**, so that `husk` runs this install. The installer
+  prints the exact line, and warns if `husk` on your `PATH` is a different install. Past
+  that, PATH no longer decides anything: the launcher, the compute job's cage and every
+  `srun` rank all enter the sandbox through the `seccomp-wrapper` in `<prefix>/bin`, by
+  absolute path. (A broker run from outside an install — `selftest.sh` from a checkout —
+  falls back to the one on PATH, and the job log says so.)
+- **husk refuses to launch from the prefix, from a directory above it, or from inside its
+  `bin/` or `lib/husk/`.** The directory you launch from is the one the agent can write, and
+  those hold the code that builds its cage. On a default install that includes your home:
+  `cd ~ && husk` is refused — launch from a project directory.
+- **The sandbox policy follows the prefix.** Outside `~/.local`, the installer adds
+  `<prefix>/bin` and `<prefix>/lib/husk` — the two directories husk installs into, not the
+  whole prefix — to the sandbox's `allowRead` (read-only: the cage runs `socat` and
+  `apply-seccomp` from them) and points the `Edit(…/lib/husk/**)` deny rule at the prefix. It
+  prints the adjusted lines before asking you to confirm. Compute jobs read the same list:
+  inside your home they stay masked there, like `~/.local`; outside it they are bound into
+  jobs read-only.
+- **Prefer a directory of its own, that only you can write.** Whatever else is in
+  `<prefix>/bin` becomes readable inside the cage too, so `--prefix ~` (which shares `~/bin`
+  with your own scripts) works but shows the agent those scripts as well. And anyone who can
+  write the prefix — or a directory above it, as in a group-writable project store — can
+  replace the binaries husk runs as you; the installer warns when that is the case.
+
+Whatever the prefix, these stay where they are: `~/.claude/settings.json` and
+`~/.claude/skills/husk/` (the only places Claude Code reads them), `~/.husk/` (your SLURM
+config and session logs), and the `claude` CLI itself, which husk does not install.
 
 ### SLURM: record the partition (per machine)
 
@@ -122,8 +180,9 @@ not do it quietly.
 > printing that the file overrides it. Put the value in the file and the ambiguity goes
 > away.
 
-If `~/.local/bin` is not yet on your PATH, add this to `~/.bashrc` or
-`~/.bash_profile`:
+If `~/.local/bin` (or `<prefix>/bin`, with [`--prefix`](#install-location---prefix)) is not
+yet on your PATH, add this to `~/.bashrc` or `~/.bash_profile` — the installer prints the
+line for the prefix it used:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
@@ -143,6 +202,8 @@ added (your other settings are preserved) — run:
 ```bash
 ./install-husk.sh --uninstall
 ```
+
+It removes the install recorded in `~/.husk/install-prefix`, so it needs no `--prefix`.
 
 **Optional — per-project restrictions:** For tighter control over what Claude
 can do within a specific project (network access, MCP servers), copy the
