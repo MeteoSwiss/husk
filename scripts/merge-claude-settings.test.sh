@@ -66,7 +66,10 @@ new_machine() {   # <settings-json-literal>
   S="$D/claude/settings.json"; M="$D/lib/husk/uninstall-manifest.json"
   printf '%s\n' "$1" > "$S"
 }
-install_run()   { python3 "$MERGE" "$S" "$D/apply-seccomp" "${1:-$SHIPPED}" "$M" 2>&1; }
+# The prefix is the default one unless a scenario sets PREFIX_UNDER_TEST, so every scenario
+# written before --prefix existed still drives exactly the install it was written against.
+install_run()   { python3 "$MERGE" "$S" "$D/apply-seccomp" "${1:-$SHIPPED}" "$M" \
+                    "${PREFIX_UNDER_TEST:-$HOME/.local}" 2>&1; }
 uninstall_run() { python3 "$MERGE" --uninstall "$S" "$M" 2>&1; }
 saved_files()   { ls "$D/claude" | grep -c 'husk-replaced' || true; }
 # The path the run PRINTED, not the newest file in the directory: the operator recovers
@@ -280,7 +283,7 @@ json.dump(d, open(sys.argv[2], "w"), indent=2)
 PY
 new_machine '{"model": "opus", "statusLine": {"type": "command", "command": "MY-OWN-STATUSLINE"}}'
 install_run >/dev/null                                   # v0.5: three managed keys
-t="$(python3 "$V6" "$S" "$D/apply-seccomp" "$SHIPPED6" "$M" 2>&1)"   # v0.6 upgrade
+t="$(python3 "$V6" "$S" "$D/apply-seccomp" "$SHIPPED6" "$M" "$HOME/.local" 2>&1)"   # v0.6 upgrade
 check_has   "the new key's arrival is announced"    "$t" "statusLine.command replaced"
 t="$(python3 "$V6" --uninstall "$S" "$M" 2>&1)"
 check_has   "…and uninstall names it among the blocks husk wrote" "$t" "statusLine"
@@ -297,7 +300,7 @@ new_machine '{"model": "opus"}'
 install_run >/dev/null
 rm -f "$M"
 : > "$D/apply-seccomp-moved"
-t="$(python3 "$MERGE" "$S" "$D/apply-seccomp-moved" "$SHIPPED" "$M" 2>&1)"
+t="$(python3 "$MERGE" "$S" "$D/apply-seccomp-moved" "$SHIPPED" "$M" "$HOME/.local" 2>&1)"
 check_lacks "no [note] about a replacement nobody made"  "$t" "husk did not write what it just replaced"
 check_lacks "…and no empty note block either"            "$t" "[note]"
 check_eq    "…and no backup file of husk's own path"   0 "$(saved_files)"
@@ -369,6 +372,109 @@ check_eq    "…and the verbatim copy is gone from the manifest" "absent" \
             "$(jq_py "$M" 'import json,sys;print("installed" in json.load(open(sys.argv[1])) and "present" or "absent")')"
 check_eq    "…replaced by digests"                  "present" \
             "$(jq_py "$M" 'import json,sys;print("installed_sha256" in json.load(open(sys.argv[1])) and "present" or "absent")')"
+
+echo "-- 17. --prefix: the DEFAULT prefix installs the shipped policy, byte for byte --"
+# Every install before --prefix existed. The only machine-computed difference is applyPath.
+new_machine '{"model": "opus"}'
+install_run >/dev/null
+check_eq    "managed keys == the shipped file + applyPath, nothing else" "same" \
+            "$(python3 - "$S" "$SHIPPED" "$D/apply-seccomp" <<'PY'
+import json, sys
+got = json.load(open(sys.argv[1])); want = json.load(open(sys.argv[2]))
+want["sandbox"]["seccomp"] = {"applyPath": sys.argv[3]}
+print("same" if all(got[k] == want[k] for k in want) else "differs")
+PY
+)"
+check_eq    "…and the preview says there is nothing to adjust" "" \
+            "$(python3 "$MERGE" --prefix-adjustments "$SHIPPED" "$HOME/.local")"
+
+echo "-- 18. --prefix outside ~/.local: the cage can READ it, the Edit backstop names it --"
+# Without the allowRead entry a prefix under /users is masked with the rest of the home, and
+# the login cage can no longer execute apply-seccomp or the socat relay installed there.
+mkdir -p "$TMP/opt/husk"
+PFX_CANON="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$TMP/opt/husk")"
+new_machine '{"model": "opus"}'
+t="$(PREFIX_UNDER_TEST="$TMP/opt/husk" install_run)"
+policy() { python3 - "$S" "$1" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1]))
+fs, deny = s["sandbox"]["filesystem"], s["permissions"]["deny"]
+print({"allowRead": json.dumps(fs["allowRead"]), "allowWrite": json.dumps(fs["allowWrite"]),
+       "edit": json.dumps([d for d in deny if "lib/husk" in d])}[sys.argv[2]])
+PY
+}
+check_eq    "allowRead gains the two install dirs, and keeps ~/.local (Claude's runtime)" \
+            "[\"./\", \"~/.local\", \"$PFX_CANON/bin\", \"$PFX_CANON/lib/husk\"]" "$(policy allowRead)"
+check_eq    "the Edit backstop is rewritten to the real prefix, absolute (//)" \
+            "[\"Edit(/$PFX_CANON/lib/husk/**)\"]" "$(policy edit)"
+check_eq    "…and nothing gains write"                "[]" "$(policy allowWrite)"
+check_has   "the run says what it changed for the prefix" "$t" "for the prefix: sandbox.filesystem.allowRead"
+check_eq    "the preview names the same three changes the install made" "3" \
+            "$(python3 "$MERGE" --prefix-adjustments "$SHIPPED" "$TMP/opt/husk" | grep -c .)"
+t="$(PREFIX_UNDER_TEST="$TMP/opt/husk" install_run)"
+check_lacks "a re-install at the same prefix replaces nothing of the operator's" \
+            "$t" "husk did not write what it just replaced"
+check_eq    "…and saves no backup of husk's own prefix entries" 0 "$(saved_files)"
+
+echo "-- 18b. REVIEW FINDING: the grant is the install dirs, NEVER the prefix itself --"
+# `--prefix ~` is an ordinary choice. Granting the prefix would carve the whole home back out of
+# denyRead — ~/.ssh, ~/.husk, every credential the floor masks — and `--prefix /` every home
+# on the machine. Here a stand-in home holds a secret beside the two install dirs.
+FAKEHOME="$TMP/fakehome"; mkdir -p "$FAKEHOME/.ssh"
+FH_CANON="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$FAKEHOME")"
+new_machine '{"model": "opus"}'
+PREFIX_UNDER_TEST="$FAKEHOME" install_run >/dev/null
+check_eq    "the prefix itself is not in allowRead"   "absent" \
+            "$(python3 - "$S" "$FH_CANON" <<'PY2'
+import json, sys
+a = json.load(open(sys.argv[1]))["sandbox"]["filesystem"]["allowRead"]
+print("PRESENT" if sys.argv[2] in a or sys.argv[2] + "/" in a else "absent")
+PY2
+)"
+check_eq    "…and nothing granted covers the secret beside the install dirs" "covered by nothing" \
+            "$(python3 - "$S" "$FH_CANON/.ssh/id_rsa" <<'PY2'
+import json, os, sys
+a = json.load(open(sys.argv[1]))["sandbox"]["filesystem"]["allowRead"]
+t = sys.argv[2]
+hit = [x for x in a if x.startswith("/") and (t == x or t.startswith(x.rstrip("/") + "/"))]
+print("covered by " + ", ".join(hit) if hit else "covered by nothing")
+PY2
+)"
+
+echo "-- 19. --prefix UNDER ~/.local: already readable, but the backstop still moves --"
+new_machine '{"model": "opus"}'
+PREFIX_UNDER_TEST="$HOME/.local/opt/husk" install_run >/dev/null
+UNDER_CANON="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$HOME/.local/opt/husk")"
+check_eq    "no allowRead entry: ~/.local already carves it out" '["./", "~/.local"]' "$(policy allowRead)"
+check_eq    "the Edit backstop names the real prefix"  "[\"Edit(/$UNDER_CANON/lib/husk/**)\"]" "$(policy edit)"
+
+echo "-- 20. a shipped file without the entry husk rewrites: refused, nothing written --"
+DRIFT="$TMP/shipped-drift.json"
+python3 - "$SHIPPED" "$DRIFT" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["permissions"]["deny"] = [x for x in d["permissions"]["deny"] if "lib/husk" not in x]
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+new_machine '{"model": "opus"}'
+before="$(cat "$S")"
+t="$(PREFIX_UNDER_TEST="$TMP/opt/husk" install_run "$DRIFT")"; rc=$?
+check_eq    "exit 1"                                  1 "$rc"
+check_has   "an attributed error naming the entry"    "$t" "Edit(~/.local/lib/husk/**)"
+check_lacks "…not a ValueError from list.index"       "$t" "Traceback"
+check_eq    "…and the settings file is untouched"     "$before" "$(cat "$S")"
+t="$(python3 "$MERGE" --prefix-adjustments "$DRIFT" "$TMP/opt/husk")"; rc=$?
+check_eq    "the preview refuses the same way"        1 "$rc"
+install_run "$DRIFT" >/dev/null; rc=$?
+check_eq    "the DEFAULT prefix still installs from it (it rewrites nothing)" 0 "$rc"
+
+echo "-- 21. the prefix is required, not defaulted --"
+# A caller that forgot it would get a ~/.local policy while husk sits elsewhere, in silence.
+new_machine '{"model": "opus"}'
+before="$(cat "$S")"
+t="$(python3 "$MERGE" "$S" "$D/apply-seccomp" "$SHIPPED" "$M" 2>&1)"; rc=$?
+check_eq    "four arguments is a usage error"         2 "$rc"
+check_eq    "…and writes nothing"                     "$before" "$(cat "$S")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

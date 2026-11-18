@@ -389,12 +389,15 @@ argument, husk is wrong.
 defends H3 · **load-bearing** *given a correctly chosen partition*
 
 Every brokered job is forced onto one partition (`HUSK_SLURM_PARTITION`, recorded at
-install under `~/.local`). It is trusted because the installer writes it **out of the cage**
-and the broker reads it there — **not** because the agent cannot see it. This said
-"agent-inaccessible" until 2026-09-01 and that was never true on CSCS: the shipped
-`allowRead: ["./", "~/.local"]` carves `~/.local` back out of `denyRead: ["/users"]`, so this
-file — and the uninstall manifest beside it, which is how `H-1` was found — is **readable**
-from inside the sandbox and only unwritable. `install-husk.sh` carried the same wrong claim in
+install under the install prefix — `~/.local`, or `install-husk.sh --prefix DIR`). It is
+trusted because the installer writes it **out of the cage** and the broker reads it there —
+**not** because the agent cannot see it. This said "agent-inaccessible" until 2026-09-01 and
+that was never true on CSCS: the shipped `allowRead: ["./", "~/.local"]` carves `~/.local`
+back out of `denyRead: ["/users"]` (for any other prefix the merge adds `<prefix>/bin` and
+`<prefix>/lib/husk` to `allowRead`, so the cage can run `socat` and `apply-seccomp` from them —
+never the prefix itself, which `--prefix ~` would turn into the whole home), so this file — and the
+uninstall manifest beside it, which is how `H-1` was found — is **readable** from inside the
+sandbox and only unwritable. `install-husk.sh` carried the same wrong claim in
 three places; all three were corrected in `8c4109c`, and this was the fourth.
 
 A **preemptible** partition makes the property structural: the job is interrupted by any job

@@ -110,6 +110,9 @@
 #   There is deliberately no exit code meaning "husk and slurmd disagree". This script does
 #   not know husk's table and must never appear to have an opinion about it.
 set -uo pipefail
+# Where husk is installed: the installer's record, read by the one helper that states it.
+. "$(cd "$(dirname "$(readlink -f "$0")")" && pwd)/husk-prefix.sh"
+husk_find_prefix || true   # an unusable record still yields the default, and says so in _from
 
 TAB=$(printf '\t')
 ACCOUNT=""; PARTITION=""; BASE=""; ART=""; MAXJOBS=20; ONLY=""
@@ -184,16 +187,16 @@ SBATCH_VERSION=$(timeout 15 sbatch --version </dev/null 2>&1 | head -1)
 ACCT_SRC="--account"; PART_SRC="--partition"
 if [ -z "$ACCOUNT" ]; then
   ACCOUNT="${HUSK_SLURM_ACCOUNT:-}"; ACCT_SRC="HUSK_SLURM_ACCOUNT"
-  if [ -z "$ACCOUNT" ] && [ -r "$HOME/.local/lib/husk/slurm-account" ]; then
-    ACCOUNT="$(head -n1 "$HOME/.local/lib/husk/slurm-account" | tr -d '[:space:]')"
-    ACCT_SRC="$HOME/.local/lib/husk/slurm-account"
+  if [ -z "$ACCOUNT" ] && [ -r "$husk_prefix/lib/husk/slurm-account" ]; then
+    ACCOUNT="$(head -n1 "$husk_prefix/lib/husk/slurm-account" | tr -d '[:space:]')"
+    ACCT_SRC="$husk_prefix/lib/husk/slurm-account (prefix from $husk_prefix_from)"
   fi
 fi
 if [ -z "$PARTITION" ]; then
   PARTITION="${HUSK_SLURM_PARTITION:-}"; PART_SRC="HUSK_SLURM_PARTITION"
-  if [ -z "$PARTITION" ] && [ -r "$HOME/.local/lib/husk/slurm-partition" ]; then
-    PARTITION="$(head -n1 "$HOME/.local/lib/husk/slurm-partition" | cut -d, -f1 | tr -d '[:space:]')"
-    PART_SRC="$HOME/.local/lib/husk/slurm-partition"
+  if [ -z "$PARTITION" ] && [ -r "$husk_prefix/lib/husk/slurm-partition" ]; then
+    PARTITION="$(head -n1 "$husk_prefix/lib/husk/slurm-partition" | cut -d, -f1 | tr -d '[:space:]')"
+    PART_SRC="$husk_prefix/lib/husk/slurm-partition (prefix from $husk_prefix_from)"
   fi
 fi
 # Both are REQUIRED and neither is guessed. A wrong one refuses every submission, which is

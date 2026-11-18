@@ -288,5 +288,190 @@ check_lacks "…rather than hardcoding the three names"    "$banner" "enableAllP
 check_has   "…and the merge script answers that question" \
             "$(python3 "$MERGE_PY" --managed-keys)" "enableAllProjectMcpServers / sandbox / permissions"
 
+# ── --prefix: where the install goes, and what may refuse it ──────────────────────────────
+# The REAL functions, extracted by name, driven against a throwaway $HOME. Each scenario is a
+# machine state (record present or not, an older install at ~/.local or not) and one command
+# line. Node-local roots are passed in, because on a Linux test host mktemp lives under /tmp —
+# the one directory the production list has to refuse.
+PFX_FNS=""
+for fn in husk_canon husk_path_within husk_installed_at husk_settings_prefix husk_prefix_others_can_write husk_prefix_validate \
+          husk_prefix_choose husk_prefix_for_uninstall husk_write_prefix_record; do
+  body="$(extract "$fn")"
+  [[ -n "$body" ]] || { echo "FAIL: $fn() not found at top level in $SRC — nothing was tested"; exit 1; }
+  PFX_FNS+="$body"$'\n'
+done
+HELPER="$(cd "$(dirname "$SRC")" && pwd)/slurm-broker/husk-prefix.sh"   # absolute: scenarios cd
+[[ -f "$HELPER" ]] || { echo "FAIL: $HELPER not found — nothing was tested"; exit 1; }
+check_eq() { # description want got
+  if [[ "$3" == "$2" ]]; then pass=$((pass+1)); printf '  ok    %s\n' "$1"
+  else fail=$((fail+1)); printf '  FAIL  %s\n        want: %s\n        got:  %s\n' "$1" "$2" "$3"; fi
+}
+canon() { python3 -c 'import os,sys;print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$1"; }
+
+# <fn> <home> <tree> <given> <arg> [node-local root...] -> rc=, prefix=, from=, then the transcript
+pfx() {
+  local fn="$1" home="$2" tree="$3"; shift 3
+  HOME="$home" SCRIPT_DIR_EARLY="$tree" "$BASH_BIN" -c '
+    set -uo pipefail; . "$1"; eval "$2"; fn="$3"; shift 3
+    given="$1" arg="$2"; shift 2
+    HUSK_NODE_LOCAL_ROOTS=("$@")
+    rc=0; out="$("$fn" "$given" "$arg")" || rc=$?
+    printf "rc=%s\nprefix=%s\nfrom=%s\n%s\n" "$rc" "${PREFIX:-}" "${PREFIX_FROM:-}" "$out"
+    # husk_prefix_choose sets PREFIX in a subshell above; ask again to READ it.
+    [ "$rc" = 0 ] && { "$fn" "$given" "$arg" >/dev/null; printf "PREFIX=%s\nFROM=%s\n" "$PREFIX" "$PREFIX_FROM"; }
+  ' _ "$HELPER" "$PFX_FNS" "$fn" "$@"
+}
+choose()    { pfx husk_prefix_choose "$@"; }
+uninstall() { pfx husk_prefix_for_uninstall "$@"; }
+
+H="$TMP/home1"; TREE="$TMP/husk-tree"; mkdir -p "$H" "$TREE" "$TMP/opt" "$TMP/nodelocal"
+REC="$H/.husk/install-prefix"
+NL="$TMP/nodelocal"
+
+echo "-- 14. --prefix: no flag, no record — the default, spelled as it always was --"
+t="$(choose "$H" "$TREE" 0 "" "$NL")"
+check_has   "accepted"                                   "$t" "rc=0"
+check_has   "PREFIX is the literal \$HOME/.local"        "$t" "PREFIX=$H/.local"
+check_has   "…and says it is the default"                "$t" "FROM=the default"
+
+echo "-- 15. --prefix DIR is canonicalised, and ~ is expanded when the shell did not --"
+t="$(choose "$H" "$TREE" 1 "$TMP/opt/./a/" "$NL")"
+check_has   "canonical absolute path"                    "$t" "PREFIX=$(canon "$TMP/opt/a")"
+check_has   "…attributed to the flag"                    "$t" "FROM=--prefix"
+t="$(choose "$H" "$TREE" 1 "~/tools/husk" "$NL")"
+check_has   "a literal ~ (zsh --prefix=~/x) lands under HOME" "$t" "PREFIX=$(canon "$H/tools/husk")"
+t="$(cd "$TMP/opt" && choose "$H" "$TREE" 1 "rel/husk" "$NL")"
+check_has   "a relative path is resolved against the cwd" "$t" "PREFIX=$(canon "$TMP/opt/rel/husk")"
+t="$(choose "$H" "$TREE" 1 "$H/.local" "$NL")"
+check_has   "--prefix ~/.local IS the default, spelled the default way" "$t" "PREFIX=$H/.local"
+
+echo "-- 16. --prefix values husk could install into but not run from are refused --"
+for bad in "$TMP/opt/a:b" "$TMP/opt/a b" "$TMP/opt/a*" "$TMP/opt/a[1]" "$TMP/opt/a\$x"; do
+  t="$(choose "$H" "$TREE" 1 "$bad" "$NL")"
+  check_has "refused: '${bad##*/}'"                      "$t" "rc=1"
+  check_has "…naming the characters rule"                "$t" "contains characters husk will not install under"
+done
+t="$(choose "$H" "$TREE" 1 "$TMP/opt/a"$'\n'"b" "$NL")"
+check_has   "refused: an embedded newline"               "$t" "rc=1"
+t="$(choose "$H" "$TREE" 1 "$NL/husk" "$NL")"
+check_has   "refused: under a node-local root"           "$t" "rc=1"
+check_has   "…saying compute nodes cannot see it"        "$t" "local to each node"
+t="$(choose "$H" "$TREE" 1 "$NL" "$NL")"
+check_has   "refused: the node-local root itself"        "$t" "local to each node"
+t="$(choose "$H" "$TREE" 1 "$TREE/install" "$NL")"
+check_has   "refused: inside the tree being installed from" "$t" "inside the husk tree"
+t="$(choose "$H" "$TREE" 1 "" "$NL")"
+check_has   "refused: --prefix with no directory"        "$t" "--prefix needs a directory"
+check_has   "…rather than quietly meaning the default"   "$t" "rc=1"
+check_has   "the production list names the four node-local roots" \
+            "$(grep '^HUSK_NODE_LOCAL_ROOTS=' "$SRC")" "(/tmp /var/tmp /dev/shm /run)"
+
+echo "-- 16b. REVIEW FINDING: a prefix other users can write is WARNED about, not refused --"
+H6="$TMP/home6"; mkdir -p "$H6" "$TMP/shared/proj" "$TMP/mine"
+chmod 775 "$TMP/shared"; chmod 755 "$TMP/shared/proj" "$TMP/mine"
+t="$(choose "$H6" "$TREE" 1 "$TMP/shared/proj/husk" "$NL")"
+check_has   "accepted"                                   "$t" "rc=0"
+check_has   "…with a warning"                            "$t" "other users can write here"
+check_has   "…naming the writable ANCESTOR, not only the prefix" "$t" "$(canon "$TMP/shared")"
+t="$(choose "$H6" "$TREE" 1 "$TMP/mine/husk" "$NL")"
+check_lacks "a directory only the operator can write is silent" "$t" "other users can write"
+chmod 1777 "$TMP/shared"
+t="$(choose "$H6" "$TREE" 1 "$TMP/shared/proj/husk" "$NL")"
+check_lacks "a sticky world-writable parent cannot have entries replaced" "$t" "other users can write"
+chmod 755 "$TMP/shared"
+
+echo "-- 17. the record makes the prefix a property of the machine --"
+HOME="$H" "$BASH_BIN" -c ". '$HELPER'; $(extract husk_write_prefix_record); husk_write_prefix_record '$TMP/opt/a'"
+check_eq    "the record holds the prefix, one line"      "$TMP/opt/a" "$(cat "$REC")"
+check_eq    "…and no temp file is left beside it"        "install-prefix" "$(ls "$H/.husk")"
+t="$(choose "$H" "$TREE" 0 "" "$NL")"
+check_has   "an upgrade with no flag reuses the recorded prefix" "$t" "PREFIX=$(canon "$TMP/opt/a")"
+check_has   "…and says where it came from"               "$t" "FROM=recorded in $REC"
+t="$(choose "$H" "$TREE" 1 "$TMP/opt/a/" "$NL")"
+check_has   "the same prefix spelled differently is not a move" "$t" "rc=0"
+
+echo "-- 18. a --prefix that MOVES the install is refused until it is uninstalled --"
+t="$(choose "$H" "$TREE" 1 "$TMP/opt/b" "$NL")"
+check_has   "refused"                                    "$t" "rc=1"
+check_has   "…naming both prefixes"                      "$t" "already installed under $TMP/opt/a"
+check_has   "…and the command that unblocks it"          "$t" "--uninstall"
+t="$(choose "$H" "$TREE" 1 "$H/.local" "$NL")"
+check_has   "moving back to the default is a move too"   "$t" "rc=1"
+t="$(choose "$H" "$TREE" 1 "$TMP/opt/b:c" "$NL")"
+check_has   "a bad --prefix is reported as BAD before it is reported as a move" \
+            "$t" "contains characters"
+check_lacks "…so nobody uninstalls to make room for a prefix that would be refused" \
+            "$t" "already installed under"
+
+echo "-- 19. an install made before the record existed is found at ~/.local --"
+H2="$TMP/home2"; mkdir -p "$H2/.local/lib/husk"
+: > "$H2/.local/lib/husk/uninstall-manifest.json"
+t="$(choose "$H2" "$TREE" 1 "$TMP/opt/c" "$NL")"
+check_has   "a --prefix elsewhere is a move, and refused" "$t" "already installed under $H2/.local"
+t="$(choose "$H2" "$TREE" 0 "" "$NL")"
+check_has   "…while a plain re-install upgrades it in place" "$t" "PREFIX=$H2/.local"
+
+echo "-- 19b. REVIEW FINDING: a lost record is not a lost install — the policy in force says where --"
+# Without this, deleting ~/.husk (or a record that never got written) plus a --prefix elsewhere
+# writes a SECOND manifest that records husk's own settings as the operator's.
+H5="$TMP/home5"; mkdir -p "$H5/.claude"
+printf '{"sandbox": {"seccomp": {"applyPath": "%s/lib/husk/apply-seccomp"}}}\n' "$TMP/opt/e" \
+  > "$H5/.claude/settings.json"
+t="$(choose "$H5" "$TREE" 1 "$TMP/opt/f" "$NL")"
+check_has   "a --prefix elsewhere is refused as a move"  "$t" "already installed under $TMP/opt/e"
+t="$(choose "$H5" "$TREE" 0 "" "$NL")"
+check_has   "a plain re-install upgrades the witnessed install in place" "$t" "PREFIX=$(canon "$TMP/opt/e")"
+check_has   "…and says how it knew"                      "$t" "sandbox.seccomp.applyPath"
+t="$(uninstall "$H5" "$TREE" 0 "")"
+check_has   "--uninstall finds it the same way"          "$t" "PREFIX=$TMP/opt/e"
+printf '{"sandbox": {"seccomp": {"applyPath": "/opt/other/apply-seccomp"}}}\n' > "$H5/.claude/settings.json"
+t="$(choose "$H5" "$TREE" 0 "" "$NL")"
+check_has   "an applyPath not in husk's layout is not a witness" "$t" "PREFIX=$H5/.local"
+
+echo "-- 20. a record that does not name a directory is a refusal, not a guess --"
+H3="$TMP/home3"; mkdir -p "$H3/.husk"; echo "relative/path" > "$H3/.husk/install-prefix"
+t="$(choose "$H3" "$TREE" 0 "" "$NL")"
+check_has   "install refuses"                            "$t" "rc=1"
+check_has   "…naming the file"                           "$t" "$H3/.husk/install-prefix exists but"
+t="$(uninstall "$H3" "$TREE" 0 "")"
+check_has   "uninstall refuses without --prefix"         "$t" "rc=1"
+t="$(uninstall "$H3" "$TREE" 1 "$TMP/opt/a")"
+check_has   "…and --prefix is how to name it"            "$t" "PREFIX=$(canon "$TMP/opt/a")"
+
+echo "-- 21. --uninstall FOLLOWS the record --"
+t="$(uninstall "$H" "$TREE" 0 "")"
+check_has   "the recorded prefix, with no flag"          "$t" "PREFIX=$TMP/opt/a"
+t="$(uninstall "$H" "$TREE" 1 "$TMP/opt/b")"
+check_has   "a --prefix that disagrees with the record is refused" "$t" "rc=1"
+check_has   "…saying which install it would remove"      "$t" "recorded as installed under $TMP/opt/a"
+H4="$TMP/home4"; mkdir -p "$H4"
+t="$(uninstall "$H4" "$TREE" 0 "")"
+check_has   "no record: the default"                     "$t" "PREFIX=$H4/.local"
+t="$(uninstall "$H4" "$TREE" 1 "$TMP/opt/d")"
+check_has   "no record: --prefix names a lost install"   "$t" "PREFIX=$(canon "$TMP/opt/d")"
+banner="$(sed -n '/Uninstall mode/,/^fi$/p' "$SRC")"
+check_has   "the record is deleted by the uninstall"     "$banner" 'rm -f "$PREFIX_RECORD"'
+
+echo "-- 22. the launcher runs the seccomp-wrapper INSTALLED BESIDE IT, not PATH's --"
+# A decoy earlier on PATH is the old ~/.local install beside a --prefix one. The fake
+# husk-slurm-wrapper prints the argv it was handed, which is the object the launcher chose.
+LAUNCHER_SRC="$(sed -n "/<<'LAUNCHER'\$/,/^LAUNCHER\$/p" "$SRC" | sed '1d;$d')"
+[[ -n "$LAUNCHER_SRC" ]] || { echo "FAIL: the launcher heredoc was not found in $SRC"; exit 1; }
+LP="$TMP/lprefix"; mkdir -p "$LP/bin" "$TMP/decoy"
+printf '%s\n' "$LAUNCHER_SRC" > "$LP/bin/husk"; chmod 755 "$LP/bin/husk"
+printf '#!/bin/sh\nfor a in "$@"; do printf "arg=%%s\\n" "$a"; done\n' > "$LP/bin/husk-slurm-wrapper"
+chmod 755 "$LP/bin/husk-slurm-wrapper"
+present "$LP/bin/seccomp-wrapper"; present "$TMP/decoy/seccomp-wrapper"; present "$TMP/decoy/claude"
+t="$(HOME="$H4" PATH="$TMP/decoy:/usr/bin:/bin" "$LP/bin/husk" --resume 2>&1)"
+check_has   "the agent command is the sibling, by absolute path" \
+            "$t" "arg=$(canon "$LP/bin")/seccomp-wrapper"
+check_lacks "…never the bare name PATH would resolve"   "$t" "arg=seccomp-wrapper"
+check_has   "…and the operator's own arguments still arrive" "$t" "arg=--resume"
+rm -f "$LP/bin/seccomp-wrapper"
+t="$(HOME="$H4" PATH="$TMP/decoy:/usr/bin:/bin" "$LP/bin/husk" 2>&1)"; rc=$?
+check_eq    "a missing sibling is a refusal"             1 "$rc"
+check_has   "…that says what is missing and where"       "$t" "expected at: $(canon "$LP/bin")/seccomp-wrapper"
+check_lacks "…and does not fall back to the decoy"       "$t" "arg="
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -41,6 +41,9 @@ set -uo pipefail   # NOT -e: run every check and tally, don't abort on first fai
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 REPO="$(dirname "$HERE")"
+# Where husk is installed: the installer's record, read by the one helper that states it.
+. "$HERE/husk-prefix.sh"
+husk_find_prefix || true   # an unusable record still yields the default, and says so in _from
 
 # ---- args ---------------------------------------------------------------------
 MODE=policy
@@ -268,10 +271,10 @@ else
   # say WHICH refusal it saw — so the nine that go red name the partition message rather than
   # looking like nine independent regressions (`P11`).
   check FAIL policy rig.config_source \
-    "the broker under test could not answer --print-config, so this rig does not know the site policy it is about to assert. Falling back to HUSK_SLURM_PARTITION / the install-time file / 'preemptible' — every partition-dependent arm below is now testing a GUESS. broker=$BROKER stderr=$(head -c 120 "$CFG_ERRF" 2>/dev/null | tr '\n' ' ')"
+    "the broker under test could not answer --print-config, so this rig does not know the site policy it is about to assert. Falling back to HUSK_SLURM_PARTITION / the install-time file under $husk_prefix ($husk_prefix_from) / 'preemptible' — every partition-dependent arm below is now testing a GUESS. broker=$BROKER stderr=$(head -c 120 "$CFG_ERRF" 2>/dev/null | tr '\n' ' ')"
   PART="${HUSK_SLURM_PARTITION:-}"
   if [ -z "$PART" ]; then
-    for cfg in "$HOME/.local/lib/husk/slurm-partition" "$HERE/../lib/husk/slurm-partition"; do
+    for cfg in "$husk_prefix/lib/husk/slurm-partition" "$HERE/../lib/husk/slurm-partition"; do
       if [ -r "$cfg" ]; then
         PART="$(head -n1 "$cfg" | tr -d '[:space:]')"
         [ -n "$PART" ] && break
@@ -294,7 +297,7 @@ PART="$(printf '%s' "$PART" | tr -d '[:space:]')"
 ACCT="$ACCT_CFG"
 [ -z "$ACCT" ] && ACCT="${HUSK_SLURM_ACCOUNT:-}"
 if [ -z "$ACCT" ]; then
-  for cfg in "$HOME/.local/lib/husk/slurm-account" "$HERE/../lib/husk/slurm-account"; do
+  for cfg in "$husk_prefix/lib/husk/slurm-account" "$HERE/../lib/husk/slurm-account"; do
     if [ -r "$cfg" ]; then
       ACCT="$(head -n1 "$cfg" | tr -d '[:space:]')"
       [ -n "$ACCT" ] && break
@@ -1038,12 +1041,12 @@ run_live_probe() {
   local qr=""; [ "$queued" != 0 ] && qr="$(queue_reason "$jid")"
   # Ask SLURM why, so a failure is self-diagnosing instead of a guess. Exit 127 from
   # the batch step means the guard's `seccomp-wrapper bwrap ...` was not found on the
-  # compute node — i.e. husk is not installed there, or ~/.local/bin is not on the PATH
+  # compute node — i.e. husk is not installed there, or <prefix>/bin is not on the PATH
   # that --export=ALL carried over.
   local acct hint=""
   acct="$(sacct -j "$jid" -X -n -P -o State,ExitCode 2>/dev/null | head -1)"
   case "$acct" in
-    *"|127:"*) hint=" [$acct — 127 = command not found: is seccomp-wrapper installed and on PATH on the compute node? run install-husk.sh]" ;;
+    *"|127:"*) hint=" [$acct — 127 = command not found: is seccomp-wrapper installed and on PATH on the compute node? $husk_prefix/bin must be on the PATH husk is launched with; run install-husk.sh]" ;;
     ?*)        hint=" [$acct]" ;;
   esac
 

@@ -2,20 +2,33 @@
 #
 # Requirements:
 #   libseccomp — either system-installed (apt install libseccomp-dev) or
-#                built from source into ~/.local (see README.md)
+#                built from source into ~/.local (see README.md); elsewhere, say where:
+#                make LIBSECCOMP_PREFIX=/path/to/libseccomp
 #
 # Targets:
 #   make            — build the wrapper binary
-#   make install    — copy to ~/.local/bin
+#   make install    — copy to $(PREFIX)/bin (~/.local/bin; make install PREFIX=DIR)
+#                     NOT how husk is installed: install-husk.sh reads the arch-tagged
+#                     binary build_and_test.sh writes, and takes --prefix itself
 #   make check      — compile and run the smoke tests
 #   make clean      — remove build artifacts (probe binaries AND staged wrappers)
 #   make clean-tests   — remove ONLY the probe binaries
 #   make clean-staged  — remove ONLY this arch's staged wrapper binaries
 
+# Two knobs, because they are two questions: where `make install` puts the wrapper, and where
+# a hand-built libseccomp lives. They coincide only when both are ~/.local.
+#
+# Plain `=`, not `?=`. `?=` yields to the ENVIRONMENT, and PREFIX is a variable build tools
+# export (conda-build, spack and friends set it) — an inherited one would install the wrapper
+# somewhere nobody asked for, in silence. The same lesson as ARCH below (`RB-6`). The command
+# line still wins: `make install PREFIX=DIR`.
+PREFIX            = $(HOME)/.local
+LIBSECCOMP_PREFIX = $(HOME)/.local
+
 CC          = gcc
 CFLAGS      = -static -O2 -Wall -Wextra -Wpedantic -std=c11 \
-              -I$(HOME)/.local/include
-LDFLAGS     = -L$(HOME)/.local/lib -lseccomp
+              -I$(LIBSECCOMP_PREFIX)/include
+LDFLAGS     = -L$(LIBSECCOMP_PREFIX)/lib -lseccomp
 CFLAGS_TEST = -O2 -Wall -Wextra -Wpedantic -std=c11
 
 TARGET           = seccomp-wrapper
@@ -60,7 +73,8 @@ $(TEST_IO_URING): test/test_io_uring.c
 	$(CC) $(CFLAGS_TEST) -o $@ $<
 
 install: $(TARGET)
-	install -m 0755 $(TARGET) $(HOME)/.local/bin/$(TARGET)
+	install -d $(PREFIX)/bin
+	install -m 0755 $(TARGET) $(PREFIX)/bin/$(TARGET)
 
 # The smoke suite's argument list lives HERE and nowhere else. build_and_test.sh
 # calls `check-tests WRAPPER=<staged binary>` instead of repeating it — a second copy
