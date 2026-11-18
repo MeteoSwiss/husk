@@ -189,7 +189,10 @@ question it cannot answer refuses. **Newly refuses** (`P16`): launches from the 
 default install, and from any ancestor of a `--prefix`. Only the operator chooses the launch
 directory; the message names both paths and says to launch from a project directory.
 **Residual:** directories made writable by other means (`permissions.additionalDirectories`,
-an `allowWrite` entry) are not compared.
+an `allowWrite` entry) are not compared. Neither is a binary run outside an install —
+`cargo run` from a checkout derives a prefix whose `bin/` and `lib/husk` do not exist, so the
+checkout's `target/` is not seen as husk's code. Development-only (the operator running it is
+editing husk); `husk-verify.sh` §4b measures the live cage's write disposition regardless.
 
 ---
 

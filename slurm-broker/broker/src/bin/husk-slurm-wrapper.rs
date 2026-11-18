@@ -689,6 +689,12 @@ use witness::{BrokerReady, ConfinerOutOfReach, SandboxReady, SettingsIntact};
 /// question is about the objects, not their spellings (`P15`). A confiner directory that does
 /// not exist yet is compared as spelled: it would be created where it is spelled.
 ///
+/// Scope: the derivation is the layout `install-husk.sh` creates. A binary run outside an
+/// install — `cargo run` from a checkout — derives a prefix whose `bin/` and `lib/husk` do
+/// not exist, so the checkout's own `target/` is not seen as husk's code. That is the
+/// development case, not the threat model (the operator running it is editing husk), and
+/// `husk-verify.sh` §4b measures the live cage's write disposition regardless.
+///
 /// The write root is the directory husk was launched from — the one Claude Code's sandbox
 /// binds writable — captured here, before the agent exists (invariant 1, `P2`).
 fn confiner_within_reach(exe: &Path, write_root: &Path) -> io::Result<Option<(PathBuf, PathBuf)>> {

@@ -10,13 +10,15 @@ owed.
 the wrong file.** Repository layout lives in the tree and the README; configuration
 lives in the settings files; rationale lives in L1 and L3; the model lives in L2.
 
-**As of 2026-09-02 · branch `main` · v0.5 released.**
+**As of 2026-11-18 · branch `install-prefix` · v0.5 released, unreleased work on top.**
 
 ---
 
 ## Status
 
 | | |
+|---|---|
+| **Install prefix (`--prefix`)** | landed on branch `install-prefix`, not yet merged: `install-husk.sh --prefix DIR` installs anywhere on a shared filesystem, recorded in `~/.husk/install-prefix`; every cage enters through `<prefix>/bin/seccomp-wrapper` by absolute path (`C1.1`); a launch that could rewrite husk's own code is refused (`C0.4`). Unit suites green (493 Rust, 293 shell checks); **hardware `selftest.sh --full` from a non-default prefix not yet run — the verdict this branch still owes** (`P10`) |
 |---|---|
 | **Feature work** | complete (2026-08-01) |
 | **Security review** | complete — 2 passes, 9 briefs, 102 candidates, 84 distinct findings |
